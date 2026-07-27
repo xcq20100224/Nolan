@@ -263,9 +263,15 @@ export default function ChatApp() {
           disabled={exited}
           onSend={handleSend}
           onRecordingChange={setRecording}
+          onStatus={pushNolan}
         />
 
         {historyOpen && <HistoryOverlay messages={messages} onClose={() => setHistoryOpen(false)} />}
+
+        {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
+        <span className="pointer-events-none absolute bottom-2 right-3 text-[10px] font-light tracking-widest text-[#3a3a40]">
+          build 0727-3
+        </span>
       </div>
     </div>
   )

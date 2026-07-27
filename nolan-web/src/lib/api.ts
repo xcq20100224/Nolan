@@ -92,7 +92,10 @@ export async function transcribe(blob: Blob): Promise<string> {
  */
 export async function micStart(): Promise<boolean> {
   try {
-    const data = await fetchJson<{ ok: boolean }>('/api/mic/start', { method: 'POST' })
+    // GET 通道：内嵌 webview 对无响应体的 POST 可能挂起，GET 兼容性最强
+    const data = await fetchJson<{ ok: boolean }>('/api/mic/start', {
+      signal: AbortSignal.timeout(8000),
+    })
     return data.ok === true
   } catch {
     return false
@@ -104,7 +107,11 @@ export async function micStart(): Promise<boolean> {
  * 无语音 / 未在录音时返回空串；请求失败抛错，由调用方兜底提示
  */
 export async function micStop(): Promise<string> {
-  const data = await fetchJson<{ text?: string }>('/api/mic/stop', { method: 'POST' })
+  const data = await fetchJson<{ text?: string }>('/api/mic/stop', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  })
   return typeof data.text === 'string' ? data.text : ''
 }
 

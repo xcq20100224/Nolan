@@ -29,7 +29,7 @@ import sounddevice as sd
 静音结束秒 = 1.0          # 语音后连续静音多久判定“说完了”
 最长句子秒 = 15.0         # 单句最长录音时长，防止无限录音
 
-模型名称 = "small"        # faster-whisper small，本地已缓存
+模型名称 = "medium"        # faster-whisper small，本地已缓存
 模型设备 = "cpu"
 模型精度 = "int8"
 

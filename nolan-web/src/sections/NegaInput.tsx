@@ -18,9 +18,24 @@ interface NegaInputProps {
   onSend: (text: string) => void
   /** 录音状态变化上报，驱动中央声波切换为模拟律动 */
   onRecordingChange: (recording: boolean) => void
+  /** 语音状态播报（以 Nolan 身份插入对话，让每一步都看得见） */
+  onStatus?: (text: string) => void
 }
 
-export default function NegaInput({ disabled, onSend, onRecordingChange }: NegaInputProps) {
+export default function NegaInput({ disabled, onSend, onRecordingChange, onStatus }: NegaInputProps) {
+  // 全局错误浮层：任何未捕获的 JS 错误都显示在屏幕上（调试期 instrumentation）
+  const [jsError, setJsError] = useState('')
+  useEffect(() => {
+    const onErr = (e: ErrorEvent) => setJsError(`JS错误: ${e.message}`)
+    const onRej = (e: PromiseRejectionEvent) =>
+      setJsError(`Promise错误: ${e.reason instanceof Error ? e.reason.message : String(e.reason)}`)
+    window.addEventListener('error', onErr)
+    window.addEventListener('unhandledrejection', onRej)
+    return () => {
+      window.removeEventListener('error', onErr)
+      window.removeEventListener('unhandledrejection', onRej)
+    }
+  }, [])
   const [text, setText] = useState('')
   const [recording, setRecording] = useState(false)
   /** 录音秒数计时 */
@@ -38,8 +53,12 @@ export default function NegaInput({ disabled, onSend, onRecordingChange }: NegaI
   // 回调入 ref，保证异步回调里取到的永远是最新闭包
   const onSendRef = useRef(onSend)
   const onRecordingChangeRef = useRef(onRecordingChange)
+  const onStatusRef = useRef(onStatus)
   onSendRef.current = onSend
   onRecordingChangeRef.current = onRecordingChange
+  onStatusRef.current = onStatus
+  // 状态播报：未提供回调时静默
+  const reportStatus = (text: string) => onStatusRef.current?.(text)
   // 卸载清理时需读取最新录音状态
   const recordingRef = useRef(recording)
   recordingRef.current = recording
@@ -71,8 +90,9 @@ export default function NegaInput({ disabled, onSend, onRecordingChange }: NegaI
     if (disabled || stoppingRef.current) return
 
     if (recording) {
-      // 停止：服务端停止录音并返回识别文本
+      // 停止：服务端停止录音并返回识别文本（识别需要几秒，先播报状态）
       stoppingRef.current = true
+      reportStatus('正在识别，请稍候……')
       try {
         const result = (await micStop()).trim()
         if (unmountedRef.current) return
@@ -84,12 +104,14 @@ export default function NegaInput({ disabled, onSend, onRecordingChange }: NegaI
         } else {
           // 空结果：仅提示，不发送
           flashHint('没听清，请再说一次')
+          reportStatus('没听清，请再说一次。')
         }
       } catch {
         // stop 请求失败：恢复空闲态并提示改用键盘
         if (!unmountedRef.current) {
           leaveRecording()
           flashHint('先生，麦克风暂时不可用，请直接打字')
+          reportStatus('先生，识别服务出错了，请直接打字告诉我。')
         }
       } finally {
         stoppingRef.current = false
@@ -98,16 +120,19 @@ export default function NegaInput({ disabled, onSend, onRecordingChange }: NegaI
     }
 
     // 开始：通知服务端录音，失败则保持空闲态并提示（不置灰，可重试）
+    reportStatus('已收到指令，正在启动麦克风……')
     const ok = await micStart()
     if (unmountedRef.current) return
     if (!ok) {
       flashHint('先生，麦克风暂时不可用，请直接打字')
+      reportStatus('先生，麦克风启动失败——服务端拒绝了开始请求，请重试，或直接打字告诉我。')
       return
     }
     setSeconds(0)
     setRecording(true)
     // 上报录音状态，中央声波切换为模拟律动
     onRecordingChangeRef.current(true)
+    reportStatus('🎤 正在聆听，先生。说完请再点一次麦克风。')
     // 秒数计时
     timerRef.current = window.setInterval(() => setSeconds((s) => s + 1), 1000)
   }
@@ -120,6 +145,39 @@ export default function NegaInput({ disabled, onSend, onRecordingChange }: NegaI
       if (hintTimerRef.current !== null) window.clearTimeout(hintTimerRef.current)
       if (recordingRef.current) void micStop().catch(() => undefined)
       onRecordingChangeRef.current(false)
+    }
+  }, [])
+
+  // Alt 键切换录音（按一下开始，再按一下结束）：
+  // 用「按下→松开期间没碰其他键」判定单独使用 Alt，
+  // 避免 Alt+Tab 切窗口时被误当成录音快捷键
+  const handleMicRef = useRef(handleMic)
+  handleMicRef.current = handleMic
+  useEffect(() => {
+    let altHeld = false
+    let altCombo = false
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Alt') {
+        if (!e.repeat) {
+          e.preventDefault()  // 阻止浏览器菜单栏抢焦点
+          altHeld = true
+          altCombo = false
+        }
+        return
+      }
+      if (altHeld) altCombo = true
+    }
+    const onKeyUp = (e: globalThis.KeyboardEvent) => {
+      if (e.key !== 'Alt') return
+      if (altHeld && !altCombo) void handleMicRef.current()
+      altHeld = false
+      altCombo = false
+    }
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('keyup', onKeyUp)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('keyup', onKeyUp)
     }
   }, [])
 
@@ -140,6 +198,11 @@ export default function NegaInput({ disabled, onSend, onRecordingChange }: NegaI
 
   return (
     <footer className="shrink-0 px-6 pb-8 pt-4">
+      {jsError && (
+        <div className="mx-auto mb-2 max-w-2xl rounded border border-[#c05b4d] px-3 py-1 text-xs text-[#c05b4d]">
+          {jsError}
+        </div>
+      )}
       <div className="mx-auto flex max-w-2xl items-center gap-4">
         <input
           value={text}
@@ -153,7 +216,7 @@ export default function NegaInput({ disabled, onSend, onRecordingChange }: NegaI
           type="button"
           onClick={handleMic}
           disabled={disabled}
-          title={recording ? '停止录音' : '语音输入'}
+          title={recording ? '停止录音（或再按一次 Alt）' : '语音输入（点击或按 Alt 键）'}
           className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-30 ${
             recording
               ? 'nega-recording border-[#c05b4d] text-[#c05b4d]'

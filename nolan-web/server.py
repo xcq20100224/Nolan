@@ -379,8 +379,8 @@ def _load_whisper() -> None:
             return
         try:
             from faster_whisper import WhisperModel
-            print("[server] 正在加载 faster-whisper small 模型（CPU+int8）……")
-            _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+            print("[server] 正在加载 faster-whisper medium 模型（CPU+int8，中文识别精度升级）……")
+            _whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
             _whisper_error = None
             print("[server] faster-whisper 模型加载完成，语音输入就绪。")
         except Exception as e:
@@ -428,7 +428,7 @@ def _transcribe_bytes(audio: bytes, content_type: str) -> str:
             segments, _info = _whisper_model.transcribe(
                 tmp_path,
                 language="zh",
-                initial_prompt="以下是简体中文普通话语音。",
+                initial_prompt="以下是主人对中文语音助手 Nolan 说的普通话指令。",
                 beam_size=5,
                 vad_filter=True,  # 过滤静音段，无语音时自然得到空结果
             )
@@ -477,6 +477,20 @@ def _mic_stop_locked() -> None:
             print(f"[server] 关闭录音流出错（已忽略）：{e}")
         _mic_stream = None
     _mic_recording = False
+
+
+# == 麦克风事件诊断日志（写文件，便于排查"点击没反应"时请求是否到达后端）==
+_MIC_DEBUG_FILE = os.path.normpath(os.path.join(_JARVIS_DIR, "files", "mic_debug.log"))
+
+
+def _mic_debug_log(msg: str) -> None:
+    """把麦克风端点事件追加到诊断日志文件；任何写失败静默忽略。"""
+    try:
+        os.makedirs(os.path.dirname(_MIC_DEBUG_FILE), exist_ok=True)
+        with open(_MIC_DEBUG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
 
 
 def _mic_start() -> None:
@@ -535,6 +549,12 @@ def _mic_stop() -> str:
     if audio.shape[0] == 0:
         return ""
 
+    # 峰值归一化：笔记本阵列麦克风录音偏小（实测峰值约 0.09），
+    # 拉到 0.9 峰值再识别，避免模型因音量过低而幻听
+    peak = float(np.abs(audio).max())
+    if peak > 0:
+        audio = audio * (0.9 / peak)
+
     _load_whisper()  # 懒加载兜底（预加载未完成时同步等待）
     if _whisper_model is None:
         raise RuntimeError(_whisper_error or "语音模型不可用。")
@@ -545,7 +565,7 @@ def _mic_stop() -> str:
             segments, _info = _whisper_model.transcribe(
                 audio,
                 language="zh",
-                initial_prompt="以下是简体中文普通话语音。",
+                initial_prompt="以下是主人对中文语音助手 Nolan 说的普通话指令。",
                 beam_size=5,
                 vad_filter=True,  # 过滤静音段，无语音时自然得到空结果
             )
@@ -768,6 +788,17 @@ class NolanHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/health":
                 self._send_json(200, {"ok": True, "name": "Nolan"})
+            elif path == "/api/mic/start":
+                # GET 变体：内嵌 webview 对 POST 响应有兼容问题时改走 GET（幂等可重开）
+                _mic_debug_log("mic/start(GET) 收到请求")
+                try:
+                    _mic_start()
+                except RuntimeError as e:
+                    _mic_debug_log(f"mic/start(GET) 失败: {e}")
+                    self._send_error_json(500, str(e))
+                    return
+                _mic_debug_log("mic/start(GET) 已开始录音")
+                self._send_json(200, {"ok": True})
             elif path == "/api/version":
                 # 版本端点：让『当前后端跑的是不是最新代码』一眼可验
                 # （陈旧进程返回旧版本号，PID 可对照任务管理器核对）
@@ -830,19 +861,25 @@ class NolanHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"text": text})
             elif path == "/api/mic/start":
                 # 服务端直接开麦录音，绕开浏览器麦克风权限
+                _mic_debug_log("mic/start 收到请求")
                 try:
                     _mic_start()
                 except RuntimeError as e:
+                    _mic_debug_log(f"mic/start 失败: {e}")
                     self._send_error_json(500, str(e))
                     return
+                _mic_debug_log("mic/start 已开始录音")
                 self._send_json(200, {"ok": True})
             elif path == "/api/mic/stop":
                 # 停止录音并识别；未在录音/无语音返回 {"text": ""}
+                _mic_debug_log("mic/stop 收到请求")
                 try:
                     text = _mic_stop()
                 except RuntimeError as e:
+                    _mic_debug_log(f"mic/stop 失败: {e}")
                     self._send_error_json(500, str(e))
                     return
+                _mic_debug_log(f"mic/stop 识别结果: {text!r}")
                 self._send_json(200, {"text": text})
             else:
                 self._send_error_json(404, f"未知路径：{path}")
