@@ -27,3 +27,4 @@ voice-test.mp3
 
 # ===== 自测临时产物 =====
 jarvis/_selftest_*
+wb-req-*.json
