@@ -1,0 +1,675 @@
+# -*- coding: utf-8 -*-
+"""
+eyes.py —— Nolan 的「眼睛」与「手」的延伸（阶段五：屏幕感知 + GUI 自动化）
+
+职责：把「点选网易云音乐列表中的歌曲」这类软件界面内操作，
+拆成一条可验证的闭环链路：
+
+    截屏 -> 视觉模型理解界面并返回动作 JSON -> pyautogui 执行
+    -> sleep 1 秒 -> 重新截屏 -> ... 直到 done / fail / 步数上限
+
+视觉模型配置驱动：模型名与附加请求体来自 jarvis/llm_config.json 的
+可选字段 vision_model（默认 glm-4.5v）与 vision_extra_body
+（默认 '{"thinking": {"type": "disabled"}}'，glm-4.5v 需关闭思考模式）；
+主模型调用失败（HTTP 错误 / 超时）自动降级到 glm-4v-flash 再试一次。
+
+安全闸（三层，均为硬约束）：
+  1. 步数上限 max_steps：任何任务最多走 max_steps 步，防死循环；
+  2. pyautogui FAILSAFE：主人把鼠标甩到屏幕任意角落，立即中止并返回中止话术；
+  3. 禁令写进 VLM 感知 prompt：禁止输入密码、禁止支付、禁止删除文件、
+     禁止向联系人发消息——VLM 遇到此类界面必须返回 fail。
+
+坐标约定（高 DPI 必须处理）：
+  进程起手调 SetProcessDPIAware，保证截屏与 pyautogui 坐标同为物理像素；
+  发送给 VLM 的截图缩放到宽 <= 1280，VLM 返回的坐标基于该截图；
+  执行前统一换算：实际坐标 = VLM 坐标 x (物理宽 / 截图宽)。
+
+接口契约（签名一字不差）：
+    perform(task: str, max_steps: int = 12) -> str  # 口语化结果
+    screenshot_b64() -> str                         # JPEG base64（宽 <= 1280）
+    locate_and_crop(description: str) -> str | None # 通用截屏元素：定位 + 裁剪保存
+"""
+
+import base64
+import ctypes
+import io
+import json
+import os
+import re
+import time
+
+import httpx
+import pyautogui
+import pyperclip
+from PIL import ImageGrab
+
+# ---------------------------------------------------------------------------
+# 初始化与常量
+# ---------------------------------------------------------------------------
+
+# 起手声明 DPI 感知：保证 ImageGrab 截屏与 pyautogui 坐标都使用物理像素，
+# 否则高 DPI 机器上两者坐标系不一致，点击位置会整体偏移。
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:  # 极少数环境（非 Windows / 权限受限）下静默降级
+    pass
+
+# FAILSAFE 是 pyautogui 默认行为，这里显式再确认一次：
+# 鼠标被甩到屏幕角落会抛 FailSafeException，我们在 perform 里捕获并中止。
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.1  # 每个 pyautogui 调用之间的最小间隔，防动作过快
+
+_VLM_FALLBACK_MODEL = "glm-4v-flash"  # 主视觉模型失败时的自动降级模型
+_DEFAULT_VISION_MODEL = "glm-4.5v"    # llm_config.json 缺 vision_model 时的默认主模型
+# glm-4.5v 必须关闭思考模式，否则响应慢且可能输出思考过程污染动作 JSON
+_DEFAULT_VISION_EXTRA_BODY = '{"thinking": {"type": "disabled"}}'
+_VLM_TIMEOUT = 60.0                # VLM 请求超时（秒）
+_SHOT_MAX_WIDTH = 1280             # 发送给 VLM 的截图最大宽度（像素）
+_JPEG_QUALITY = 80                 # 截图 JPEG 质量（兼顾清晰度与体积）
+_STEP_INTERVAL = 1.0               # 每步执行后的等待秒数，等界面响应
+
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "llm_config.json")
+
+# 通用截屏元素的裁剪保存目录：jarvis\files\captures\（网页端经 /api/files 访问）
+_CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "files", "captures")
+_CROP_MARGIN = 10  # 裁剪时在定位框外扩的边距（物理像素）
+
+# 口语化返回话术（Nolan 可靠管家人设：正式、精确、如实汇报）
+_MSG_FAILSAFE = "先生，检测到您将鼠标移至屏幕角落，操作已被安全中止。"
+_MSG_FAIL_PREFIX = "先生，任务未能完成。"
+_MSG_VLM_DOWN = "先生，我的视觉模块暂时无法连接，任务无法执行。"
+
+# VLM 感知 prompt：定义动作协议 + 坐标系 + 安全禁令（硬编码，不可绕过）
+_VLM_SYSTEM = (
+    "你是 Nolan 的屏幕感知模块。我会给你一张电脑屏幕截图和一个任务目标，"
+    "你每步只能返回一个 JSON 对象（不要任何多余文字、不要 markdown 代码块）：\n"
+    '{"action": "left_click|double_click|type|key|scroll|wait|done|fail", '
+    '"x": 像素x, "y": 像素y, "text": "输入内容", "keys": "如 ctrl+v", '
+    '"thought": "一句话决策理由"}\n'
+    "协议细则：\n"
+    "1. x、y 是基于我发给你的这张截图的像素坐标（截图左上角为原点）。"
+    "只有 left_click、double_click、scroll 需要坐标；scroll 的 text 填 up 或 down。\n"
+    "2. type 用于输入文字（text 为内容，支持中文）；key 用于按键"
+    "（keys 为单键如 enter，或组合键如 ctrl+v）。\n"
+    "3. wait 用于等待界面加载；done 表示任务已完成；fail 表示无法完成。\n"
+    "4. done 时把 thought 写成给主人的一句话完成汇报；fail 时写成失败原因。\n"
+    "5. 每步只做一个动作，逐步逼近目标，不要试图一步完成所有事。\n"
+    "6. 我会附上已执行的动作历史；请结合当前截图判断："
+    "若任务目标已在屏幕上完成，立即返回 done，绝不重复已成功的动作。\n"
+    "7. 若目标窗口尚未出现或界面仍在加载，返回 wait 等待，不要急着 fail；"
+    "只有反复等待后仍确认无法完成时才返回 fail。\n"
+    "8. 常识提示：记事本等编辑器打开后，窗口中央的大片空白区域就是文本区，"
+    "深色主题下文本区呈深色属正常现象；这类任务可直接返回 type 输入文字，"
+    "不要因为文本区是空白的就判定窗口未打开或无法输入。\n"
+    "9. 桌面应用常识：深色侧边栏导航是音乐/视频类应用的标准布局"
+    "（如网易云音乐左侧的「发现音乐 / 我喜欢 / 歌单」导航栏），"
+    "看到这类布局应优先在侧边栏中寻找入口。\n"
+    "10. 若目标应用窗口不在屏幕上、未打开或被其他窗口遮挡，必须返回 fail，"
+    "并在 thought 中以「屏幕上没有找到<应用名>」开头明确报告，"
+    "绝不要乱点其他无关应用的界面来碰运气。\n"
+    "安全禁令（最高优先级，绝不可违背）：\n"
+    "- 禁止输入任何密码、验证码或支付信息；\n"
+    "- 禁止进行任何支付、转账、下单操作；\n"
+    "- 禁止删除任何文件或数据；\n"
+    "- 禁止向任何联系人发送消息；\n"
+    "遇到上述情况或界面要求上述操作时，必须返回 fail 并在 thought 中说明原因。"
+)
+
+
+# ---------------------------------------------------------------------------
+# 感知：截屏
+# ---------------------------------------------------------------------------
+
+def screenshot_b64() -> str:
+    """截全屏，缩放到宽 <= 1280，编码为 JPEG base64 字符串返回。"""
+    img = ImageGrab.grab()  # DPI 感知后为物理像素
+    if img.width > _SHOT_MAX_WIDTH:
+        new_h = round(img.height * _SHOT_MAX_WIDTH / img.width)
+        img = img.resize((_SHOT_MAX_WIDTH, new_h), ImageGrab.Image.LANCZOS)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=_JPEG_QUALITY)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _screenshot_size() -> tuple[int, int]:
+    """返回发送给 VLM 的截图尺寸 (宽, 高)，与 screenshot_b64 的缩放逻辑一致。"""
+    sw, sh = pyautogui.size()  # DPI 感知后为物理分辨率
+    if sw > _SHOT_MAX_WIDTH:
+        sh = round(sh * _SHOT_MAX_WIDTH / sw)
+        sw = _SHOT_MAX_WIDTH
+    return sw, sh
+
+
+# ---------------------------------------------------------------------------
+# 坐标换算：VLM 截图像素 -> 屏幕物理像素
+# ---------------------------------------------------------------------------
+
+def _vlm_to_screen(x: float, y: float,
+                   shot_w: int | None = None,
+                   shot_h: int | None = None) -> tuple[int, int]:
+    """
+    把 VLM 基于缩放截图返回的坐标换算成屏幕物理像素坐标。
+    换算式：实际坐标 = VLM 坐标 x (物理宽 / 截图宽)（高向同理，按比例）。
+    结果会被钳制在屏幕范围内，防止越界点击。
+    """
+    screen_w, screen_h = pyautogui.size()
+    if shot_w is None or shot_h is None:
+        shot_w, shot_h = _screenshot_size()
+    sx = screen_w / shot_w
+    sy = screen_h / shot_h
+    px = int(round(x * sx))
+    py = int(round(y * sy))
+    # 钳制到屏幕内，避免 VLM 幻觉坐标导致的越界异常
+    px = max(0, min(px, screen_w - 1))
+    py = max(0, min(py, screen_h - 1))
+    return px, py
+
+
+# ---------------------------------------------------------------------------
+# 思考：调视觉模型（配置驱动，主模型失败自动降级 glm-4v-flash）
+# ---------------------------------------------------------------------------
+
+def _load_llm_config() -> dict:
+    """读取与 brain 同一份 jarvis/llm_config.json，取 api_key 与 base_url。"""
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _vision_config() -> tuple[str, dict]:
+    """
+    从 llm_config.json 读取视觉模型配置：
+      - vision_model：主视觉模型名，缺省回落到 glm-4.5v；
+      - vision_extra_body：附加请求体（默认关闭思考模式），
+        兼容 JSON 字符串与已解析的 dict 两种写法，解析失败按空 dict 处理。
+    返回 (模型名, 附加请求体 dict)。
+    """
+    cfg = _load_llm_config()
+    model = str(cfg.get("vision_model") or _DEFAULT_VISION_MODEL).strip()
+    if not model:
+        model = _DEFAULT_VISION_MODEL
+    extra_raw = cfg.get("vision_extra_body", _DEFAULT_VISION_EXTRA_BODY)
+    if isinstance(extra_raw, dict):
+        extra = extra_raw
+    else:
+        try:
+            extra = json.loads(str(extra_raw))
+            if not isinstance(extra, dict):
+                extra = {}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            print("[eyes] vision_extra_body 解析失败，按空附加请求体处理")
+            extra = {}
+    return model, extra
+
+
+def _ask_vlm_once(image_b64: str, user_text: str, system: str | None,
+                  model: str, extra_body: dict) -> str:
+    """
+    单次视觉模型调用：发送一张截图 + 文本，返回模型的文本回复。
+    OpenAI 兼容格式，image_url 传 base64 data URI；httpx 超时 60 秒。
+    vision_extra_body 合并进请求 payload（如 thinking 关闭）。
+    失败时抛出异常，由 _ask_vlm 决定降级或上抛。
+    """
+    cfg = _load_llm_config()
+    url = cfg["base_url"].rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": "Bearer " + cfg["api_key"],
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system or "你是一个屏幕内容描述助手。"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/jpeg;base64," + image_b64},
+                    },
+                ],
+            },
+        ],
+        "temperature": 0.1,  # 动作决策要低随机性
+    }
+    payload.update(extra_body)  # 合并 vision_extra_body（如 thinking disabled）
+    with httpx.Client(timeout=_VLM_TIMEOUT) as client:
+        resp = client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def _ask_vlm(image_b64: str, user_text: str, system: str | None = None) -> str:
+    """
+    配置驱动的视觉模型调用：先用 llm_config.json 指定的主模型，
+    调用失败（HTTP 错误 / 超时 / 鉴权）自动降级到 glm-4v-flash 再试一次。
+    降级请求不带 vision_extra_body：thinking 字段是 glm-4.5 系参数，
+    带上去可能让旧模型直接报错，降级链路必须尽可能朴素以保证可用。
+    两次都失败时抛出异常，由调用方决定话术。
+    """
+    model, extra = _vision_config()
+    try:
+        return _ask_vlm_once(image_b64, user_text, system, model, extra)
+    except Exception as exc:
+        if model == _VLM_FALLBACK_MODEL:
+            raise  # 主模型已是降级模型，继续降级只会死循环
+        print("[eyes] 主视觉模型 %s 调用失败（%s），降级到 %s 重试一次"
+              % (model, exc, _VLM_FALLBACK_MODEL))
+        return _ask_vlm_once(image_b64, user_text, system,
+                             _VLM_FALLBACK_MODEL, {})
+
+
+def _describe_screen(shot_b64: str) -> str:
+    """
+    失败时补问一句「当前屏幕显示什么」，用于具体化失败报告。
+    只读感知，不执行任何动作；自身调用失败返回空串（降级为无屏幕描述），
+    绝不允许因为补充描述失败而掩盖原始失败原因。
+    """
+    if not shot_b64:
+        return ""
+    try:
+        reply = _ask_vlm(shot_b64,
+                         "用一句话客观描述这张屏幕截图当前显示的主要内容"
+                         "（看到了哪些应用的窗口、界面停留大概在什么位置）。")
+        return reply.strip()
+    except Exception as exc:
+        print("[eyes] 失败报告的屏幕状态补问失败：%s" % exc)
+        return ""
+
+
+def _parse_action(raw: str) -> dict | None:
+    """
+    从 VLM 回复中解析动作 JSON。VLM 偶尔会裹 markdown 代码块或前后缀文字，
+    先做宽松提取再严格校验 action 字段；解析失败返回 None。
+    """
+    text = raw.strip()
+    # 剥离可能的 ```json ... ``` 包裹
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None
+    candidate = m.group(0)
+    try:
+        obj = json.loads(candidate)
+    except json.JSONDecodeError:
+        obj = None
+    if obj is None:
+        # VLM 常见笔误："x": 204, 475, —— y 被写成了裸数字，修复后重试
+        if '"y"' not in candidate:
+            repaired = re.sub(
+                r'("x"\s*:\s*-?\d+)\s*,\s*(-?\d+)(\s*,)',
+                r'\1, "y": \2\3', candidate)
+            if repaired != candidate:
+                try:
+                    obj = json.loads(repaired)
+                except json.JSONDecodeError:
+                    return None
+            else:
+                return None
+        else:
+            return None
+    legal = {"left_click", "double_click", "type", "key",
+             "scroll", "wait", "done", "fail"}
+    if not isinstance(obj, dict) or obj.get("action") not in legal:
+        return None
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# 动作：pyautogui 执行
+# ---------------------------------------------------------------------------
+
+def _do_action(action: dict, shot_w: int, shot_h: int) -> None:
+    """
+    执行单步动作。坐标先经 _vlm_to_screen 换算为物理像素。
+    type 用 pyperclip 复制 + ctrl+v 粘贴，天然支持中文；
+    key 支持单键（enter）与组合键（ctrl+v）。
+    pyautogui.FailSafeException 不在此捕获，向上抛给 perform 统一中止。
+    """
+    act = action["action"]
+
+    if act in ("left_click", "double_click"):
+        x, y = _vlm_to_screen(float(action.get("x", 0)),
+                              float(action.get("y", 0)), shot_w, shot_h)
+        pyautogui.moveTo(x, y, duration=0.2)
+        if act == "left_click":
+            pyautogui.click()
+        else:
+            pyautogui.doubleClick()
+
+    elif act == "scroll":
+        # scroll 坐标可选：给了就先移动鼠标过去，再滚动
+        if "x" in action and "y" in action:
+            x, y = _vlm_to_screen(float(action["x"]), float(action["y"]),
+                                  shot_w, shot_h)
+            pyautogui.moveTo(x, y, duration=0.2)
+        direction = str(action.get("text", "down")).lower()
+        pyautogui.scroll(3 if direction == "up" else -3)
+
+    elif act == "type":
+        # 剪贴板粘贴方案：pyautogui.write 不支持中文，pyperclip + ctrl+v 通吃
+        pyperclip.copy(str(action.get("text", "")))
+        time.sleep(0.1)
+        pyautogui.hotkey("ctrl", "v")
+
+    elif act == "key":
+        keys = str(action.get("keys", "")).lower().strip()
+        parts = [k.strip() for k in keys.split("+") if k.strip()]
+        if not parts:
+            return
+        if len(parts) == 1:
+            pyautogui.press(parts[0])
+        else:
+            pyautogui.hotkey(*parts)
+
+    elif act == "wait":
+        time.sleep(1.0)
+
+    # done / fail 不执行任何物理动作，由 perform 的循环逻辑处理
+
+
+# ---------------------------------------------------------------------------
+# 失败报告具体化：第几步 + VLM 最后判断 + 当前屏幕状态
+# ---------------------------------------------------------------------------
+
+def _join_zh(*parts: str) -> str:
+    """中文句读拼接：去掉各分句末尾句号后用「。」连接，保证全文恰好一个结尾句号。"""
+    cleaned = [p.strip().rstrip("。") for p in parts if p and p.strip()]
+    if not cleaned:
+        return ""
+    return "。".join(cleaned) + "。"
+
+
+def _fail_report(step: int, reason: str, shot_b64: str, executed: int) -> str:
+    """
+    失败话术：失败在第几步、这一步 VLM 的判断、当前屏幕状态简述。
+    屏幕状态通过 _describe_screen 补问一次 VLM 获得，补问失败则省略该句。
+    """
+    parts = [_MSG_FAIL_PREFIX, "卡在第 %d 步：%s" % (step, reason)]
+    desc = _describe_screen(shot_b64)
+    if desc:
+        parts.append("当前屏幕显示的是：%s" % desc)
+    if executed > 0:
+        parts.append("此前已成功执行 %d 个动作，请您检查" % executed)
+    return _join_zh(*parts)
+
+
+def _over_limit_report(max_steps: int, last_thought: str,
+                       shot_b64: str, executed: int) -> str:
+    """步数超限话术：上限步数、最后一步 VLM 的判断、当前屏幕状态简述。"""
+    parts = ["先生，任务步数超出安全上限（%d 步）" % max_steps]
+    if last_thought:
+        parts.append("停顿时最后一步的判断是：%s" % last_thought)
+    desc = _describe_screen(shot_b64)
+    if desc:
+        parts.append("当前屏幕显示的是：%s" % desc)
+    if executed > 0:
+        parts.append("已成功执行 %d 个动作" % executed)
+    parts.append("已完成的部分请您检查")
+    return _join_zh(*parts)
+
+
+# ---------------------------------------------------------------------------
+# 主闭环：perform
+# ---------------------------------------------------------------------------
+
+def perform(task: str, max_steps: int = 12) -> str:
+    """
+    屏幕感知 + GUI 动作闭环：逐步截屏、问 VLM、执行动作，直到完成。
+
+    返回口语化结果（Nolan 人设，直接可语音播报）：
+      - done        -> VLM 的完成汇报话术
+      - fail        -> 具体化失败报告：第几步 + VLM 判断 + 当前屏幕状态
+      - 目标应用缺失 -> 明确说出「屏幕上没有找到 X，请先让我用 open_app 打开它」
+      - 步数超限     -> 超限话术 + 最后一步判断 + 当前屏幕状态
+      - FAILSAFE    -> 固定中止话术
+      - VLM 不可达   -> 固定降级话术
+    永不向调用方抛异常。
+    """
+    print("[eyes] 任务开始：%s（步数上限 %d）" % (task, max_steps))
+
+    history: list[str] = []  # 已执行动作历史，每步带给 VLM 防止重复动作
+    executed = 0             # 已执行的物理动作数（wait 不计）
+    repeat_sigs: list = []   # 动作签名序列，用于死循环检测（同一动作连续重复即介入）
+    early_fail_retries = 0   # 「零动作早退 fail」的宽限次数
+    last_shot = ""           # 最近一次截屏，失败时用于补问屏幕状态
+    last_thought = ""        # 最后一步 VLM 的决策理由，失败报告要带出来
+
+    try:
+        for step in range(1, max_steps + 1):
+            # 1) 感知：截屏
+            shot = screenshot_b64()
+            last_shot = shot
+            shot_w, shot_h = _screenshot_size()
+
+            # 2) 思考：问 VLM 下一步动作；非法 JSON 原地重试一次
+            prompt = "当前任务：%s。这是第 %d 步（上限 %d 步）。" % (
+                task, step, max_steps)
+            if history:
+                prompt += "已执行的动作历史：%s。" % "；".join(history)
+            prompt += "请结合当前截图判断任务是否已完成，返回下一步动作 JSON。"
+            try:
+                raw = _ask_vlm(shot, prompt, system=_VLM_SYSTEM)
+            except Exception as exc:  # 网络 / 鉴权 / 超时（含降级后仍失败）
+                print("[eyes] VLM 请求失败：%s" % exc)
+                return _MSG_VLM_DOWN
+
+            action = _parse_action(raw)
+            if action is None:
+                print("[eyes] 第 %d 步 VLM 返回非法 JSON，重试一次：%s"
+                      % (step, raw[:200]))
+                try:
+                    raw = _ask_vlm(shot, prompt + " 上次回复不是合法 JSON，"
+                                   "请只返回一个 JSON 对象。",
+                                   system=_VLM_SYSTEM)
+                except Exception as exc:
+                    print("[eyes] VLM 重试请求失败：%s" % exc)
+                    return _MSG_VLM_DOWN
+                action = _parse_action(raw)
+                if action is None:
+                    print("[eyes] 第 %d 步重试仍非法，按 fail 处理" % step)
+                    return _fail_report(step, "视觉模块连续两次未能给出有效指令",
+                                        last_shot, executed)
+
+            thought = str(action.get("thought", ""))
+            last_thought = thought
+            print("[eyes] 第 %d 步：%s | %s"
+                  % (step, action["action"], thought))
+
+            # 3) 终态判定
+            if action["action"] == "done":
+                summary = thought or "任务已完成。"
+                print("[eyes] 任务完成：%s" % summary)
+                return summary
+            if action["action"] == "fail":
+                reason = thought or "视觉模块判断无法完成。"
+                # 目标应用不在屏幕：立即如实报告并提示先 open_app，
+                # 不做早退宽限——等待解决不了「应用根本没打开」，
+                # 快速把信号还给 brain，让它走 open_app 补救路径
+                if "屏幕上没有找到" in reason:
+                    print("[eyes] 目标应用缺失：%s" % reason)
+                    return _join_zh(_MSG_FAIL_PREFIX, reason,
+                                    "请先让我用 open_app 打开它")
+                # 零动作早退宽限：尚未执行任何物理动作时的 fail 没有副作用，
+                # 多是界面仍在加载或 VLM 的随机误判，宽限为 wait 重看一次
+                # （最多 2 次；安全禁令类 fail 重看后仍会 fail，不会被掩盖）
+                if executed == 0 and early_fail_retries < 2:
+                    early_fail_retries += 1
+                    print("[eyes] 第 %d 步早退 fail（%s），宽限为等待重看（%d/2）"
+                          % (step, reason, early_fail_retries))
+                    history.append("第%d步 视觉判断「%s」但尚未尝试，继续观察"
+                                   % (step, reason[:30]))
+                    time.sleep(_STEP_INTERVAL)
+                    continue
+                print("[eyes] 任务失败（第 %d 步）：%s" % (step, reason))
+                return _fail_report(step, reason, last_shot, executed)
+
+            # 4) 执行动作（FAILSAFE 抛异常即中止）
+            try:
+                _do_action(action, shot_w, shot_h)
+            except pyautogui.FailSafeException:
+                print("[eyes] FAILSAFE 触发，安全中止")
+                return _MSG_FAILSAFE
+
+            # 记入历史：下一步带给 VLM，避免模型无记忆而重复同一动作
+            desc = action["action"]
+            if action.get("text"):
+                desc += "「%s」" % action["text"]
+            elif action.get("keys"):
+                desc += "「%s」" % action["keys"]
+            history.append("第%d步 %s" % (step, desc))
+            if action["action"] != "wait":
+                executed += 1
+
+            # 4.5) 死循环检测：同一动作（动作+坐标+文本）连续重复——
+            # 第 3 次重复给 VLM 换路强提示，第 4 次直接判定失败，
+            # 避免像「反复点同一入口 11 次」那样空转到上限
+            sig = (action["action"], action.get("x"), action.get("y"),
+                   action.get("text"), action.get("keys"))
+            repeat_sigs.append(sig)
+            if len(repeat_sigs) >= 3 and len(set(repeat_sigs[-3:])) == 1:
+                if len(repeat_sigs) >= 4 and len(set(repeat_sigs[-4:])) == 1:
+                    print("[eyes] 同一动作连续重复 4 次无效，判定失败")
+                    return _fail_report(
+                        step,
+                        "同一操作重复多次均无效（界面无变化），任务目标可能不存在或需要先登录",
+                        last_shot, executed)
+                history.append("警告：同一操作已连续 3 次且界面无变化，"
+                               "下一步必须换完全不同的策略（滚动页面、换其他入口、"
+                               "或直接 fail 并说明真实原因，例如列表为空/需要登录）")
+
+            # 5) 等界面响应，进入下一步
+            time.sleep(_STEP_INTERVAL)
+
+        # 步数耗尽仍未 done/fail：超限话术 + 最后判断 + 屏幕状态
+        print("[eyes] 步数超出上限 %d，中止" % max_steps)
+        return _over_limit_report(max_steps, last_thought, last_shot, executed)
+
+    except pyautogui.FailSafeException:
+        # 截屏阶段之外也可能触发（例如 moveTo 期间），兜底捕获
+        print("[eyes] FAILSAFE 触发（外层），安全中止")
+        return _MSG_FAILSAFE
+    except Exception as exc:  # 任何意外都不许炸到调用方
+        print("[eyes] 未预期异常：%s" % exc)
+        return _fail_report(max(1, executed + 1),
+                            "执行过程中出现异常（%s），已停止" % exc,
+                            last_shot, executed)
+
+
+# ---------------------------------------------------------------------------
+# 通用截屏元素：locate_and_crop
+# ---------------------------------------------------------------------------
+#
+# 第一性原理：「把屏幕上看到的某个东西变成一张图片文件」的物理本质是
+# 「截屏 -> 找到它的边界框 -> 按物理像素裁剪保存」。与 perform 的动作闭环
+# 不同，这里不做任何鼠标键盘操作，是纯感知能力：任何界面元素（歌曲封面、
+# 头像、图标、图表）都走同一条链路，机制通用化。
+
+# 元素定位 prompt：只问边界框 JSON，坐标基于发送的缩放截图
+_VLM_LOCATE_SYSTEM = (
+    "你是 Nolan 的屏幕元素定位模块。我会给你一张电脑屏幕截图和一段元素描述，"
+    "你的唯一任务是给出该元素在截图中的边界框。\n"
+    "只返回一个 JSON 对象（不要任何多余文字、不要 markdown 代码块）：\n"
+    '{"x1": 左上角x, "y1": 左上角y, "x2": 右下角x, "y2": 右下角y}\n'
+    "规则：\n"
+    "1. 坐标是这张截图的像素坐标（截图左上角为原点），边界框要紧贴元素边缘。\n"
+    "2. 若截图中找不到该元素，返回 "
+    '{"x1": 0, "y1": 0, "x2": 0, "y2": 0}。'
+)
+
+
+def _parse_bbox(raw: str) -> tuple[float, float, float, float] | None:
+    """
+    从 VLM 回复中解析边界框 JSON。复用宽松提取策略（剥 markdown 包裹），
+    严格校验四个坐标字段齐备且构成正面积矩形；任何不合法返回 None。
+    """
+    m = re.search(r"\{.*\}", raw.strip(), re.DOTALL)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    try:
+        x1, y1 = float(obj["x1"]), float(obj["y1"])
+        x2, y2 = float(obj["x2"]), float(obj["y2"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if x2 <= x1 or y2 <= y1:  # 零面积 / 反向框视为「未找到」
+        return None
+    return x1, y1, x2, y2
+
+
+def locate_and_crop(description: str) -> str | None:
+    """
+    通用截屏元素：定位 description 所指的界面元素并裁剪保存为 PNG。
+
+    链路：截屏（物理像素）-> 缩放截图发视觉模型问边界框 ->
+    换算回物理像素 -> 外扩 10 像素边距并钳制在屏幕内 -> 裁剪 ->
+    保存到 jarvis\\files\\captures\\capture_时间戳.png（目录自动创建）。
+
+    返回保存文件的完整路径；定位失败 / VLM 不可达 / JSON 非法返回 None。
+    永不抛异常（所有意外在日志留痕后按 None 处理）。
+    """
+    try:
+        description = (description or "").strip()
+        if not description:
+            print("[eyes] locate_and_crop：空描述，放弃")
+            return None
+
+        # 1) 感知：截一次屏，物理像素原图与缩放截图同源，
+        #    避免两次截屏之间界面变化导致定位框与裁剪图错位
+        full = ImageGrab.grab()  # DPI 感知后为物理像素
+        shot = full
+        if shot.width > _SHOT_MAX_WIDTH:
+            new_h = round(shot.height * _SHOT_MAX_WIDTH / shot.width)
+            shot = shot.resize((_SHOT_MAX_WIDTH, new_h), ImageGrab.Image.LANCZOS)
+        buf = io.BytesIO()
+        shot.convert("RGB").save(buf, format="JPEG", quality=_JPEG_QUALITY)
+        shot_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+        # 2) 思考：问 VLM 该元素的边界框（截图像素坐标）
+        prompt = ("请在这张截图中定位以下界面元素：%s。"
+                  "只返回它的边界框 JSON。" % description)
+        raw = _ask_vlm(shot_b64, prompt, system=_VLM_LOCATE_SYSTEM)
+        bbox = _parse_bbox(raw)
+        if bbox is None:
+            print("[eyes] locate_and_crop：未定位到「%s」，VLM 回复：%s"
+                  % (description, raw[:200]))
+            return None
+
+        # 3) 换算：截图像素 -> 屏幕物理像素（与 _vlm_to_screen 同一比例关系，
+        #    但按本次截图的实际尺寸计算，不依赖全局屏幕状态）
+        x1, y1, x2, y2 = bbox
+        sx = full.width / shot.width
+        sy = full.height / shot.height
+        px1 = int(round(x1 * sx))
+        py1 = int(round(y1 * sy))
+        px2 = int(round(x2 * sx))
+        py2 = int(round(y2 * sy))
+
+        # 4) 外扩边距并钳制在屏幕内，防止幻觉坐标越界
+        px1 = max(0, px1 - _CROP_MARGIN)
+        py1 = max(0, py1 - _CROP_MARGIN)
+        px2 = min(full.width, px2 + _CROP_MARGIN)
+        py2 = min(full.height, py2 + _CROP_MARGIN)
+        if px2 <= px1 or py2 <= py1:
+            print("[eyes] locate_and_crop：钳制后裁剪框为空，放弃")
+            return None
+
+        # 5) 裁剪保存：文件名 capture_时间戳_毫秒.png，毫秒防同秒连拍覆盖
+        os.makedirs(_CAPTURE_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        fname = "capture_%s_%03d.png" % (stamp, int(time.time() * 1000) % 1000)
+        path = os.path.join(_CAPTURE_DIR, fname)
+        full.crop((px1, py1, px2, py2)).save(path, format="PNG")
+        print("[eyes] locate_and_crop：已截取「%s」-> %s（框 %d,%d-%d,%d）"
+              % (description, path, px1, py1, px2, py2))
+        return path
+    except Exception as exc:  # VLM 网络失败、截屏失败等一律按定位失败处理
+        print("[eyes] locate_and_crop 未预期异常：%s" % exc)
+        return None

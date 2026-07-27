@@ -1,0 +1,29 @@
+# ===== 机密配置（绝不提交真实 API Key）=====
+jarvis/llm_config.json
+
+# ===== 运行时数据 / 个人隐私 =====
+jarvis/memory/
+jarvis/files/
+*.log
+*.bak
+server.pid
+
+# ===== Python =====
+__pycache__/
+*.pyc
+
+# ===== Node / 前端 =====
+node_modules/
+nolan-web/dist/
+
+# ===== 本地工具目录 =====
+.bin/
+
+# ===== 调试截图与语音样本 =====
+screenshot-*.png
+reference-ai.png
+voice-*.wav
+voice-test.mp3
+
+# ===== 自测临时产物 =====
+jarvis/_selftest_*
