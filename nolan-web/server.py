@@ -61,7 +61,7 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 # == 把 ../jarvis 加入 sys.path（用 __file__ 定位，与启动目录无关）==
 _JARVIS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "jarvis")
@@ -77,7 +77,7 @@ import memory      # noqa: E402  记忆：recall / load / remember / forget
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-07-23-smartgui"
+_VERSION = "2026-07-27-micfix2"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -261,7 +261,7 @@ def _glm_tts_to_file(text: str, path: str) -> bool:
             headers={"Authorization": f"Bearer {api_key}"},
             json={"model": "glm-tts", "input": text, "voice": "male",
                   "response_format": "wav"},
-            timeout=30,
+            timeout=12,  # 硬上界：主通道最多 12 秒，超时即放弃换备用通道
         )
         if resp.status_code == 200 and resp.content:
             with open(path, "wb") as f:
@@ -273,14 +273,62 @@ def _glm_tts_to_file(text: str, path: str) -> bool:
     return False
 
 
+def _tts_cached_url(text: str):
+    """缓存命中查询：sha1(文本) 对应的 .wav/.mp3 任一存在即返回 URL，否则 None（毫秒级，不联网）。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    base = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    for ext in (".wav", ".mp3"):
+        p = os.path.join(_TTS_CACHE_DIR, base + ext)
+        try:
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                return "/api/tts/" + base + ext
+        except OSError:
+            pass
+    return None
+
+
+def _run_with_deadline(fn, timeout: float):
+    """
+    在守护线程里执行 fn()，最多等 timeout 秒。
+    按时完成返回 fn 的返回值；超时返回 None（线程可能残留，但绝不阻塞调用方）。
+    这是修复『TTS 合成偶发挂死拖垮整个后端』的关键：发声链任何一步都有明确上界——
+    此前 edge-tts 无超时（aiohttp 默认 300 秒）、SAPI 在工作线程偶发挂死，
+    它们攥着合成锁不放，会把 /api/chat、/api/due 全部拖死，进而占满浏览器连接池。
+    """
+    box = {}
+    done = threading.Event()
+
+    def _run():
+        try:
+            box["result"] = fn()
+        except Exception as e:
+            print(f"[server] TTS 通道执行异常：{e}")
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, daemon=True).start()
+    if done.wait(timeout):
+        return box.get("result")
+    return None
+
+
+def _warm_tts_async(text: str) -> None:
+    """后台守护线程暖缓存：为 text 预先合成音频，同文本下次直接命中。"""
+    if not (text or "").strip():
+        return
+    threading.Thread(target=lambda: synth_for(text), daemon=True).start()
+
+
 def synth_for(text: str):
     """
     把 text 合成为音频存入缓存目录，返回音频 URL（形如 '/api/tts/<sha1>.wav|.mp3'）；
-    缓存命中（.wav/.mp3 任一）直接复用；全部通道失败返回 None。
+    缓存命中直接复用；全部通道失败返回 None。
 
-    发声链顺序（与 mouth.py 一致）：GLM-TTS 主通道（wav）→ edge-tts 备用（mp3，
-    失败间隔 1 秒重试一次）→ SAPI 离线兜底（wav）。不抛异常——音频是增强体验，
-    绝不能拖垮 API。
+    发声链顺序（与 mouth.py 一致）：GLM-TTS 主通道（wav，12s 上界）→ edge-tts 备用
+    （mp3，18s 上界）→ SAPI 离线兜底（wav，12s 上界）。每一步都有硬性时间上界，
+    任何通道挂死都只表现为『该通道放弃』，绝不阻塞请求、绝不拖垮 API。
     """
     text = (text or "").strip()
     if not text:
@@ -297,69 +345,63 @@ def synth_for(text: str):
         print(f"[server] TTS 缓存目录创建失败：{e}")
         return None
 
-    def _cache_hit():
-        """缓存命中三种通道产物任一即复用（wav：GLM-TTS/SAPI；mp3：edge-tts）。"""
-        for name, p in ((wav_name, wav_path), (mp3_name, mp3_path)):
-            if os.path.isfile(p) and os.path.getsize(p) > 0:
-                return "/api/tts/" + name
-        return None
-
     # 锁外先查一次缓存，命中不联网
-    hit = _cache_hit()
+    hit = _tts_cached_url(text)
     if hit:
         return hit
 
     with _tts_lock:
         # 持锁后再查一次：并发下别的线程可能已合成好
-        hit = _cache_hit()
+        hit = _tts_cached_url(text)
         if hit:
             return hit
 
-        # 通道一：GLM-TTS 主通道（智谱 glm-tts，wav）
+        # 通道一：GLM-TTS 主通道（智谱 glm-tts，wav；httpx 自带 12s 超时，有界）
         if _glm_tts_to_file(text, wav_path):
             return "/api/tts/" + wav_name
 
-        # 通道二：edge-tts 备用（mp3，瞬态抖动重试一次）
-        try:
+        # 通道二：edge-tts 备用（mp3，单次尝试 18s 硬上界；
+        # 不重试同一路径——超时线程可能仍在后台写该文件，并发双写会损坏缓存）
+        def _edge_once():
             import edge_tts
 
             async def _synth():
                 communicate = edge_tts.Communicate(text, _TTS_VOICE)
                 await communicate.save(mp3_path)
 
-            for attempt in (1, 2):
-                try:
-                    asyncio.run(_synth())
-                    if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
-                        return "/api/tts/" + mp3_name
-                    raise RuntimeError("合成结果为空文件")
-                except Exception as e:
-                    print(f"[server] edge-tts 合成第 {attempt} 次失败：{e}")
-                    if attempt == 1:
-                        time.sleep(1)  # 瞬态网络抖动常见，重试一次
-            # 彻底失败：清理半成品文件
-            try:
-                if os.path.exists(mp3_path):
-                    os.remove(mp3_path)
-            except OSError:
-                pass
-        except Exception as e:
-            print(f"[server] edge-tts 不可用：{e}")
+            asyncio.run(_synth())
+            return os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0
 
-        # 通道三：SAPI 离线兜底（wav）——
-        # 第一性原理：浏览器必须必定发声，音色可降级，声音不能缺席。
+        if _run_with_deadline(_edge_once, 18):
+            return "/api/tts/" + mp3_name
+        print("[server] edge-tts 未在 18 秒内完成，放弃本通道（残留线程写完即成正常缓存，无害）。")
+        # 清理空壳半成品，避免下次误判为缓存命中
         try:
+            if os.path.exists(mp3_path) and os.path.getsize(mp3_path) == 0:
+                os.remove(mp3_path)
+        except OSError:
+            pass
+
+        # 通道三：SAPI 离线兜底（wav，12s 硬上界）——
+        # 第一性原理：浏览器必须必定发声，音色可降级，声音不能缺席；
+        # 但 SAPI 在工作线程里偶发挂死，必须沙盒化，宁可放弃也不阻塞。
+        def _sapi_once():
             import pyttsx3
 
             engine = pyttsx3.init()
-            engine.save_to_file(text, wav_path)
-            engine.runAndWait()
-            engine.stop()
-            if os.path.isfile(wav_path) and os.path.getsize(wav_path) > 0:
-                print("[server] 在线通道均不可用，浏览器音频已降级为离线语音（wav）")
-                return "/api/tts/" + wav_name
-        except Exception as e:
-            print(f"[server] 离线语音合成也失败：{e}")
+            try:
+                engine.save_to_file(text, wav_path)
+                engine.runAndWait()
+            finally:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+            return os.path.isfile(wav_path) and os.path.getsize(wav_path) > 0
+
+        if _run_with_deadline(_sapi_once, 12):
+            print("[server] 在线通道均不可用，浏览器音频已降级为离线语音（wav）")
+            return "/api/tts/" + wav_name
         return None
 
 # == 语音识别（faster-whisper 懒加载单例）==
@@ -493,6 +535,25 @@ def _mic_debug_log(msg: str) -> None:
         pass
 
 
+# == 前端黑匣子（关键诊断设施）==
+# 已证实：浏览器端 fetch 的『响应丢失』只在用户的内嵌 webview 里发生，
+# curl/node 全部正常。/api/clientlog 是 fire-and-forget 上报通道——
+# 前端把每一步痕迹发过来（只依赖『请求能到达』，不依赖响应），
+# 落盘到 client_debug.log，下次卡死可精确还原断在哪一步。
+_CLIENT_DEBUG_FILE = os.path.normpath(os.path.join(_JARVIS_DIR, "files", "client_debug.log"))
+
+
+def _client_debug_log(msg: str) -> None:
+    """把前端上报的诊断事件追加到黑匣子日志；去换行防注入，截断防膨胀。"""
+    msg = (msg or "").replace("\r", " ").replace("\n", " ")[:300]
+    try:
+        os.makedirs(os.path.dirname(_CLIENT_DEBUG_FILE), exist_ok=True)
+        with open(_CLIENT_DEBUG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except OSError:
+        pass
+
+
 def _mic_start() -> None:
     """
     开始服务端录音。已在录音则先停掉重来。
@@ -538,10 +599,12 @@ def _mic_stop() -> str:
         _mic_frames = []
 
     if not frames:
+        _mic_debug_log("mic/stop 无音频帧（回调未采到声音，麦克风可能被独占）")
         return ""
 
     import numpy as np
     audio = np.concatenate(frames, axis=0).flatten()
+    _mic_debug_log(f"mic/stop 采到 {len(frames)} 帧，共 {audio.shape[0] / _MIC_SAMPLERATE:.1f} 秒音频")
     # 安全上限：只取前 60 秒音频（正常识别，不报错）
     max_samples = _MIC_MAX_SECONDS * _MIC_SAMPLERATE
     if audio.shape[0] > max_samples:
@@ -773,6 +836,23 @@ class NolanHandler(BaseHTTPRequestHandler):
             raise ValueError("请求体必须是 JSON 对象。")
         return data
 
+    def _discard_body(self) -> None:
+        """
+        读取并丢弃请求体（上限 1MB）。
+        有的 POST 端点不需要请求体，但客户端仍可能带 body（如 mic/stop 带 '{}'）：
+        不读干净会让残留字节污染 keep-alive 连接上的下一个请求，造成协议错位。
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        remaining = max(0, min(length, 1024 * 1024))
+        while remaining > 0:
+            chunk = self.rfile.read(min(65536, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     # -- 静默访问日志（保持控制台干净，可按需打开）--
     def log_message(self, fmt, *args):
         pass
@@ -799,6 +879,17 @@ class NolanHandler(BaseHTTPRequestHandler):
                     return
                 _mic_debug_log("mic/start(GET) 已开始录音")
                 self._send_json(200, {"ok": True})
+            elif path == "/api/mic/state":
+                # 录音状态查询（关键修复）：前端发起 start 后轮询本端点确认服务端
+                # 真实录音状态，不再依赖单次 start 请求的响应——响应丢失也能自愈
+                with _mic_lock:
+                    rec = _mic_recording
+                self._send_json(200, {"recording": rec})
+            elif path == "/api/clientlog":
+                # 前端黑匣子上报：fire-and-forget，只负责落痕（GET 简单请求，无预检）
+                msg = parse_qs(urlparse(self.path).query).get("m", [""])[0]
+                _client_debug_log(msg)
+                self._send_json(200, {"ok": True})
             elif path == "/api/version":
                 # 版本端点：让『当前后端跑的是不是最新代码』一眼可验
                 # （陈旧进程返回旧版本号，PID 可对照任务管理器核对）
@@ -807,8 +898,12 @@ class NolanHandler(BaseHTTPRequestHandler):
                 messages = reminders.check_due() or []
                 out = []
                 for msg in messages:
-                    # 契约：每条消息携带合成音频 URL（失败为 None）
-                    out.append({"text": msg, "audio_url": synth_for(msg)})
+                    # 音频异步化（关键修复）：响应只带缓存命中（毫秒级，通常首轮为 None），
+                    # 未命中交给后台线程合成暖缓存——此前在这里同步 synth_for，
+                    # TTS 一慢/一挂，15 秒轮询就挂住，占满浏览器连接池，
+                    # 连累麦克风等所有请求排队卡死。闹钟声音由音箱通道保证必达。
+                    out.append({"text": msg, "audio_url": _tts_cached_url(msg)})
+                    _warm_tts_async(msg)
                     # 闹钟必响：服务端音箱连续播报两遍
                     _speak_alarm_async(msg)
                 self._send_json(200, {"messages": out})
@@ -862,6 +957,7 @@ class NolanHandler(BaseHTTPRequestHandler):
             elif path == "/api/mic/start":
                 # 服务端直接开麦录音，绕开浏览器麦克风权限
                 _mic_debug_log("mic/start 收到请求")
+                self._discard_body()  # 读净请求体，防止残留字节污染 keep-alive 连接
                 try:
                     _mic_start()
                 except RuntimeError as e:
@@ -873,6 +969,7 @@ class NolanHandler(BaseHTTPRequestHandler):
             elif path == "/api/mic/stop":
                 # 停止录音并识别；未在录音/无语音返回 {"text": ""}
                 _mic_debug_log("mic/stop 收到请求")
+                self._discard_body()  # 读净请求体（前端会带 '{}'），防止污染 keep-alive 连接
                 try:
                     text = _mic_stop()
                 except RuntimeError as e:

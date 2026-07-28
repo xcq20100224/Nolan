@@ -8,7 +8,7 @@ import HistoryOverlay from '@/sections/HistoryOverlay'
 import NegaInput from '@/sections/NegaInput'
 import type { WaveMode } from '@/sections/WaveCanvas'
 import type { Message } from '@/types/message'
-import { checkHealth, sendChat, getDueMessages, getMemoryText, getRemindersText, playAudio, soundTest, getBackground } from '@/lib/api'
+import { checkHealth, sendChat, getDueMessages, getMemoryText, getRemindersText, playAudio, soundTest, getBackground, clientLog } from '@/lib/api'
 
 /** 当前时间，格式 HH:MM（24 小时制） */
 function nowHHMM(): string {
@@ -124,7 +124,11 @@ export default function ChatApp() {
     if (bootedRef.current) return
     bootedRef.current = true
 
-    checkHealth().then(setOnline)
+    clientLog('页面加载 build 0727-6')
+    checkHealth().then((ok) => {
+      clientLog(`健康检查: ${ok}`)
+      setOnline(ok)
+    })
     setMessages([{ id: nextId(), role: 'nolan', text: '先生，Nolan 在线，请讲。', time: nowHHMM() }])
   }, [])
 
@@ -270,7 +274,7 @@ export default function ChatApp() {
 
         {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
         <span className="pointer-events-none absolute bottom-2 right-3 text-[10px] font-light tracking-widest text-[#3a3a40]">
-          build 0727-3
+          build 0727-6
         </span>
       </div>
     </div>

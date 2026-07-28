@@ -6,7 +6,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { Mic, SendHorizontal } from 'lucide-react'
-import { micStart, micStop } from '@/lib/api'
+import { micStart, micStop, micState, clientLog } from '@/lib/api'
 
 /** 「没听清」等占位提示的显示时长（毫秒） */
 const HINT_MS = 3000
@@ -49,6 +49,8 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
   const unmountedRef = useRef(false)
   // stop 请求进行中（识别可能耗时），防止连点重复触发
   const stoppingRef = useRef(false)
+  // start 流程进行中（发起请求 + 轮询确认），防止连点重复触发
+  const startingRef = useRef(false)
 
   // 回调入 ref，保证异步回调里取到的永远是最新闭包
   const onSendRef = useRef(onSend)
@@ -87,14 +89,16 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
 
   /** 点击麦克风：录音中则停止并识别，否则通知服务端开始录音 */
   const handleMic = async () => {
-    if (disabled || stoppingRef.current) return
+    if (disabled || stoppingRef.current || startingRef.current) return
 
     if (recording) {
       // 停止：服务端停止录音并返回识别文本（识别需要几秒，先播报状态）
+      clientLog('点击-停止录音')
       stoppingRef.current = true
       reportStatus('正在识别，请稍候……')
       try {
         const result = (await micStop()).trim()
+        clientLog(`识别返回 ${result.length} 字: ${result.slice(0, 30)}`)
         if (unmountedRef.current) return
         leaveRecording()
         if (result) {
@@ -119,26 +123,53 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
       return
     }
 
-    // 开始：通知服务端录音，失败则保持空闲态并提示（不置灰，可重试）
+    // 开始：双保险机制——
+    // ① 发起 start 请求（内部最多重试 3 次，服务端录音幂等可重开）；
+    // ② 不依赖单次请求的响应，随后轮询 /api/mic/state 确认服务端真实录音状态，
+    //    响应丢失也能自愈。6 秒内未确认才判定失败（保持空闲态，可重试，不置灰）。
+    startingRef.current = true
+    clientLog('点击-开始录音')
     reportStatus('已收到指令，正在启动麦克风……')
-    const ok = await micStart()
-    if (unmountedRef.current) return
-    if (!ok) {
-      flashHint('先生，麦克风暂时不可用，请直接打字')
-      reportStatus('先生，麦克风启动失败——服务端拒绝了开始请求，请重试，或直接打字告诉我。')
-      return
+    try {
+      void micStart() // 点火即可，确认靠下方的状态轮询
+      const deadline = Date.now() + 6000
+      let started = false
+      while (Date.now() < deadline && !unmountedRef.current) {
+        const state = await micState()
+        clientLog(`轮询录音状态: ${state === null ? '查询失败' : state}`)
+        if (state === true) {
+          started = true
+          break
+        }
+        await new Promise((r) => setTimeout(r, 400))
+      }
+      if (unmountedRef.current) return
+      if (!started) {
+        clientLog('启动失败：6秒内未确认录音开始')
+        flashHint('先生，麦克风暂时不可用，请直接打字')
+        reportStatus('先生，麦克风启动失败——服务端没有确认录音开始，请重试，或直接打字告诉我。')
+        return
+      }
+      clientLog('已确认服务端录音中，进入聆听态')
+      setSeconds(0)
+      setRecording(true)
+      // 上报录音状态，中央声波切换为模拟律动
+      onRecordingChangeRef.current(true)
+      reportStatus('🎤 正在聆听，先生。说完请再点一次麦克风。')
+      // 秒数计时
+      timerRef.current = window.setInterval(() => setSeconds((s) => s + 1), 1000)
+    } finally {
+      startingRef.current = false
     }
-    setSeconds(0)
-    setRecording(true)
-    // 上报录音状态，中央声波切换为模拟律动
-    onRecordingChangeRef.current(true)
-    reportStatus('🎤 正在聆听，先生。说完请再点一次麦克风。')
-    // 秒数计时
-    timerRef.current = window.setInterval(() => setSeconds((s) => s + 1), 1000)
   }
 
   // 组件卸载：清理计时器；若仍在录音，尽力通知服务端停止（服务端未录音时返回空串，调用安全）
   useEffect(() => {
+    // 关键：setup 里必须把卸载标记复位——StrictMode 开发模式会执行
+    // setup → cleanup → setup，cleanup 会把标记置 true，不复位的话
+    // 组件实例（ref 随实例存活）将永远认为『已卸载』，
+    // 导致录音流程每次都在 micStart 成功后被静默丢弃（本次卡死的根因）
+    unmountedRef.current = false
     return () => {
       unmountedRef.current = true
       stopTimer()

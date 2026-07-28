@@ -1,5 +1,10 @@
 // Nolan 后端 API 封装
-// 一律使用相对路径 '/api/...'，由 vite dev server 代理到 7101 端口的 Python 后端
+// 默认走相对路径 '/api/...'（vite 代理到 7101）；
+// 内嵌 webview 被证实存在『代理链路响应丢失』问题，故关键端点支持
+// 直连兜底：http://127.0.0.1:7101（CORS 已放开，GET 为简单请求无预检）
+
+/** 直连后端的兜底地址（绕过 vite 代理这一中间人） */
+const DIRECT_BASE = 'http://127.0.0.1:7101'
 
 /** 通用 JSON 请求助手：失败时抛出带说明的错误 */
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -11,6 +16,43 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     throw new Error(`请求失败：${url}，状态码 ${res.status}`)
   }
   return (await res.json()) as T
+}
+
+/**
+ * 手动超时 fetch：AbortSignal.timeout 在部分内嵌 webview 不可用（且对排队中的
+ * 请求行为不一），用 AbortController + setTimeout 实现同等能力，兼容性最好
+ */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+): Promise<Response> {
+  const ctrl = new AbortController()
+  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal })
+  } finally {
+    window.clearTimeout(timer)
+  }
+}
+
+/**
+ * 前端黑匣子：把诊断事件 fire-and-forget 上报到后端 /api/clientlog 落盘。
+ * 关键特性——只依赖『请求能到达后端』，不依赖响应（响应丢失已在本机
+ * webview 上被证实）。代理、直连双通道各发一份，确保至少一条到达。
+ */
+export function clientLog(msg: string): void {
+  const q = `/api/clientlog?m=${encodeURIComponent(msg)}`
+  try {
+    void fetch(q).catch(() => undefined)
+  } catch {
+    /* 忽略 */
+  }
+  try {
+    void fetch(DIRECT_BASE + q).catch(() => undefined)
+  } catch {
+    /* 忽略 */
+  }
 }
 
 /** 健康检查：GET /api/health → {"ok": true, "name": "Nolan"} */
@@ -86,33 +128,81 @@ export async function transcribe(blob: Blob): Promise<string> {
 }
 
 /**
- * 服务端开始录音：POST /api/mic/start → {"ok": true}
- * 麦克风由服务端（sounddevice）直采，浏览器只当遥控器，无需任何浏览器权限
- * 返回是否成功开始（请求失败 / ok 非 true 均视为不可用）
+ * 服务端开始录音：GET /api/mic/start → {"ok": true}
+ * 麦克风由服务端（sounddevice）直采，浏览器只当遥控器，无需任何浏览器权限。
+ * 双通道点火：先走 vite 代理，失败再走 7101 直连（绕过代理中间人）——
+ * 服务端录音幂等可重开，重复 start 无害；每通道 2 次尝试、3 秒上界。
+ * 全程黑匣子落痕，响应丢失也能从后端日志还原链路。
  */
 export async function micStart(): Promise<boolean> {
-  try {
-    // GET 通道：内嵌 webview 对无响应体的 POST 可能挂起，GET 兼容性最强
-    const data = await fetchJson<{ ok: boolean }>('/api/mic/start', {
-      signal: AbortSignal.timeout(8000),
-    })
-    return data.ok === true
-  } catch {
-    return false
+  for (const base of ['', DIRECT_BASE]) {
+    const via = base === '' ? 'proxy' : 'direct'
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      clientLog(`micStart 发起(${via}#${attempt})`)
+      try {
+        const res = await fetchWithTimeout(base + '/api/mic/start', undefined, 3000)
+        clientLog(`micStart 响应(${via}#${attempt}) status=${res.status}`)
+        if (res.ok) {
+          const data = (await res.json()) as { ok?: boolean }
+          if (data.ok === true) return true
+        }
+      } catch (e) {
+        clientLog(`micStart 异常(${via}#${attempt}) ${e instanceof Error ? e.message : String(e)}`)
+      }
+      await new Promise((r) => setTimeout(r, 300))
+    }
   }
+  return false
+}
+
+/**
+ * 服务端录音状态：GET /api/mic/state → {"recording": bool}
+ * 前端发起 start 后轮询本端点确认服务端真实录音状态——不依赖单次 start 请求的
+ * 响应本身，响应丢失也能自愈。代理失败自动切直连；null 表示两通道都失败。
+ */
+export async function micState(): Promise<boolean | null> {
+  for (const base of ['', DIRECT_BASE]) {
+    try {
+      const res = await fetchWithTimeout(base + '/api/mic/state', undefined, 2000)
+      if (!res.ok) continue
+      const data = (await res.json()) as { recording?: boolean }
+      return data.recording === true
+    } catch {
+      // 本通道失败，换直连通道
+    }
+  }
+  return null
 }
 
 /**
  * 服务端停止录音并识别：POST /api/mic/stop → {"text": "..."}
- * 无语音 / 未在录音时返回空串；请求失败抛错，由调用方兜底提示
+ * 无语音 / 未在录音时返回空串；代理失败自动切直连；两通道都失败抛错。
+ * medium 模型在 CPU 上识别长录音可能耗时数十秒，给 60 秒上界。
  */
 export async function micStop(): Promise<string> {
-  const data = await fetchJson<{ text?: string }>('/api/mic/stop', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: '{}',
-  })
-  return typeof data.text === 'string' ? data.text : ''
+  let lastErr: unknown = null
+  for (const base of ['', DIRECT_BASE]) {
+    const via = base === '' ? 'proxy' : 'direct'
+    clientLog(`micStop 发起(${via})`)
+    try {
+      const res = await fetchWithTimeout(
+        base + '/api/mic/stop',
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+        60_000,
+      )
+      clientLog(`micStop 响应(${via}) status=${res.status}`)
+      if (!res.ok) {
+        lastErr = new Error(`请求失败：/api/mic/stop，状态码 ${res.status}`)
+        continue
+      }
+      const data = (await res.json()) as { text?: string }
+      return typeof data.text === 'string' ? data.text : ''
+    } catch (e) {
+      clientLog(`micStop 异常(${via}) ${e instanceof Error ? e.message : String(e)}`)
+      lastErr = e
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('mic/stop 两通道均失败')
 }
 
 /**
