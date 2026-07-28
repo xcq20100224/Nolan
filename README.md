@@ -6,6 +6,22 @@
 
 > 🇨🇳 以下为中文详细版。
 
+![Nolan 网页版界面](docs/screenshot.png)
+
+---
+
+## ⚡ 10 分钟快速开始（Windows）
+
+1. **克隆仓库**：`git clone https://github.com/xcq20100224/Nolan.git`
+2. **一键安装**：双击运行根目录的 `install.bat`（自动建虚拟环境、装全部 Python 与前端依赖；需要提前装好 [Python 3.10+](https://www.python.org/downloads/) 和 [Node.js LTS](https://nodejs.org)）
+3. **填 API Key**：用记事本打开 `jarvis/llm_config.json`，把 `api_key` 改成你的智谱 API Key（[open.bigmodel.cn](https://open.bigmodel.cn) 免费申请）
+4. **启动**：双击 `Nolan-Web.bat`（或在 `nolan-web` 目录执行 `npm run dev`）
+5. **使用**：浏览器打开 http://localhost:7100 （推荐 Chrome / Edge，语音需要麦克风权限）
+
+### 🎤 语音用法
+
+点一下界面上的 **🎤 麦克风按钮**（或按 **Alt 键**）开始说话，说完**再点一次 🎤**（或再按一次 Alt）停止录音，Nolan 会自动识别、思考并语音回复你。
+
 ---
 
 ## Nolan 是什么
@@ -53,8 +69,8 @@ Nolan 是一个**本地优先的 Windows 中文语音 AI 管家**：对着麦克
 ### 1. 安装依赖
 
 ```bash
-# Python 依赖（建议 Python 3.10+，虚拟环境）
-pip install sounddevice faster-whisper edge-tts pygame numpy httpx beautifulsoup4 pyttsx3 pyautogui mss
+# Python 依赖（建议 Python 3.10+，虚拟环境；install.bat 已自动完成）
+pip install -r requirements.txt
 
 # 网页版前端依赖
 cd nolan-web
@@ -65,7 +81,8 @@ npm install
 
 ```bash
 # 复制示例配置并填入你自己的智谱 API Key（https://open.bigmodel.cn）
-cp jarvis/llm_config.example.json jarvis/llm_config.json
+# install.bat 已自动完成复制，此处为手动方式
+copy jarvis\llm_config.json.example jarvis\llm_config.json
 # 编辑 llm_config.json，把 api_key 改成你的真实 Key
 ```
 
@@ -114,7 +131,7 @@ Nolan 依赖[智谱开放平台](https://open.bigmodel.cn)的 GLM 系列模型�
 ```
 Nolan/
 ├── jarvis/          # Python 后端：ears / brain / hands / eyes / memory / mouth + 自测
-│   ├── llm_config.example.json   # 配置模板（复制为 llm_config.json 并填 Key）
+│   ├── llm_config.json.example   # 配置模板（install.bat 会自动复制为 llm_config.json）
 │   └── test_jarvis.py            # 免麦克风全链路自动测试
 ├── nolan-web/       # React + Vite 网页版（NEGA 风驾驶舱）+ Python 标准库后端
 ├── Nolan.bat        # 桌面 GUI 启动器

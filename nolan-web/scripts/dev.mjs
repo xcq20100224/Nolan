@@ -2,18 +2,47 @@
 // 先拉起 Python 标准库后端（server.py，端口 7101），再启动 Vite 前端，
 // 退出时负责把后端子进程树一并清理掉。
 import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 // 项目根目录（本文件位于 <root>/scripts/dev.mjs）
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-// 运行后端的 Python 解释器。
-// 可用环境变量 NOLAN_PYTHON 覆盖为你自己的 Python（需已安装 jarvis 依赖），
-// 例如：set NOLAN_PYTHON=C:\Python311\python.exe
-const PYTHON_EXE =
-  process.env.NOLAN_PYTHON ||
-  "C:\\Users\\J1896\\AppData\\Roaming\\kimi-desktop\\daimon-share\\daimon\\runtime\\python\\.venv\\Scripts\\python.exe";
+// 运行后端的 Python 解释器，按以下优先级自动探测：
+//   1. 环境变量 NOLAN_PYTHON（手动指定，最高优先级）
+//   2. 仓库根目录 .venv\Scripts\python.exe（install.bat 创建的虚拟环境）
+//   3. 系统 PATH 里的 python（where python / which python）
+// 全部找不到时打印中文报错并退出，提示先运行 install.bat。
+function resolvePython() {
+  if (process.env.NOLAN_PYTHON) {
+    return process.env.NOLAN_PYTHON;
+  }
+  const repoRoot = path.resolve(projectRoot, "..");
+  const venvPython = path.join(repoRoot, ".venv", "Scripts", "python.exe");
+  if (fs.existsSync(venvPython)) {
+    return venvPython;
+  }
+  const probe = spawnSync(process.platform === "win32" ? "where" : "which", ["python"], {
+    encoding: "utf8",
+  });
+  if (probe.status === 0 && probe.stdout) {
+    const first = probe.stdout.split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+    if (first) {
+      return first;
+    }
+  }
+  return null;
+}
+
+const PYTHON_EXE = resolvePython();
+if (!PYTHON_EXE) {
+  console.error("[dev] 错误：找不到可用的 Python 解释器。");
+  console.error("[dev] 请先在仓库根目录双击运行 install.bat 完成环境安装；");
+  console.error("[dev] 或设置环境变量 NOLAN_PYTHON 指向你的 python.exe 后重试。");
+  process.exit(1);
+}
+console.log(`[dev] 使用 Python 解释器：${PYTHON_EXE}`);
 
 // 启动 Python 后端：python server.py 7101，工作目录为项目根
 const backend = spawn(PYTHON_EXE, ["-u", "server.py", "7101"], {

@@ -1,0 +1,23 @@
+# Nolan Python 依赖清单（Windows，Python 3.10+）
+# 由 install.bat 自动安装；版本均为宽松下限约束，取最新稳定版即可。
+
+# ===== 大脑 brain / 眼睛 eyes：智谱 GLM API 调用 =====
+httpx>=0.27
+
+# ===== 耳朵 ears：本地中文语音识别 =====
+faster-whisper>=1.0
+sounddevice>=0.4.6
+numpy>=1.26
+
+# ===== 嘴巴 mouth：语音播报 =====
+edge-tts>=6.1        # 在线 TTS（GLM-TTS 之外的通道）
+pygame>=2.5          # 音频播放
+pyttsx3>=2.90        # 离线 TTS 兜底（延迟导入，仅兜底时加载）
+
+# ===== 眼睛 eyes：屏幕感知与 GUI 自动化 =====
+pyautogui>=0.9.54    # 键鼠操作
+pyperclip>=1.8       # 剪贴板读写
+pillow>=10.0         # 截屏（PIL.ImageGrab）
+
+# ===== 手 hands：网页搜索工具 =====
+beautifulsoup4>=4.12  # 必应搜索结果页解析（延迟导入）
