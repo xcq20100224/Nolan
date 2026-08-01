@@ -323,7 +323,18 @@ def test_hands_tools() -> None:
     if real_startfile is None:
         _check("os.startfile 可用（Windows 专属）", False, "当前环境无 os.startfile")
     else:
+        # open_app 执行后自检配套：假 startfile 成功的分支视为窗口出现
+        # （_wait_for_window 一并 monkeypatch）；cmd start 兜底也不真的执行
+        real_wait = hands._wait_for_window
+        real_cmd_start = hands._cmd_start
+        real_find = hands._find_window
+        real_proc = hands._process_running
+        window_flag = {"ok": True}
         os.startfile = _fake_startfile  # type: ignore[attr-defined]
+        hands._wait_for_window = lambda _t, timeout=8.0: window_flag["ok"]  # noqa: E731
+        hands._cmd_start = lambda _term: None  # noqa: E731
+        hands._find_window = lambda _t: False  # 假世界里没有任何已存在的窗口
+        hands._process_running = lambda _x: False  # 假世界里没有任何已运行的进程
         try:
             # 打开 VSCode：应命中别名/已知路径，返回含『打开』的确认
             reply_vscode = hands.execute("open_app", {"app": "vscode"})
@@ -390,11 +401,13 @@ def test_hands_tools() -> None:
                 _recording_success(args)
 
             os.startfile = _tracking_startfile  # type: ignore[attr-defined]
+            window_flag["ok"] = False  # 不存在的应用：窗口永不出现 -> 如实失败话术
             reply_missing = hands.execute("open_app", {"app": "不存在的东西xyz123"})
+            window_flag["ok"] = True
             _check(
-                "open_app('不存在的东西xyz123') 返回含『没有找到』或『抱歉』",
+                "open_app('不存在的东西xyz123') 返回如实话术（含『抱歉』）",
                 isinstance(reply_missing, str)
-                and ("没有找到" in reply_missing or "抱歉" in reply_missing),
+                and "抱歉" in reply_missing,
                 f"得到：{reply_missing!r}",
             )
             _check(
@@ -403,8 +416,12 @@ def test_hands_tools() -> None:
                 f"成功调用 {len(success_calls)} 次：{success_calls!r}",
             )
         finally:
-            # 无论断言成败，必须恢复真正的 os.startfile
+            # 无论断言成败，必须恢复真正的 os.startfile 与窗口等待/兜底原语
             os.startfile = real_startfile  # type: ignore[attr-defined]
+            hands._wait_for_window = real_wait
+            hands._cmd_start = real_cmd_start
+            hands._find_window = real_find
+            hands._process_running = real_proc
         _check("测试后 os.startfile 已恢复", os.startfile is real_startfile)
 
     # --- 大脑意图映射抽查 ---

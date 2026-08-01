@@ -77,7 +77,7 @@ import memory      # noqa: E402  记忆：recall / load / remember / forget
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-07-27-micfix2"
+_VERSION = "2026-08-01-stage1"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -698,17 +698,18 @@ def _chat(user_text: str) -> dict:
 
     with _brain_lock:
         reply = brain.think(user_text, list(_history))
+        # 历史写入与裁剪也在同一临界区内：与 brain.think 串行化，
+        # 杜绝并发请求把对话历史交错、裁剪互相覆盖
+        if reply != "__EXIT__":
+            _history.append({"role": "user", "content": user_text})
+            _history.append({"role": "assistant", "content": reply})
+            if len(_history) > _HISTORY_MAX_TURNS * 2:
+                _history = _history[-_HISTORY_MAX_TURNS * 2:]
 
     if reply == "__EXIT__":
         farewell = "好的先生，我先去休息了，随时叫我的名字就能唤醒我。"
         _speak_async(farewell)
         return {"reply": farewell, "audio_url": synth_for(farewell), "exit": True}
-
-    # 写入历史并裁剪到最近 20 轮（每轮 user+assistant 两条）
-    _history.append({"role": "user", "content": user_text})
-    _history.append({"role": "assistant", "content": reply})
-    if len(_history) > _HISTORY_MAX_TURNS * 2:
-        _history = _history[-_HISTORY_MAX_TURNS * 2:]
 
     _speak_async(reply)
     return {"reply": reply, "audio_url": synth_for(reply)}

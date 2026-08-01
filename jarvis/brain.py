@@ -127,6 +127,12 @@ def _is_composite(text: str) -> bool:
     """判断一句话是否为多意图复合任务（连接词 或 命中多个动作触发组）。"""
     if any(marker in text for marker in _COMPOSITE_MARKERS):
         return True
+    # 写文件句式 + 时间词（如「把今天的日期写到 x.txt」）：写入内容需要
+    # 运行时动态求值，规则层只会被时间规则劫持或写死字面量，交给 LLM Agent 循环
+    if any(w in text for w in ("写到", "写进", "写入", "记到", "保存到")) and any(
+        k in text for k in _TIME_KEYS
+    ):
+        return True
     hits = sum(1 for group in _ACTION_GROUPS if any(word in text for word in group))
     return hits >= 2
 
@@ -218,9 +224,11 @@ def _handle_reminder_intent(text: str) -> str | None:
     if reminders is None:
         return None
     try:
-        # 新增提醒：含「提醒我」，取其后的原文交给 reminders 解析时间与内容
+        # 新增提醒：含「提醒我」，把「提醒我」从句中剔除后整句交给 reminders
+        # 解析时间与内容——兼容「提醒我 1 分钟后喝水」（时间在后）与
+        # 「10 秒后提醒我 测试弹出」（时间在前）两种语序
         if "提醒我" in text:
-            raw = text.split("提醒我", 1)[1].strip(" ，。！？：:帮我请把")
+            raw = text.replace("提醒我", "", 1).strip(" ，。！？：:帮我请把")
             if not raw:
                 return "好的先生，请问要我在什么时候提醒您什么？"
             return reminders.add(raw)
@@ -392,6 +400,25 @@ def _execute_tool(tool: str, args: dict) -> str:
     global _pending_shell
     args = args or {}
     result = hands.execute(tool, args)
+    # 失败自动换路（gui_control 专用）：眼睛报告「目标应用缺失」时，
+    # 自动提取应用名 -> open_app 打开（其内置窗口等待）-> 原任务重放一次，
+    # 返回第二次的结果。视觉模块断连 / 安全中止 / 步数超限一律不重试。
+    if (
+        tool == "gui_control"
+        and isinstance(result, str)
+        and "请先让我用 open_app 打开它" in result
+    ):
+        hint = None
+        try:
+            hint = hands._extract_app_hint(str(args.get("task", "")))
+        except Exception:  # noqa: BLE001 - 提取失败按无 hint 处理
+            hint = None
+        if hint:
+            print(f"[brain] gui_control 报告目标应用缺失，自动打开「{hint}」后重放一次……")
+            hands.execute("open_app", {"app": hint})
+            retry_args = dict(args)
+            retry_args["confirmed"] = True
+            return hands.execute("gui_control", retry_args)
     if isinstance(result, str) and result.startswith("[[NEEDS_CONFIRM]]"):
         _pending_shell = {"tool": tool, "args": dict(args)}
         if tool == "run_shell":
@@ -538,13 +565,15 @@ def _parse_tool_call(reply: str) -> dict | None:
     工具 JSON 检测：优先整段解析；若回复是「文本 + JSON」混合
     （如『我来写入文件。{"tool": ...}』），扫描每个 { 位置尝试 raw_decode，
     取第一个含 'tool' 键的 JSON 对象；都没有返回 None（视为普通文本）。
+    解码器用 strict=False：容忍大模型在 JSON 字符串值里写未转义的
+    控制字符（最常见的是正文里直接换行），避免把可执行的指令误判成普通文本。
     """
     if hands is None or not reply:
         return None
     text = reply.strip()
+    decoder = json.JSONDecoder(strict=False)
     if not text.startswith("{"):
         # 混合回复：逐个 { 位置尝试解码，寻找内嵌的工具调用
-        decoder = json.JSONDecoder()
         for idx, ch in enumerate(text):
             if ch != "{":
                 continue
@@ -556,7 +585,7 @@ def _parse_tool_call(reply: str) -> dict | None:
                 return call
         return None
     try:
-        call = json.loads(text)
+        call = json.loads(text, strict=False)
     except ValueError:
         return None
     if isinstance(call, dict) and "tool" in call:
@@ -613,6 +642,27 @@ def _think_via_llm(user_text: str, history: list[dict]) -> str | None:
             return None  # 大模型链路故障：整体降级，交给规则兜底
         call = _parse_tool_call(reply)
         if call is None:
+            # 防泄漏 + 自愈：回复形似工具调用（含 "tool"/"args"）却解析失败时，
+            # 那是格式残缺的执行指令——绝不能当普通文本播报给先生；
+            # 轮次预算内回灌一条格式纠正指令让大模型重发（畸形是瞬态非确定性），
+            # 预算耗尽才如实汇报失败
+            if '"tool"' in reply and '"args"' in reply:
+                print("[brain] 大模型返回了无法解析的工具 JSON（格式残缺），要求其重发。")
+                if round_no < _MAX_TOOL_ROUNDS:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[系统提示] 你上一条回复是无法解析的 JSON，未被执行。"
+                            "请严格输出一个合法的 JSON 工具调用"
+                            "（字符串值内的换行必须写成 \\n 转义、引号必须成对转义），"
+                            "或者放弃工具、改用纯文本直接回答。"
+                        ),
+                    })
+                    continue
+                return (
+                    "抱歉先生，我在组织执行指令时格式出了点问题，这一步没能完成；"
+                    "请您再说一遍，我重新组织一次。"
+                )
             return reply  # 普通文本：Agent 循环结束，作为最终回复
         result = _execute_tool(call["tool"], call.get("args") or {})
         if not isinstance(result, str):

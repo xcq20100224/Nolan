@@ -148,6 +148,77 @@ def _start_app(target: str) -> bool:
         return False
 
 
+def _cmd_start(term: str) -> None:
+    """
+    cmd start 兜底拉起：别名/PATH/已知路径/lnk/ShellExecute 全部失败后的
+    最后一招——`start ""` 经 cmd 再试一次解析（立即返回不阻塞）。
+    任何失败都吞掉；是否真拉起由调用方的窗口自检判定。
+    """
+    try:
+        subprocess.run(
+            f'start "" "{term}"', shell=True, timeout=5,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=os.path.expanduser("~"),
+        )
+    except Exception:
+        pass
+
+
+def _process_running(exe_basename: str) -> bool:
+    """
+    tasklist 查进程是否存在（按镜像名匹配，大小写不敏感，自动补 .exe）。
+    任何异常返回 False——进程探测是补救链的辅助证据，绝不拖垮主流程。
+    """
+    try:
+        name = (exe_basename or "").strip().lower()
+        if not name:
+            return False
+        if not name.endswith(".exe"):
+            name += ".exe"
+        out = subprocess.run(
+            ["tasklist", "/fo", "csv", "/nh", "/fi", f"imagename eq {name}"],
+            capture_output=True, timeout=10,
+        )
+        raw = out.stdout or b""
+        for enc in ("gbk", "utf-8"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = raw.decode("gbk", errors="replace")
+        return name in text.lower()
+    except Exception:
+        return False
+
+
+def _exe_candidates(term: str, started: list) -> list:
+    """
+    进程探测用的 exe basename 候选（去重）：
+      1. 成功启动过的目标里的 .exe 文件名（去扩展名）；
+      2. 别名表中映射到同一搜索词的纯英文键（如 cloudmusic -> 网易云音乐）；
+      3. 搜索词本身（纯 ASCII 时，去空格）。
+    """
+    cands = []
+
+    def _add(x):
+        x = (x or "").strip().lower()
+        if x and x not in cands:
+            cands.append(x)
+
+    for target in started:
+        base = os.path.basename(str(target)).lower()
+        if base.endswith(".exe"):
+            _add(base[:-4])
+    for key, val in APP_ALIASES.items():
+        if val == term and re.fullmatch(r"[a-z0-9_\-]+", key):
+            _add(key)
+    if re.fullmatch(r"[a-z0-9_\- ]+", term or ""):
+        _add(term.replace(" ", ""))
+    return cands
+
+
 def _normalize_term(name: str) -> str:
     """
     把口语化应用名归一化成搜索词：
@@ -256,44 +327,109 @@ def _open_app(app: str) -> str:
     """
     通用化打开本机应用，永不抛异常。
     解析顺序：别名表（归一化 + 模糊匹配）-> PATH(shutil.which) -> 已知安装路径
-    -> 开始菜单/桌面 .lnk 递归搜索 -> ShellExecute 直接解析。
-    全部失败时返回礼貌话术。
+    -> 开始菜单/桌面 .lnk 递归搜索 -> ShellExecute 直接解析 -> cmd start 兜底。
+
+    执行后自检（可靠闭环）：每一级 _start_app 不再「不抛异常即成功」，
+    必须等目标窗口真实出现（_wait_for_window）才宣布成功；未出现则继续下一级。
+    窗口搜索词只用解析后的应用名（标点截断 + 别名表键 + exe basename），
+    绝不让「打开网易云音乐，播放第一首歌」这类混合句的任务描述混进搜索词。
+    全部候选启动后仍无窗口时走托盘/已运行补救链（进程探测 -> 二次唤出 ->
+    再等等 -> 如实区分「已经在运行」与「没看到窗口」），绝不误报失败。
     """
     try:
         app = app.strip()
         if not app:
             return "抱歉先生，您没有告诉我要打开什么应用。"
 
+        # 语音指令常把任务描述混进应用名：取标点前的第一段作为候选应用名
+        name = re.split(r"[，。！？；,.!?;]", app, maxsplit=1)[0].strip() or app
+
         # 第一步：通用别名解析（归一化 + 精确 + 双向子串），得到统一搜索词
-        term = _resolve_alias(app)
+        term = _resolve_alias(name)
         if not term:
-            term = app
+            term = name
+
+        # 窗口自检搜索词：别名解析词 + 候选名 + 别名表键（中英文系统的
+        # 窗口标题各覆盖一边；绝不含标点后的任务描述）
+        wait_terms = []
+        for t in (term, name):
+            t = (t or "").strip()
+            if t and t not in wait_terms:
+                wait_terms.append(t)
+        for key, val in APP_ALIASES.items():
+            if val == term and key not in wait_terms:
+                wait_terms.append(key)
+
+        # 幂等短路：目标窗口已在屏幕上时不重复拉起进程，直接如实确认
+        for t in wait_terms:
+            if _find_window(t):
+                return f"好的先生，{name}已经打开了。"
+
+        def _appeared(timeout: float = _WINDOW_VERIFY_TIMEOUT) -> bool:
+            """把等待预算均摊给各候选搜索词，任一窗口出现即视为启动成功。"""
+            per = max(1.0, timeout / len(wait_terms))
+            return any(_wait_for_window(t, timeout=per) for t in wait_terms)
+
+        started = []  # 成功 _start_app 过的目标，供托盘补救链二次唤出与进程探测
+
+        def _start_and_record(target: str) -> bool:
+            if _start_app(target):
+                started.append(target)
+                return True
+            return False
 
         # 第二步：PATH 查找，找到直接用
         try:
             found = shutil.which(term)
         except Exception:
             found = None
-        if found and _start_app(found):
-            return f"好的先生，{app}已经打开了。"
+        if found and _start_and_record(found):
+            if _appeared():
+                return f"好的先生，{name}已经打开了。"
+            print(f"[hands] 「{name}」经 PATH 启动后未检测到窗口，继续尝试下一级……")
 
         # 第三步：已知安装路径探测
         for path in KNOWN_APP_PATHS.get(term, []):
-            if os.path.isfile(path) and _start_app(path):
-                return f"好的先生，{app}已经打开了。"
+            if os.path.isfile(path) and _start_and_record(path):
+                if _appeared():
+                    return f"好的先生，{name}已经打开了。"
+                print(f"[hands] 「{name}」经已知路径启动后未检测到窗口，继续尝试下一级……")
 
         # 第四步：开始菜单快捷方式递归搜索
         lnk = _find_start_menu_lnk(term)
-        if lnk and _start_app(lnk):
-            return f"好的先生，{app}已经打开了。"
+        if lnk and _start_and_record(lnk):
+            if _appeared():
+                return f"好的先生，{name}已经打开了。"
+            print(f"[hands] 「{name}」经快捷方式启动后未检测到窗口，继续尝试下一级……")
 
         # 第五步：直接让 ShellExecute 解析搜索词
         # （mspaint、calc 等经 App Paths / 执行别名注册，which 找不到但能直接启动）
-        if _start_app(term):
-            return f"好的先生，{app}已经打开了。"
+        if _start_and_record(term):
+            if _appeared():
+                return f"好的先生，{name}已经打开了。"
+            print(f"[hands] 「{name}」经 ShellExecute 启动后未检测到窗口，用 cmd start 兜底……")
 
-        # 全部失败：礼貌话术，绝不抛异常
-        return f"抱歉先生，我在电脑里没有找到「{app}」，您可以试着说全名，或者先把它安装好。"
+        # 兜底：cmd start 再拉起一次，最后再等一次窗口
+        _cmd_start(term)
+        if _appeared():
+            return f"好的先生，{name}已经打开了。"
+
+        # 托盘/已在运行补救链：进程确实活着 -> 二次唤出 -> 再等等 ->
+        # 仍无窗口则如实说「已经在运行」（这是成功，应用可用），绝不误报失败
+        exe_names = _exe_candidates(term, started)
+        if any(_process_running(x) for x in exe_names):
+            print(f"[hands] 「{name}」窗口未出现但进程存在，尝试二次唤出……")
+            if started:
+                _start_app(started[-1])  # 单实例应用二次 ShellExecute 通常唤出窗口
+            if _appeared(timeout=5.0):
+                return f"好的先生，{name}已经打开了。"
+            return f"好的先生，「{name}」已经在运行了（窗口可能收在托盘里）。"
+
+        # 进程也不存在：如实说明，绝不谎称已打开
+        return (
+            f"抱歉先生，已尝试启动「{name}」但没有看到它的窗口"
+            "（可能被系统拦截或它只在托盘运行）。"
+        )
     except Exception:
         return f"抱歉先生，打开{app}时出了问题，请稍后再试。"
 
@@ -450,11 +586,19 @@ def _read_file(name: str) -> str:
 
 
 def _write_file(name: str, content: str) -> str:
-    """以 UTF-8 覆盖写沙盒文件。"""
+    """以 UTF-8 覆盖写沙盒文件；写后重读校验，读回一致才宣布成功。"""
     try:
         path = _sandbox_path(name)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
+        # 写后重读自检：写入调用返回不代表落盘内容正确，读回比对才算数
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                readback = f.read()
+        except Exception:
+            readback = None
+        if readback != content:
+            return "抱歉先生，写文件后校验没通过，请让我重试。"
         return f"好的先生，内容已经写进文件「{os.path.basename(path)}」了。"
     except Exception as e:
         return f"抱歉先生，写文件时出了问题：{e}"
@@ -600,6 +744,59 @@ def shell_risk(cmd: str) -> str:
     return "safe"
 
 
+# CLI 白名单：run_shell 首词命中即按命令行程序同步执行（含/不含扩展名都匹配）；
+# 白名单外的 .exe 或可解析 exe 视为 GUI 程序，改走 cmd start 非阻塞拉起。
+_CLI_WHITELIST = {
+    "python", "python3", "pip", "git", "curl", "wget", "ping", "ipconfig",
+    "netstat", "tasklist", "taskkill", "where", "whoami", "hostname",
+    "echo", "dir", "type", "copy", "move", "ren", "del",
+    "node", "npm", "ffmpeg", "reg", "sc", "chkdsk", "sfc",
+    "powershell", "pwsh", "cmd",
+}
+
+
+def _first_word(cmd: str) -> str:
+    """提取命令首词；双引号包裹的带空格路径取引号内整体。"""
+    cmd = (cmd or "").lstrip()
+    if cmd.startswith('"'):
+        end = cmd.find('"', 1)
+        if end > 1:
+            return cmd[1:end]
+    parts = cmd.split()
+    return parts[0] if parts else ""
+
+
+def _looks_like_gui_launch(cmd: str) -> tuple:
+    """
+    判定命令是否为「直接拉起 GUI 程序」（同步执行会阻塞 60 秒的那种）：
+      (a) 首词 basename 以 .exe 结尾且去扩展名后不在 CLI 白名单；
+      (b) 首词无扩展名但 shutil.which 能解析到 exe，且该 exe basename 不在白名单。
+    白名单外无法解析的返回 (False, 首词)，保持原同步执行路径不动。
+    返回 (是否 GUI 拉起, 用于话术的纯名)。
+    """
+    word = _first_word(cmd)
+    if not word:
+        return False, ""
+    base = os.path.basename(word).lower()
+    stem = base[:-4] if base.endswith(".exe") else base
+    if stem in _CLI_WHITELIST:
+        return False, stem
+    # (a) 显式 .exe 且不在白名单
+    if base.endswith(".exe"):
+        return True, stem
+    # (b) 无扩展名：which 能解析到 exe 且其 basename 不在白名单
+    if "." not in base:
+        try:
+            resolved = shutil.which(word)
+        except Exception:
+            resolved = None
+        if resolved and resolved.lower().endswith(".exe"):
+            rstem = os.path.basename(resolved).lower()[:-4]
+            if rstem not in _CLI_WHITELIST:
+                return True, stem
+    return False, stem
+
+
 def _run_shell(cmd: str, confirmed: bool = False) -> str:
     """
     通用命令执行：在主人家目录下以 shell 方式执行任意 cmd/PowerShell 命令。
@@ -622,6 +819,23 @@ def _run_shell(cmd: str, confirmed: bool = False) -> str:
                 f"命令原文：{cmd}\n"
                 "如确认无误，请说「确认执行」；若改变主意，请说「取消」。"
             )
+
+        # GUI 拉起非阻塞化：首词是白名单外的 GUI 程序时，同步 subprocess.run
+        # 会阻塞 60 秒（GUI 进程不退出）；改写成 cmd start 立即返回。
+        # 改写后的命令必须重新过安全闸，等级变了就放弃改写、走原路径。
+        is_gui, gui_name = _looks_like_gui_launch(cmd)
+        if is_gui:
+            rewritten = f'start "" {cmd}'
+            if shell_risk(rewritten) == risk:
+                try:
+                    subprocess.run(
+                        rewritten, shell=True, timeout=10,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        cwd=os.path.expanduser("~"),
+                    )
+                    return f"好的先生，已启动「{gui_name}」。"
+                except Exception:
+                    pass  # 改写路径失败则回落到原同步路径
 
         result = subprocess.run(
             cmd, shell=True, capture_output=True, timeout=60,
@@ -780,6 +994,29 @@ def _find_window(title_substr: str) -> bool:
     return _find_window_hwnd(title_substr) is not None
 
 
+# 窗口等待参数：每 1 秒轮询一次；open_app 执行后自检默认最多等 8 秒
+_WINDOW_VERIFY_TIMEOUT = 8.0
+
+
+def _wait_for_window(term: str, timeout: float = _WINDOW_VERIFY_TIMEOUT) -> bool:
+    """
+    窗口等待原语（全模块唯一）：每 1 秒轮询 _find_window(term)，
+    窗口出现立即返回 True；超时（默认 8 秒）返回 False。
+    open_app 的执行后自检与 gui_control 的自动开路前导都复用它。
+    """
+    try:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if _find_window(term):
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(1.0, remaining))
+    except Exception:
+        return False
+
+
 def _bring_window_front(title_substr: str) -> bool:
     """
     尝试把标题匹配的窗口还原（SW_RESTORE）并置前（SetForegroundWindow）。
@@ -833,8 +1070,9 @@ def _ensure_app_ready(hint: str) -> None:
     """
     gui_control 自动开路前导：检测目标应用窗口 -> 缺失则复用现有应用解析链
     （别名 -> which -> 已知路径 -> 开始菜单/桌面 lnk -> ShellExecute）启动
-    -> 轮询等待窗口出现（每 1 秒一次，最多 16 秒）-> 出现后尝试置前。
-    托盘型应用（如网易云音乐）主窗口出现慢，等待中途再补一次启动调用把它唤出。
+    -> 复用 _wait_for_window 原语等待窗口出现（总上限 16 秒，分两段）->
+    出现后尝试置前。
+    托盘型应用（如网易云音乐）主窗口出现慢，两段等待之间再补一次启动调用把它唤出。
     等待超时不阻断：打印中文日志后继续，交给眼睛模块自行判断并报告。
     任何环节出错都吞掉，绝不让前导把 gui_control 拖垮。
     """
@@ -843,20 +1081,23 @@ def _ensure_app_ready(hint: str) -> None:
             return  # 窗口已在屏幕上，无需开路
         print(f"[hands] 未检测到「{hint}」的窗口，先自动打开该应用……")
         _open_app(hint)  # 复用应用解析链启动（返回话术此处不用，眼睛只看屏幕）
-        waited = 0
-        nudged = False
-        while waited < _WINDOW_WAIT_MAX_SECONDS:
-            time.sleep(_WINDOW_WAIT_INTERVAL)
-            waited += _WINDOW_WAIT_INTERVAL
-            if _find_window(hint):
+
+        # 第一段等待：前半程预算（_open_app 内部已做过自检，这里等的是窗口真正就绪）
+        half = _WINDOW_WAIT_MAX_SECONDS // 2
+        if _wait_for_window(hint, timeout=half):
+            _bring_window_front(hint)  # 容错置前，失败也无妨
+            print(f"[hands] 「{hint}」的窗口已出现，已尝试置前。")
+            return
+
+        # 第二段等待：托盘型应用先补一次启动调用唤出主窗口，再等剩余预算
+        remaining = _WINDOW_WAIT_MAX_SECONDS - half
+        if remaining > 0:
+            print(f"[hands] 「{hint}」窗口仍未出现，补一次启动调用尝试唤出……")
+            _open_app(hint)
+            if _wait_for_window(hint, timeout=remaining):
                 _bring_window_front(hint)  # 容错置前，失败也无妨
                 print(f"[hands] 「{hint}」的窗口已出现，已尝试置前。")
                 return
-            if not nudged and waited >= _WINDOW_WAIT_MAX_SECONDS // 2:
-                nudged = True
-                # 托盘型应用：再次调用启动通常会把已运行的主窗口唤出
-                print(f"[hands] 「{hint}」窗口仍未出现，补一次启动调用尝试唤出……")
-                _open_app(hint)
         print(
             f"[hands] 等待 {_WINDOW_WAIT_MAX_SECONDS} 秒后仍未看到「{hint}」的窗口，"
             "继续交给眼睛模块判断。"
@@ -981,6 +1222,14 @@ def _set_web_background(name: str) -> str:
         os.makedirs(SANDBOX_DIR, exist_ok=True)
         with open(_WEB_BG_STATE, "w", encoding="utf-8") as f:
             json.dump({"image": rel}, f, ensure_ascii=False)
+        # 写后重读自检：JSON 可解析且 image 字段与刚写入一致才算成功
+        try:
+            with open(_WEB_BG_STATE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception:
+            state = None
+        if not isinstance(state, dict) or state.get("image") != rel:
+            return "抱歉先生，背景状态写入后校验没通过，请让我重试。"
         return "好的先生，聊天背景已更换。"
     except Exception as e:
         return f"抱歉先生，更换聊天背景时出了问题：{e}"

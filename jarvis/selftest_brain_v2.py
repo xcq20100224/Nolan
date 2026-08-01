@@ -40,8 +40,8 @@ check("write_file 解析不出返回None", p("记录") is None)
 
 check("list_files", p("列出有哪些文件") == ("list_files", {}))
 
-check("run_command", p("运行 echo hello") == ("run_command", {"cmd": "echo hello"}))
-check("run_command 执行", p("执行 python --version") == ("run_command", {"cmd": "python --version"}))
+check("run_shell 运行", p("运行 echo hello") == ("run_shell", {"cmd": "echo hello"}))
+check("run_shell 执行", p("执行 python --version") == ("run_shell", {"cmd": "python --version"}))
 
 check("闲聊返回None", p("今天天气怎么样") is None)
 

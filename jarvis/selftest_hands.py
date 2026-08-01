@@ -143,6 +143,55 @@ def main():
     r = hands.execute("run_shell", {"cmd": "echo 已确认执行", "confirmed": True})
     fails += check("confirmed=true 的 echo 执行成功", "已确认执行" in r)
 
+    # ---- 4.5 run_shell GUI 拉起非阻塞化 ----
+    print("[4.5] run_shell GUI 拉起检测与非阻塞改写")
+    # 纯函数检测逻辑（不真实启动任何程序）
+    fails += check(
+        "GUI 检测：'notepad' 判为 GUI 拉起",
+        hands._looks_like_gui_launch("notepad")[0],
+    )
+    fails += check(
+        "GUI 检测：'notepad.exe' 判为 GUI 拉起",
+        hands._looks_like_gui_launch("notepad.exe")[0],
+    )
+    fails += check(
+        "GUI 检测：'python --version' 在 CLI 白名单，不判 GUI",
+        not hands._looks_like_gui_launch("python --version")[0],
+    )
+    fails += check(
+        "GUI 检测：无法解析的命令保持原路径（不判 GUI）",
+        not hands._looks_like_gui_launch("不存在的命令xyz123")[0],
+    )
+    fails += check(
+        "GUI 检测：'taskkill /im x.exe' 在 CLI 白名单，不判 GUI",
+        not hands._looks_like_gui_launch("taskkill /im x.exe")[0],
+    )
+    # 改写行为：monkeypatch subprocess.run，验证命令被改写为 start "" 且立即返回话术
+    real_run = hands.subprocess.run
+    run_calls = []
+
+    def fake_run(*a, **kw):
+        run_calls.append((a, kw))
+
+        class _R:  # 最小化 subprocess 结果替身
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        return _R()
+
+    hands.subprocess.run = fake_run
+    try:
+        r = hands.execute("run_shell", {"cmd": "notepad"})
+        fails += check(
+            "run_shell('notepad') 改写为 start 拉起并返回「已启动」话术",
+            "已启动" in r
+            and bool(run_calls)
+            and str(run_calls[0][0][0]).startswith('start "" notepad'),
+        )
+    finally:
+        hands.subprocess.run = real_run  # 恢复
+
     # ---- 5. get_time 非空 ----
     print("[5] get_time")
     r = hands.execute("get_time", {})
@@ -152,8 +201,17 @@ def main():
     print("[6] open_app / open_url / web_search 分支逻辑（不真实启动）")
     opened = []
     real_startfile = os.startfile
+    real_wait = hands._wait_for_window
+    real_cmd_start = hands._cmd_start
+    real_find = hands._find_window
+    real_proc = hands._process_running
     os.startfile = make_fake_startfile(opened)  # monkeypatch（逼真版）
+    hands._cmd_start = lambda _term: None  # cmd start 兜底也不真的执行
+    hands._find_window = lambda _t: False  # 假世界里没有任何已存在的窗口
+    hands._process_running = lambda _x: False  # 假世界里没有任何已运行的进程
     try:
+        # open_app 执行后自检：假 startfile 成功的分支 -> 视为窗口出现
+        hands._wait_for_window = lambda _t, timeout=8.0: True  # noqa: E731
         r = hands.execute("open_app", {"app": "记事本"})
         fails += check(
             "open_app('记事本') 最终打开 notepad",
@@ -161,8 +219,11 @@ def main():
             and os.path.basename(opened[-1]).lower().startswith("notepad")
             and "记事本" in r,
         )
+        # 未知应用：各级启动全失败 -> 窗口永不出现 -> 如实失败话术
+        hands._wait_for_window = lambda _t, timeout=8.0: False  # noqa: E731
         r = hands.execute("open_app", {"app": "注册表编辑器"})
         fails += check("open_app 未知应用礼貌拒绝", "抱歉" in r)
+        hands._wait_for_window = lambda _t, timeout=8.0: True  # noqa: E731
         r = hands.execute("open_url", {"url": "https://example.com"})
         fails += check("open_url 打开原网址", opened[-1:] == ["https://example.com"])
         r = hands.execute("open_url", {"url": "example.com"})
@@ -176,6 +237,10 @@ def main():
         )
     finally:
         os.startfile = real_startfile  # 恢复
+        hands._wait_for_window = real_wait
+        hands._cmd_start = real_cmd_start
+        hands._find_window = real_find
+        hands._process_running = real_proc
 
     # ---- 7. 未知工具与异常兜底 ----
     print("[7] 兜底行为")
@@ -192,8 +257,16 @@ def main():
     print("[8] open_app 通用化改造")
     opened = []
     real_startfile = os.startfile
+    real_wait = hands._wait_for_window
+    real_cmd_start = hands._cmd_start
+    real_find = hands._find_window
+    real_proc = hands._process_running
     os.startfile = make_fake_startfile(opened)  # monkeypatch（逼真版）
+    hands._cmd_start = lambda _term: None  # cmd start 兜底也不真的执行
+    hands._find_window = lambda _t: False  # 假世界里没有任何已存在的窗口
+    hands._process_running = lambda _x: False  # 假世界里没有任何已运行的进程
     try:
+        hands._wait_for_window = lambda _t, timeout=8.0: True  # noqa: E731 - 假启动成功即视为窗口出现
         for alias in ("vscode", "VSCode"):
             opened.clear()
             r = hands.execute("open_app", {"app": alias})
@@ -208,12 +281,16 @@ def main():
                 bool(opened) and ok_target and "已经打开" in r,
             )
         opened.clear()
+        # 不存在的应用：窗口永不出现，走如实失败话术（语义变化：不再说「没有找到」，
+        # 而是「已尝试启动但没有看到它的窗口」——启动可能成功但窗口被拦截/托盘化）
+        hands._wait_for_window = lambda _t, timeout=8.0: False  # noqa: E731
         r = hands.execute("open_app", {"app": "不存在的东西xyz123"})
         fails += check(
-            "open_app('不存在的东西xyz123') 返回含「没有找到」的礼貌话术",
-            "没有找到" in r and "抱歉" in r and not opened,
+            "open_app('不存在的东西xyz123') 返回「已尝试启动但没有看到窗口」的如实话术",
+            "已尝试启动" in r and "没有看到它的窗口" in r and "抱歉" in r and not opened,
         )
         # 画图：which 与开始菜单都找不到时，走 ShellExecute 兜底直接 startfile
+        hands._wait_for_window = lambda _t, timeout=8.0: True  # noqa: E731
         opened.clear()
         r = hands.execute("open_app", {"app": "画图"})
         fails += check(
@@ -222,6 +299,10 @@ def main():
         )
     finally:
         os.startfile = real_startfile  # 恢复
+        hands._wait_for_window = real_wait
+        hands._cmd_start = real_cmd_start
+        hands._find_window = real_find
+        hands._process_running = real_proc
 
     # 快捷方式挑选：卸载类垫底，完全同名优先（纯函数，与机器状态无关）
     pick = hands._pick_best_lnk(
@@ -273,9 +354,17 @@ def main():
     # 端到端：逼真 fake_startfile 下六种口语叫法都必须解析出目标
     opened = []
     real_startfile = os.startfile
+    real_wait = hands._wait_for_window
+    real_cmd_start = hands._cmd_start
+    real_find = hands._find_window
+    real_proc = hands._process_running
     os.startfile = make_fake_startfile(opened)  # monkeypatch（逼真版）
+    hands._cmd_start = lambda _term: None  # cmd start 兜底也不真的执行
+    hands._find_window = lambda _t: False  # 假世界里没有任何已存在的窗口
+    hands._process_running = lambda _x: False  # 假世界里没有任何已运行的进程
     try:
         # (输入, 目标文件名中必须出现的关键词)
+        hands._wait_for_window = lambda _t, timeout=8.0: True  # noqa: E731 - 假启动成功即视为窗口出现
         universal_cases = [
             ("chrome浏览器", "chrome"),
             ("edge浏览器", "edge"),
@@ -292,15 +381,20 @@ def main():
                 f"open_app('{spoken}') 解析出目标（含 '{keyword}'）",
                 bool(opened) and keyword in target and "已经打开" in r,
             )
-        # 找不到的应用：礼貌话术 + 无任何成功调用
+        # 找不到的应用：如实失败话术 + 无任何成功调用（窗口永不出现）
+        hands._wait_for_window = lambda _t, timeout=8.0: False  # noqa: E731
         opened.clear()
         r = hands.execute("open_app", {"app": "不存在的xyz123"})
         fails += check(
-            "open_app('不存在的xyz123') 返回「没有找到」话术且无成功调用",
-            "没有找到" in r and "抱歉" in r and not opened,
+            "open_app('不存在的xyz123') 返回「已尝试启动但没有看到窗口」话术且无成功调用",
+            "已尝试启动" in r and "没有看到它的窗口" in r and "抱歉" in r and not opened,
         )
     finally:
         os.startfile = real_startfile  # 恢复
+        hands._wait_for_window = real_wait
+        hands._cmd_start = real_cmd_start
+        hands._find_window = real_find
+        hands._process_running = real_proc
 
     # ---- 9.5 别名表扩充：常用应用别名解析（_open_app 的别名解析即 _resolve_alias）----
     print("[9.5] 别名表扩充（网易云音乐 / cloudmusic / qq音乐 等）")
@@ -524,21 +618,31 @@ def main():
         hands._extract_app_hint("打开网易云音乐，播放我喜欢") == "网易云音乐",
     )
 
-    # 13.2 _find_window 真实窗口检测：真开记事本，测完 taskkill 清理
-    import subprocess as _sp
-    import time as _time
-    try:
-        os.startfile("notepad")
-        _time.sleep(2)
-        # 中文系统标题为「无标题 - 记事本」，英文系统为「Untitled - Notepad」，两种都认
-        found = hands._find_window("记事本") or hands._find_window("notepad")
-        fails += check("_find_window 能检测到真实存在的记事本窗口", found)
+    # 13.2 _find_window 真实窗口检测（真开记事本再 taskkill）——真实开窗口的
+    # E2E 默认跳过：自动化回归不允许真实弹窗。需要人工验证时设
+    # NOLAN_E2E_WINDOWS=1 再运行本段。
+    if os.environ.get("NOLAN_E2E_WINDOWS") == "1":
+        import subprocess as _sp
+        import time as _time
+        try:
+            os.startfile("notepad")
+            _time.sleep(2)
+            # 中文系统标题为「无标题 - 记事本」，英文系统为「Untitled - Notepad」，两种都认
+            found = hands._find_window("记事本") or hands._find_window("notepad")
+            fails += check("_find_window 能检测到真实存在的记事本窗口", found)
+            fails += check(
+                "_find_window 对不存在的窗口标题返回 False",
+                not hands._find_window("绝对不存在的窗口标题xyz123"),
+            )
+        finally:
+            _sp.run(["taskkill", "/f", "/im", "notepad.exe"], capture_output=True)
+    else:
+        print("  [跳过] 13.2 真实窗口 E2E（真开记事本）；设 NOLAN_E2E_WINDOWS=1 可开启")
+        # 非真实窗口的纯语义检查照常进行：对不存在的标题必须返回 False
         fails += check(
             "_find_window 对不存在的窗口标题返回 False",
             not hands._find_window("绝对不存在的窗口标题xyz123"),
         )
-    finally:
-        _sp.run(["taskkill", "/f", "/im", "notepad.exe"], capture_output=True)
 
     # 13.3 前导逻辑 monkeypatch：窗口缺失 -> 调解析链打开 -> 等待出现 -> 置前
     class _FakeEyes2:

@@ -18,6 +18,7 @@ Nolan 语音助手 · 主动提醒模块（reminders.py）· 阶段四
 
 import os
 import re
+import threading
 from datetime import datetime, timedelta
 
 # == 常量与配置 ==
@@ -25,6 +26,10 @@ from datetime import datetime, timedelta
 _MEMORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory")
 _REMINDERS_FILE = os.path.join(_MEMORY_DIR, "reminders.txt")
 _ENCODING = "utf-8"
+
+# 存储串行化：/api/due 每 15 秒读改写 vs brain 提醒意图写，并发会互相吃掉
+# 提醒——所有对外接口的读写临界区（读-改-写）都收进同一把锁。
+_STORE_LOCK = threading.Lock()
 
 # 中文数字（1~99，含「两」）
 _CN_DIGITS = {
@@ -36,7 +41,7 @@ _CN_DIGITS = {
 _NUM = r"(?:\d+|[零一二两三四五六七八九十]{1,3})"
 
 # 时间表达式正则（用于在原文开头提取最长的前缀）
-_RE_REL = re.compile(rf"^(?:\s*({_NUM})\s*(分钟|小时)后)")
+_RE_REL = re.compile(rf"^(?:\s*({_NUM})\s*(分钟|小时|秒钟|秒)后)")
 _RE_ABS = re.compile(
     rf"^\s*(?:(今天|明天|后天)\s*)?"
     rf"(?:(早上|上午|中午|下午|晚上)\s*)?"
@@ -151,13 +156,23 @@ def parse_time(text: str):
         return None
     now = datetime.now()
 
-    # 相对时间：X分钟后 / X小时后
+    # 相对时间：X秒钟后 / X秒后 / X分钟后 / X小时后
     m = _RE_REL.match(text)
     if m and m.end() == len(text):
         n = _cn_to_int(m.group(1))
         if n is None:
             return None
-        delta = timedelta(minutes=n) if m.group(2) == "分钟" else timedelta(hours=n)
+        unit = m.group(2)
+        if unit == "分钟":
+            delta = timedelta(minutes=n)
+        elif unit == "小时":
+            delta = timedelta(hours=n)
+        else:  # 秒 / 秒钟
+            delta = timedelta(seconds=n)
+        # 秒级提醒保留秒精度（截断到分钟会被 add 误判为已过点而顺延到明天）；
+        # 存储仍按分钟精度落盘，弹出粒度最差不差于 1 分钟，可接受
+        if unit in ("秒", "秒钟"):
+            return (now + delta).replace(microsecond=0)
         return (now + delta).replace(second=0, microsecond=0)
 
     # 特例：『（今天|明天|后天）中午』没有「X点」，固定 12:00
@@ -255,10 +270,11 @@ def add(raw: str) -> str:
         when = when + timedelta(days=1)
         rolled = True
 
-    entries = _read_entries()
-    entries.append((when, content))
-    if not _write_entries(entries):
-        return "抱歉先生，提醒没有存下来，请稍后再试一次。"
+    with _STORE_LOCK:  # 读-改-写同一把锁，杜绝与 check_due 并发互吃
+        entries = _read_entries()
+        entries.append((when, content))
+        if not _write_entries(entries):
+            return "抱歉先生，提醒没有存下来，请稍后再试一次。"
 
     confirm = f"好的先生，我会在{_spoken_time(when)}提醒您：{content}。"
     if rolled:
@@ -269,8 +285,9 @@ def add(raw: str) -> str:
 def list_pending() -> str:
     """口语化列出未来提醒（按时间排序）；无提醒返回固定话术。"""
     try:
-        now = datetime.now()
-        pending = sorted((w, c) for w, c in _read_entries() if w > now)
+        with _STORE_LOCK:  # 读临界区入锁，与 add / check_due 串行化
+            now = datetime.now()
+            pending = sorted((w, c) for w, c in _read_entries() if w > now)
         if not pending:
             return "先生，目前没有任何待提醒事项。"
         items = []
@@ -290,15 +307,16 @@ def check_due() -> list:
     并从存储中移除；无到点返回 []；永不抛异常。
     """
     try:
-        now = datetime.now()
-        due, keep = [], []
-        for when, content in _read_entries():
-            if when <= now:
-                due.append(f"先生，提醒时间到：{content}。")
-            else:
-                keep.append((when, content))
-        if due:
-            _write_entries(keep)
-        return due
+        with _STORE_LOCK:  # 读-改-写同一把锁，与 add 串行化
+            now = datetime.now()
+            due, keep = [], []
+            for when, content in _read_entries():
+                if when <= now:
+                    due.append(f"先生，提醒时间到：{content}。")
+                else:
+                    keep.append((when, content))
+            if due:
+                _write_entries(keep)
+            return due
     except Exception:
         return []
