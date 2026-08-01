@@ -118,7 +118,7 @@ python jarvis/jarvis.py       # 或双击 Nolan-CLI.bat
 
 ## 🎬 演示
 
-> 📹 **GIF 演示待补充** —— 语音对话 + 工具调用 + 网页版驾驶舱的录屏将放在这里。
+> 📹 **[Nolan 自录自配演示视频（45 秒）](docs/nolan-demo.mp4)** —— Nolan 自己录屏、自己配音：打开网易云音乐播放「我喜欢的音乐」第一首，再随手打开记事本。旁白为 Nolan 本人的 GLM-TTS 男声。
 
 ## ⚖️ 商用与 API 条款提醒
 
