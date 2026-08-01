@@ -350,7 +350,12 @@ def main() -> int:
     test_coord_mapping()
     test_fail_report()
     test_app_not_found()
-    test_notepad_e2e()
+    # 真机 E2E（会真的动鼠标打字）默认跳过，避免每次回归都干扰前台；
+    # 需要真机验证时：set NOLAN_E2E_EYES=1 再跑
+    if os.environ.get("NOLAN_E2E_EYES") == "1":
+        test_notepad_e2e()
+    else:
+        print("[SKIP] 8/8 记事本真机 E2E（NOLAN_E2E_EYES=1 时开启）")
     print("=" * 60)
     print("全部自测通过。")
     return 0

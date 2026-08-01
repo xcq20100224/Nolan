@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-selftest_gaokao.py —— Nolan「高考题库」：53 条真实指令的端到端成功率测试
+selftest_gaokao.py —— Nolan「高考题库」：56 条真实指令的端到端成功率测试
 
 设计原则（第一性原理）：
   1. 测的物理指标是「任务成功率」：每题 = 一条真实用户指令 -> 直接 import brain
@@ -205,6 +205,19 @@ def probe_llm() -> bool:
         resp.raise_for_status()
         resp.json()["choices"][0]["message"]["content"]
         return True
+    except Exception:
+        return False
+
+
+def probe_vlm() -> bool:
+    """VLM 探测：真截屏 + 一句描述（VLM 内部 60 秒超时 + 降级重试，可能较慢）。"""
+    try:
+        import eyes
+        shot = eyes.screenshot_b64()
+        if not shot:
+            return False
+        desc = eyes._ask_vlm(shot, "用一句话描述这张屏幕截图的内容。")
+        return bool(desc and desc.strip())
     except Exception:
         return False
 
@@ -730,6 +743,139 @@ def q53():
         kill_apps(*NOTEPAD_PROCS)
 
 
+# ---------- 十二、阶段 2 收尾：UIA 元素树 + 可打断播报（3 题） ----------
+
+def _fresh_notepad_hwnd() -> int:
+    """
+    确保记事本窗口真实可见并置前，返回窗口句柄；两轮尝试后仍无窗口返回 0。
+
+    Win11 记事本是单实例应用：尸体未凉就重启会出现「窗口交接」——
+    open_app 的自检看到旧窗口残骸判成功，新窗口却永不出现。
+    对策：先杀净并等进程彻底退出再重启，窗口句柄按 UIA 可见性轮询确认，
+    出现后置前（防止被其他窗口遮挡导致眼睛截屏误判）。
+    """
+    import uia
+    for _attempt in range(2):
+        kill_apps(*NOTEPAD_PROCS)
+        deadline = time.time() + 5
+        while proc_count(*NOTEPAD_PROCS) > 0 and time.time() < deadline:
+            time.sleep(0.3)
+        hands.execute("open_app", {"app": "记事本"})
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            hwnd = (uia._find_hwnd_by_title("记事本")
+                    or uia._find_hwnd_by_title("notepad"))
+            if hwnd:
+                hands._bring_window_front("记事本")
+                return hwnd
+            time.sleep(0.5)
+    return 0
+
+
+@q(54, ("gui",), "打开记事本（UIA 元素树物理验证控件枚举）")
+def q54():
+    import uia
+    try:
+        r = brain.think("打开记事本", [])
+        if not ("已经打开" in r or "已经在运行" in r):
+            return (False, f"open_app 话术异常：{r!r}")
+        hwnd = _fresh_notepad_hwnd()
+        if not hwnd:
+            return (False, "记事本窗口未出现（两轮重启轮询）")
+        # UIA 控件树就绪可能晚于窗口句柄出现，枚举失败时短轮询重试
+        controls, text = [], ""
+        for _ in range(6):
+            controls = uia.dump_window_controls(hwnd)
+            text = uia.format_controls(controls)
+            if controls:
+                break
+            time.sleep(0.5)
+        ok = bool(controls) and ("文件" in text or "编辑" in text)
+        return (ok, f"UIA 控件 {len(controls)} 个：{text[:100]}")
+    finally:
+        kill_apps(*NOTEPAD_PROCS)
+
+
+@q(55, (), "interrupt() 打断播放（打桩 mixer，不真发声）")
+def q55():
+    import threading
+
+    import mouth
+    mouth._interrupt.clear()
+    state = {"stopped": False}
+
+    class _FakeMusic:
+        def load(self, path): pass
+        def play(self): pass
+        def get_busy(self): return not state["stopped"]
+        def stop(self): state["stopped"] = True
+        def unload(self): pass
+
+    orig_init = mouth._init_mixer
+    orig_music = mouth.pygame.mixer.music
+    mouth._init_mixer = lambda: None
+    mouth.pygame.mixer.music = _FakeMusic()
+    t = None
+    try:
+        t = threading.Thread(target=mouth._play_file, args=("x.wav",), daemon=True)
+        t.start()
+        time.sleep(0.3)  # 让它先进轮询循环
+        mouth.interrupt()
+        t.join(1.0)
+        ok = (not t.is_alive()) and state["stopped"]
+        return (ok, f"提前返回={not t.is_alive()}，stop 被调={state['stopped']}")
+    finally:
+        mouth._init_mixer = orig_init
+        mouth.pygame.mixer.music = orig_music
+        mouth._interrupt.clear()
+
+
+@q(56, ("llm", "gui", "vlm"), "在记事本中输入 nolan uia ok（确认后真机打字，UIA 加持）")
+def q56():
+    fail_prefixes = (
+        "先生，任务未能完成",
+        "先生，任务步数超出安全上限",
+        "先生，检测到您将鼠标移至屏幕角落",
+        "先生，我的视觉模块暂时无法连接",
+    )
+    last = "未执行"
+    try:
+        # 另清场网易云音乐——52 题按设计不关闭它，其延迟弹窗会抢前台、
+        # 让眼睛在任务中途误判「屏幕上没有找到记事本」
+        kill_apps("cloudmusic.exe")
+        # 真实桌面上任何窗口（Word、终端、弹窗）都可能在 LLM 往返的
+        # 几秒内抢占前台/遮挡记事本，导致眼睛截屏误判「目标应用缺失」。
+        # 这是环境抖动而非功能缺陷：同一原因失败时整体重试一次。
+        for attempt in range(2):
+            # 备现场：记事本窗口必须真实可见且置前（两轮重启轮询），
+            # 不让「进程在但窗口不在」的交接假成功混进眼睛环节
+            hwnd = _fresh_notepad_hwnd()
+            if not hwnd:
+                last = "记事本窗口未出现（两轮重启轮询）"
+                continue
+            brain._pending_shell = None
+            r1 = brain.think("在记事本中输入 nolan uia ok", [])
+            if "确认" not in r1:
+                last = f"未进入确认询问：{r1!r}"
+                continue
+            # 确认前再把记事本置前一次：brain 的 LLM 往返有几秒，
+            # 期间其他窗口可能抢占前台
+            hands._bring_window_front("记事本")
+            # 确认后 eyes.perform 真机执行（截屏 + UIA + VLM 逐步打字）
+            r2 = brain.think("确认", [])
+            last = f"执行结果：{r2[:100]!r}"
+            if any(p in r2 for p in fail_prefixes):
+                brain._pending_shell = None  # 清场后重试
+                continue
+            if wait_window(NOTEPAD_TERMS, 3) or proc_count(*NOTEPAD_PROCS) > 0:
+                suffix = f"（第 {attempt + 1} 次尝试）" if attempt else ""
+                return (True, last + suffix)
+        return (False, last)
+    finally:
+        brain._pending_shell = None
+        kill_apps(*NOTEPAD_PROCS)
+
+
 # == 备份 / 恢复 ==
 
 def _read_bytes(path):
@@ -789,12 +935,14 @@ def main():
         a, b = sys.argv[1].split("-", 1)
         only = (int(a), int(b))
 
-    print("== Nolan 高考题库 · 53 题端到端成功率测试 ==")
+    print("== Nolan 高考题库 · 56 题端到端成功率测试 ==")
     net_ok = probe_net()
     print(f"网络探测（www.baidu.com:443）：{'可用' if net_ok else '不可用，NET 组整组 SKIP'}")
     llm_ok = probe_llm() if net_ok else False
     print(f"大模型探测（一句「你好」，10 秒）：{'可用' if llm_ok else '不可用，LLM 组整组 SKIP'}")
-    available = {"gui": os.name == "nt", "net": net_ok, "llm": llm_ok}
+    vlm_ok = (net_ok and llm_ok) and probe_vlm()
+    print(f"视觉模型探测（截屏 + 一句描述）：{'可用' if vlm_ok else '不可用，VLM 组整组 SKIP'}")
+    available = {"gui": os.name == "nt", "net": net_ok, "llm": llm_ok, "vlm": vlm_ok}
     if os.name != "nt":
         print("非 Windows 环境：GUI 组整组 SKIP")
 

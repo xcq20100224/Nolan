@@ -19,7 +19,7 @@ vite 把 /api 代理到本服务）。
 
 API 契约（一字不差）：
     GET  /api/health     → {"ok": true, "name": "Nolan"}
-    GET  /api/version    → {"version": "2026-07-23-smartgui", "pid": 整数}
+    GET  /api/version    → {"version": "2026-08-01-stage2", "pid": 整数}
                          （后端代码版本标识 + 当前进程 PID；
                          用于验证运行中的后端是否为最新代码，排查陈旧进程）
     POST /api/chat       请求 {"text": "..."} → 响应 {"reply": str, "audio_url": str|null}
@@ -43,6 +43,8 @@ API 契约（一字不差）：
                          → {"text": "识别文本"}；无语音 {"text": ""}
     POST /api/mic/start  → {"ok": true}（服务端直接开麦录音，绕开浏览器权限）
     POST /api/mic/stop   → {"text": "..."}（停止并识别；无语音/未录音 {"text": ""}）
+    POST /api/stop       → {"stopped": true}（立即打断服务端音箱当前播报；
+                         前端「停止说话」按钮与发送新消息前的自动打断都走这里）
 全部 JSON UTF-8（ensure_ascii=False）、CORS 允许 *、处理 OPTIONS 预检；
 异常返回 500 + {"error": 中文说明}；未知路径 404。
 
@@ -77,7 +79,7 @@ import memory      # noqa: E402  记忆：recall / load / remember / forget
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-01-stage1"
+_VERSION = "2026-08-01-stage2"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -696,6 +698,13 @@ def _chat(user_text: str) -> dict:
         reply = "先生，您似乎还没有说话，请输入内容后再发送。"
         return {"reply": reply, "audio_url": synth_for(reply)}
 
+    # 新消息进场前先打断正在进行的音箱播报（主人开口即优先）
+    if mouth is not None:
+        try:
+            mouth.interrupt()
+        except Exception:
+            pass
+
     with _brain_lock:
         reply = brain.think(user_text, list(_history))
         # 历史写入与裁剪也在同一临界区内：与 brain.think 串行化，
@@ -979,6 +988,15 @@ class NolanHandler(BaseHTTPRequestHandler):
                     return
                 _mic_debug_log(f"mic/stop 识别结果: {text!r}")
                 self._send_json(200, {"text": text})
+            elif path == "/api/stop":
+                # 立即打断服务端音箱当前播报（mouth 为 None 时静默成功）
+                self._discard_body()  # 读净请求体，防止残留字节污染 keep-alive 连接
+                if mouth is not None:
+                    try:
+                        mouth.interrupt()
+                    except Exception as e:
+                        print(f"[server] 打断播报失败（已静默）：{e}")
+                self._send_json(200, {"stopped": True})
             else:
                 self._send_error_json(404, f"未知路径：{path}")
         except Exception as e:

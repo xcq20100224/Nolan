@@ -5,8 +5,8 @@
 // 录音状态通过 onRecordingChange 上报给父组件，中央声波以模拟律动呈现（无真实波形流）
 import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
-import { Mic, SendHorizontal } from 'lucide-react'
-import { micStart, micStop, micState, clientLog } from '@/lib/api'
+import { Mic, SendHorizontal, Square } from 'lucide-react'
+import { micStart, micStop, micState, clientLog, stopSpeak } from '@/lib/api'
 
 /** 「没听清」等占位提示的显示时长（毫秒） */
 const HINT_MS = 3000
@@ -269,6 +269,18 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#2e2e33] text-[#8a8578] transition-colors hover:border-[#5a5a60] hover:text-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-30"
         >
           <SendHorizontal className="h-4 w-4" />
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            clientLog('点击-停止说话')
+            stopSpeak()
+          }}
+          disabled={disabled}
+          title="停止说话（打断当前播报）"
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#2e2e33] text-[#8a8578] transition-colors hover:border-[#5a5a60] hover:text-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-30"
+        >
+          <Square className="h-4 w-4" />
         </button>
       </div>
     </footer>

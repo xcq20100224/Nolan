@@ -11,12 +11,15 @@
 
 对外接口（跨模块契约，签名不可改）：
     def speak(text: str) -> None
+附加接口（可打断）：
+    def interrupt() -> None   # 立即打断当前播报；speak 开头自清标志
 """
 
 import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 
 import edge_tts
@@ -30,6 +33,20 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_conf
 
 # pygame.mixer 模块级单例初始化标记
 _mixer_ready = False
+
+# 可打断标志：外部线程（如网页端 /api/stop）置位，正在播放的语音立即停止。
+# 每次 speak() 开头清位，保证打断只作用于「当前这一句」。
+_interrupt = threading.Event()
+
+
+def interrupt() -> None:
+    """打断当前正在播放的语音（pygame.mixer 通道）。
+
+    线程安全，可随时调用；无播放时调用无副作用。
+    注意：SAPI 离线兜底（pyttsx3 的 runAndWait）是阻塞调用，不可中断——
+    该通道仅在主备两条网络链路全部失败时启用，属极端降级场景，接受此边界。
+    """
+    _interrupt.set()
 
 
 def _init_mixer() -> None:
@@ -130,12 +147,20 @@ def _write_temp_file(data: bytes, suffix: str) -> str:
 
 
 def _play_file(path: str) -> None:
-    """用 pygame.mixer 播放音频文件，播完才返回，播放后卸载释放文件占用。"""
+    """用 pygame.mixer 播放音频文件，播完或被 interrupt() 打断才返回。
+
+    被打断时先 stop() 再照常 unload()——不能只 return，否则 Windows 上
+    临时文件仍被 mixer 占用，外层 finally 删不掉。
+    """
     _init_mixer()
     pygame.mixer.music.load(path)
     pygame.mixer.music.play()
-    # 忙等播放结束（get_busy 轮询）
+    # 轮询播放状态（每 50ms），同时检查打断标志
     while pygame.mixer.music.get_busy():
+        if _interrupt.is_set():
+            pygame.mixer.music.stop()
+            print("⏹️ 嘴巴：播报被主人打断。")
+            break
         time.sleep(0.05)
     pygame.mixer.music.unload()
     print("🔊 嘴巴：播报完毕。")
@@ -160,6 +185,9 @@ def speak(text: str) -> None:
     if not text or not text.strip():
         print("🔇 嘴巴：收到空文本，跳过播报。")
         return
+
+    # 新一轮播报开始，清除上一轮可能残留的打断标志
+    _interrupt.clear()
 
     tmp_path = None
     try:

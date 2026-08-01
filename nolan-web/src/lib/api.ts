@@ -55,6 +55,23 @@ export function clientLog(msg: string): void {
   }
 }
 
+/**
+ * 停止说话：POST /api/stop，立即打断服务端音箱当前播报。
+ * 仿 clientLog 的 fire-and-forget 风格：只保证请求尽量到达，不依赖响应。
+ */
+export function stopSpeak(): void {
+  const init: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  }
+  try {
+    void fetch('/api/stop', init).catch(() => undefined)
+  } catch {
+    /* 忽略 */
+  }
+}
+
 /** 健康检查：GET /api/health → {"ok": true, "name": "Nolan"} */
 export async function checkHealth(): Promise<boolean> {
   try {

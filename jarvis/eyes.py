@@ -43,6 +43,13 @@ import pyautogui
 import pyperclip
 from PIL import ImageGrab
 
+# UIA 元素树感知：comtypes 直调 UI Automation，枚举前台窗口可操作控件。
+# 防御式导入：UIA 不可用时纯视觉模式照常工作（截图 + VLM 不变）。
+try:
+    import uia as _uia
+except Exception:
+    _uia = None
+
 # ---------------------------------------------------------------------------
 # 初始化与常量
 # ---------------------------------------------------------------------------
@@ -321,9 +328,22 @@ def _parse_action(raw: str) -> dict | None:
 # 动作：pyautogui 执行
 # ---------------------------------------------------------------------------
 
-def _do_action(action: dict, shot_w: int, shot_h: int) -> None:
+def _snap(x: float, y: float, controls: list | None) -> tuple:
+    """UIA 就近吸附：有控件清单则对齐到最近控件中心，失败/无清单原样返回。"""
+    if not controls or _uia is None:
+        return x, y
+    try:
+        return _uia.snap_to_element(controls, x, y)
+    except Exception:
+        return x, y
+
+
+def _do_action(action: dict, shot_w: int, shot_h: int,
+               controls: list | None = None) -> None:
     """
-    执行单步动作。坐标先经 _vlm_to_screen 换算为物理像素。
+    执行单步动作。坐标先经 _vlm_to_screen 换算为物理像素；
+    若携带 UIA 控件清单（controls），落鼠标前再做一次 snap_to_element
+    就近吸附，把 VLM 的目测坐标对齐到真实控件中心，降低点偏概率。
     type 用 pyperclip 复制 + ctrl+v 粘贴，天然支持中文；
     key 支持单键（enter）与组合键（ctrl+v）。
     pyautogui.FailSafeException 不在此捕获，向上抛给 perform 统一中止。
@@ -333,6 +353,7 @@ def _do_action(action: dict, shot_w: int, shot_h: int) -> None:
     if act in ("left_click", "double_click"):
         x, y = _vlm_to_screen(float(action.get("x", 0)),
                               float(action.get("y", 0)), shot_w, shot_h)
+        x, y = _snap(x, y, controls)
         pyautogui.moveTo(x, y, duration=0.2)
         if act == "left_click":
             pyautogui.click()
@@ -344,6 +365,7 @@ def _do_action(action: dict, shot_w: int, shot_h: int) -> None:
         if "x" in action and "y" in action:
             x, y = _vlm_to_screen(float(action["x"]), float(action["y"]),
                                   shot_w, shot_h)
+            x, y = _snap(x, y, controls)
             pyautogui.moveTo(x, y, duration=0.2)
         direction = str(action.get("text", "down")).lower()
         pyautogui.scroll(3 if direction == "up" else -3)
@@ -444,11 +466,24 @@ def perform(task: str, max_steps: int = 12) -> str:
             last_shot = shot
             shot_w, shot_h = _screenshot_size()
 
+            # 1.5) UIA 元素树：枚举前台窗口的可操作控件（含屏幕物理坐标），
+            # 作为 VLM 坐标的参照系；UIA 不可用时静默降级为空列表
+            controls = []
+            if _uia is not None:
+                try:
+                    controls = _uia.dump_window_controls() or []
+                except Exception:
+                    controls = []
+
             # 2) 思考：问 VLM 下一步动作；非法 JSON 原地重试一次
             prompt = "当前任务：%s。这是第 %d 步（上限 %d 步）。" % (
                 task, step, max_steps)
             if history:
                 prompt += "已执行的动作历史：%s。" % "；".join(history)
+            if controls:
+                prompt += ("屏幕上的可操作控件（来自无障碍元素树，"
+                           "坐标为屏幕物理像素，点击时优先对齐这些控件）：%s。"
+                           % _uia.format_controls(controls))
             prompt += "请结合当前截图判断任务是否已完成，返回下一步动作 JSON。"
             try:
                 raw = _ask_vlm(shot, prompt, system=_VLM_SYSTEM)
@@ -508,7 +543,7 @@ def perform(task: str, max_steps: int = 12) -> str:
 
             # 4) 执行动作（FAILSAFE 抛异常即中止）
             try:
-                _do_action(action, shot_w, shot_h)
+                _do_action(action, shot_w, shot_h, controls)
             except pyautogui.FailSafeException:
                 print("[eyes] FAILSAFE 触发，安全中止")
                 return _MSG_FAILSAFE

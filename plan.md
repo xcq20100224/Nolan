@@ -39,3 +39,31 @@ jarvis/selftest_gaokao.py：50 条真实指令，覆盖 时间/打开应用/写�
 
 ## Stage F · 提交推送
 git commit；github.com 直连若仍不通，走 Git Data API（本次已验证的通道）。
+
+---
+
+# 阶段 2 · 感知升级（2026-08-01 开工）
+
+> 阶段 1 回答「做成没有」；阶段 2 回答「看见没有」。
+> 北极星：界面操作确定性——坐标不再靠 VLM 蒙像素。
+
+## 2A · UIA 元素树感知（眼睛升级）
+- 新模块 jarvis/uia.py：comtypes 直调 UIAutomationCore（已验证 comtypes 1.4.16 可用），
+  导出目标窗口控件树（Name/ControlType/BoundingRectangle/IsEnabled），紧凑文本化；
+  find_element(名称) → 矩形中心坐标。任何失败返回空，绝不拖垮 eyes。
+- eyes.py 集成：观测 = 截图 + UIA 控件清单（可交互控件优先，限量防爆 prompt）；
+  执行点击/输入时，目标点落入或匹配到控件 → 吸附到控件矩形中心（确定性坐标）。
+- VLM 决策循环不变，UIA 只是「更准的眼睛」，不是新的大脑。
+
+## 2B · 可打断（嘴巴升级）
+- mouth：播放循环每 50ms 查中断事件，mouth.interrupt() 立即止播。
+- server：/api/chat 入口先 mouth.interrupt()（新指令自动打断旧话）；
+  新增 /api/stop；网页版加「打断」按钮。
+- 砍：唤醒词与全双工——always-on 听音引擎 + 误触发调优是独立工程，移出本阶段。
+
+## 2C · 题库扩充
+- UIA dump  Sanity（记事本控件树含 文件/编辑）；interrupt 单元题；gui_control 记事本实操题（VLM 可用才跑）。
+
+## 2D · 打包发布（主代理亲自）
+- dist/Nolan-1.x.zip → 桌面副本 + 桌面快捷方式；
+- GitHub Release（API + uploads.github.com 已验证可达）给公开下载链接。

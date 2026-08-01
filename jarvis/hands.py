@@ -1078,6 +1078,9 @@ def _ensure_app_ready(hint: str) -> None:
     """
     try:
         if _find_window(hint):
+            # 窗口已在屏幕上但可能被其他窗口遮挡：先尝试置前，
+            # 否则眼睛截屏看不到目标界面，会误报「屏幕上没有找到」
+            _bring_window_front(hint)  # 容错置前，失败也无妨
             return  # 窗口已在屏幕上，无需开路
         print(f"[hands] 未检测到「{hint}」的窗口，先自动打开该应用……")
         _open_app(hint)  # 复用应用解析链启动（返回话术此处不用，眼睛只看屏幕）
