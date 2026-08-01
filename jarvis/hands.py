@@ -1161,8 +1161,9 @@ def _gui_control(task: str, confirmed: bool = False) -> str:
         if hint:
             _ensure_app_ready(hint)
 
-        # 确认后委托眼睛模块执行（步数上限等安全参数用其默认值）
-        return _eyes.perform(task)
+        # 确认后委托眼睛模块执行（步数上限等安全参数用其默认值；
+        # 目标应用词一并传入，眼睛每步截屏前做前台保障）
+        return _eyes.perform(task, target_hint=hint)
     except Exception as e:
         return f"抱歉先生，进行界面操作时出了问题：{e}"
 

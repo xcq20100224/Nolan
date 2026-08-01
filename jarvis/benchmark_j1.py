@@ -34,7 +34,7 @@ SANDBOX = hands.SANDBOX_DIR
 MEM_FILE = os.path.join(_JARVIS_DIR, "memory", "long_term.txt")
 REM_FILE = os.path.join(_JARVIS_DIR, "memory", "reminders.txt")
 
-FAIL_MARKS = ("抱歉", "未能完成", "出了问题", "无法连接")
+FAIL_MARKS = ("抱歉", "未能完成", "出了问题", "无法连接", "超出安全上限")
 CHAT_FAIL_MARKS = ("未能完成", "出了问题", "无法连接")
 
 

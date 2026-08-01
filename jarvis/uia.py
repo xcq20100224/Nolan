@@ -95,6 +95,56 @@ def _find_hwnd_by_title(title_substr: str) -> int:
     return hits[0] if hits else 0
 
 
+def foreground_title() -> str:
+    """当前前台窗口标题；失败返回空串。"""
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value or ""
+    except Exception:
+        return ""
+
+
+def bring_to_front(title_substr: str) -> bool:
+    """
+    把标题匹配的窗口还原并置前，返回是否真的成为前台窗口。
+    Windows 前台锁：后台进程直接 SetForegroundWindow 会被静默拒绝，
+    标准解法是 AttachThreadInput 挂接前台线程取得置前权限。
+    全程容错不抛异常。
+    """
+    try:
+        hwnd = _find_hwnd_by_title(title_substr)
+        if not hwnd:
+            return False
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.ShowWindow(ctypes.c_void_p(hwnd), 9)  # 9 = SW_RESTORE
+        fore = user32.GetForegroundWindow()
+        fore_tid = user32.GetWindowThreadProcessId(
+            ctypes.c_void_p(fore), None) if fore else 0
+        cur_tid = kernel32.GetCurrentThreadId()
+        attached = False
+        if fore_tid and fore_tid != cur_tid:
+            attached = bool(user32.AttachThreadInput(cur_tid, fore_tid, True))
+        try:
+            user32.BringWindowToTop(ctypes.c_void_p(hwnd))
+            user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
+            user32.SetActiveWindow(ctypes.c_void_p(hwnd))
+        finally:
+            if attached:
+                user32.AttachThreadInput(cur_tid, fore_tid, False)
+        return int(user32.GetForegroundWindow()) == int(hwnd)
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # 控件树枚举
 # ---------------------------------------------------------------------------

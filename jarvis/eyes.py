@@ -118,7 +118,10 @@ _VLM_SYSTEM = (
     "不要因为文本区是空白的就判定窗口未打开或无法输入。\n"
     "9. 桌面应用常识：深色侧边栏导航是音乐/视频类应用的标准布局"
     "（如网易云音乐左侧的「发现音乐 / 我喜欢 / 歌单」导航栏），"
-    "看到这类布局应优先在侧边栏中寻找入口。\n"
+    "看到这类布局应优先在侧边栏中寻找入口。"
+    "音乐播放状态常识：点击播放后，底部播放栏的圆形按钮变成「暂停」图标"
+    "（两条竖线）即表示歌曲正在播放，任务目标已达成，应立即返回 done，"
+    "不要重复点击播放（再点会变成暂停）。\n"
     "10. 若目标应用窗口不在屏幕上、未打开或被其他窗口遮挡，必须返回 fail，"
     "并在 thought 中以「屏幕上没有找到<应用名>」开头明确报告，"
     "绝不要乱点其他无关应用的界面来碰运气。\n"
@@ -497,9 +500,14 @@ def _over_limit_report(max_steps: int, last_thought: str,
 # 主闭环：perform
 # ---------------------------------------------------------------------------
 
-def perform(task: str, max_steps: int = 12) -> str:
+def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> str:
     """
     屏幕感知 + GUI 动作闭环：逐步截屏、问 VLM、执行动作，直到完成。
+
+    target_hint：目标应用窗口标题词（由 hands 前导提取）。提供时每步
+    截屏前检查前台窗口，目标不在前台就先置前——LLM 往返的几秒内
+    其他窗口（浏览器、弹窗、聊天软件）可能抢占前台遮挡目标，
+    整屏截图会把遮挡物当成操作对象（J1 基准实测的头号抖动源）。
 
     返回口语化结果（Nolan 人设，直接可语音播报）：
       - done        -> VLM 的完成汇报话术
@@ -523,6 +531,18 @@ def perform(task: str, max_steps: int = 12) -> str:
 
     try:
         for step in range(1, max_steps + 1):
+            # 0) 前台保障：目标窗口被遮挡时先置前，再截屏。
+            # 失败静默（托盘/标题漂移），不阻断主闭环
+            if target_hint and _uia is not None:
+                try:
+                    if target_hint.lower() not in _uia.foreground_title().lower():
+                        if _uia.bring_to_front(target_hint):
+                            print("[eyes] 目标窗口「%s」曾被遮挡，已重新置前"
+                                  % target_hint)
+                            time.sleep(0.5)  # 等窗口完成切换动画
+                except Exception:
+                    pass
+
             # 1) 感知：截屏
             shot = screenshot_b64()
             last_shot = shot
@@ -566,8 +586,21 @@ def perform(task: str, max_steps: int = 12) -> str:
                     return _MSG_VLM_DOWN
                 action = _parse_action(raw)
                 if action is None:
-                    print("[eyes] 第 %d 步重试仍非法，按 fail 处理" % step)
-                    return _fail_report(step, "视觉模块连续两次未能给出有效指令",
+                    # 第三次机会：换降级模型 glm-4v-flash（指令服从更朴素），
+                    # 主模型的随机格式错误不该直接判任务失败
+                    print("[eyes] 第 %d 步重试仍非法，换降级模型最后重试" % step)
+                    try:
+                        raw = _ask_vlm_once(
+                            shot,
+                            prompt + " 只返回一个合法 JSON 对象，"
+                            "不要任何其他文字、不要 markdown 代码块。",
+                            _VLM_SYSTEM, _VLM_FALLBACK_MODEL, {})
+                        action = _parse_action(raw)
+                    except Exception as exc:
+                        print("[eyes] 降级模型重试请求失败：%s" % exc)
+                if action is None:
+                    print("[eyes] 第 %d 步三次尝试均非法，按 fail 处理" % step)
+                    return _fail_report(step, "视觉模块连续多次未能给出有效指令",
                                         last_shot, executed)
 
             thought = str(action.get("thought", ""))
@@ -600,6 +633,24 @@ def perform(task: str, max_steps: int = 12) -> str:
                 # 不做早退宽限——等待解决不了「应用根本没打开」，
                 # 快速把信号还给 brain，让它走 open_app 补救路径
                 if "屏幕上没有找到" in reason:
+                    # 窗口其实存在、只是被遮挡/未置前时，「缺失」是误报：
+                    # 置前后重看（计入早退宽限，防无限循环），不判任务失败
+                    if (target_hint and _uia is not None
+                            and early_fail_retries < 2):
+                        try:
+                            hwnd = _uia._find_hwnd_by_title(target_hint)
+                        except Exception:
+                            hwnd = 0
+                        if hwnd:
+                            early_fail_retries += 1
+                            print("[eyes] 目标窗口存在但被遮挡（VLM 报缺失为误报），"
+                                  "置前重看（%d/2）" % early_fail_retries)
+                            _uia.bring_to_front(target_hint)
+                            time.sleep(1.0)
+                            history.append(
+                                "第%d步 目标窗口被其他界面遮挡，已重新置前，请重新观察"
+                                % step)
+                            continue
                     print("[eyes] 目标应用缺失：%s" % reason)
                     return _join_zh(_MSG_FAIL_PREFIX, reason,
                                     "请先让我用 open_app 打开它")
