@@ -14,7 +14,7 @@ set "NOLAN_NPM="
 for /f "delims=" %%P in ('where npm 2^>nul') do (
     if not defined NOLAN_NPM set "NOLAN_NPM=%%P"
 )
-if not defined NOLAN_NPM set "NOLAN_NPM=C:\Users\J1896\AppData\Local\Programs\kimi-desktop\resources\resources\runtime\node\npm.cmd"
+if not defined NOLAN_NPM set "NOLAN_NPM=C:\Users\J1896\AppData\Local\Programs\kimi-desktop\resources\resources\runtime\npm.cmd"
 
 "%NOLAN_NPM%" run dev
 pause

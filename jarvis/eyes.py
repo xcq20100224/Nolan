@@ -5,8 +5,10 @@ eyes.py —— Nolan 的「眼睛」与「手」的延伸（阶段五：屏幕�
 职责：把「点选网易云音乐列表中的歌曲」这类软件界面内操作，
 拆成一条可验证的闭环链路：
 
-    截屏 -> 视觉模型理解界面并返回动作 JSON -> pyautogui 执行
-    -> sleep 1 秒 -> 重新截屏 -> ... 直到 done / fail / 步数上限
+    截屏 -> 视觉模型理解界面并返回动作 JSON（含预期效果 expect）
+    -> pyautogui 执行 -> sleep 1 秒 -> 重新截屏复核上一步是否生效
+    （未生效则换策略重试，连续 2 次判失败；done 也需复核通过才生效）
+    -> ... 直到 done / fail / 步数上限
 
 视觉模型配置驱动：模型名与附加请求体来自 jarvis/llm_config.json 的
 可选字段 vision_model（默认 glm-4.5v）与 vision_extra_body
@@ -94,7 +96,8 @@ _VLM_SYSTEM = (
     "你每步只能返回一个 JSON 对象（不要任何多余文字、不要 markdown 代码块）：\n"
     '{"action": "left_click|double_click|type|key|scroll|wait|done|fail", '
     '"x": 像素x, "y": 像素y, "text": "输入内容", "keys": "如 ctrl+v", '
-    '"thought": "一句话决策理由"}\n'
+    '"thought": "一句话决策理由", '
+    '"expect": "动作生效后屏幕上应出现的可见变化"}\n'
     "协议细则：\n"
     "1. x、y 是基于我发给你的这张截图的像素坐标（截图左上角为原点）。"
     "只有 left_click、double_click、scroll 需要坐标；scroll 的 text 填 up 或 down。\n"
@@ -116,6 +119,10 @@ _VLM_SYSTEM = (
     "10. 若目标应用窗口不在屏幕上、未打开或被其他窗口遮挡，必须返回 fail，"
     "并在 thought 中以「屏幕上没有找到<应用名>」开头明确报告，"
     "绝不要乱点其他无关应用的界面来碰运气。\n"
+    "11. 物理动作（left_click/double_click/type/key/scroll）必须填 expect："
+    "一句话描述这个动作生效后，屏幕上应该出现什么可见变化"
+    "（例如「输入框里出现文字 hello」），用于执行后复核；"
+    "wait、done、fail 不需要填 expect。\n"
     "安全禁令（最高优先级，绝不可违背）：\n"
     "- 禁止输入任何密码、验证码或支付信息；\n"
     "- 禁止进行任何支付、转账、下单操作；\n"
@@ -287,6 +294,42 @@ def _describe_screen(shot_b64: str) -> str:
         return ""
 
 
+# 复核模块 prompt：只看截图实际可见内容回答是非题，拿不准一律 false
+_VLM_VERIFY_SYSTEM = (
+    "你是 Nolan 的执行复核模块。我会给你一张电脑屏幕截图和一个判断问题，"
+    "你只根据截图中实际可见的内容回答，绝不猜测、绝不脑补。\n"
+    "只返回一个 JSON 对象（不要任何多余文字、不要 markdown 代码块）：\n"
+    '{"ok": true或false, "reason": "一句话依据"}\n'
+    "拿不准时返回 false 并在 reason 里说明缺什么。"
+)
+
+
+def _verify(shot_b64: str, question: str) -> tuple:
+    """
+    执行复核（闭环核心）：问 VLM 一个关于当前截图的是非问题，
+    返回 (ok, reason)。ok 为 True/False 是有效判断；
+    复核调用本身失败或回复无法解析时返回 (None, "")，由调用方按
+    「复核不可用，静默放行」处理——复核是可靠性增强，绝不成为新的故障点。
+    """
+    if not shot_b64:
+        return None, ""
+    try:
+        raw = _ask_vlm(shot_b64, question, system=_VLM_VERIFY_SYSTEM)
+    except Exception as exc:
+        print("[eyes] 复核调用失败（按放行处理）：%s" % exc)
+        return None, ""
+    m = re.search(r"\{.*\}", raw.strip(), re.DOTALL)
+    if not m:
+        return None, ""
+    try:
+        obj = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None, ""
+    if not isinstance(obj, dict) or not isinstance(obj.get("ok"), bool):
+        return None, ""
+    return obj["ok"], str(obj.get("reason", ""))
+
+
 def _parse_action(raw: str) -> dict | None:
     """
     从 VLM 回复中解析动作 JSON。VLM 偶尔会裹 markdown 代码块或前后缀文字，
@@ -456,6 +499,8 @@ def perform(task: str, max_steps: int = 12) -> str:
     executed = 0             # 已执行的物理动作数（wait 不计）
     repeat_sigs: list = []   # 动作签名序列，用于死循环检测（同一动作连续重复即介入）
     early_fail_retries = 0   # 「零动作早退 fail」的宽限次数
+    verify_fails = 0         # 连续「复核未生效」次数（1 次换策略提示，2 次判失败）
+    done_rejects = 0         # done 复核驳回次数（最多 2 次，防复核侧死循环）
     last_shot = ""           # 最近一次截屏，失败时用于补问屏幕状态
     last_thought = ""        # 最后一步 VLM 的决策理由，失败报告要带出来
 
@@ -513,10 +558,24 @@ def perform(task: str, max_steps: int = 12) -> str:
             print("[eyes] 第 %d 步：%s | %s"
                   % (step, action["action"], thought))
 
-            # 3) 终态判定
+            # 3) 终态判定：done 必须先经复核才生效，防 VLM 谎报完成
             if action["action"] == "done":
+                ok, why = _verify(
+                    shot,
+                    "任务目标是「%s」。请只看这张截图判断："
+                    "该目标是否已经在屏幕上真正完成？" % task)
+                if ok is False and done_rejects < 2:
+                    done_rejects += 1
+                    print("[eyes] 第 %d 步 done 复核未通过（%s），继续执行（%d/2）"
+                          % (step, why, done_rejects))
+                    history.append(
+                        "第%d步 系统复核：任务尚未真正完成（%s），请继续未完成的部分"
+                        % (step, (why or "目标未达成")[:40]))
+                    time.sleep(_STEP_INTERVAL)
+                    continue
                 summary = thought or "任务已完成。"
-                print("[eyes] 任务完成：%s" % summary)
+                print("[eyes] 任务完成%s：%s"
+                      % ("（复核通过）" if ok is True else "", summary))
                 return summary
             if action["action"] == "fail":
                 reason = thought or "视觉模块判断无法完成。"
@@ -577,6 +636,39 @@ def perform(task: str, max_steps: int = 12) -> str:
 
             # 5) 等界面响应，进入下一步
             time.sleep(_STEP_INTERVAL)
+
+            # 5.5) 执行复核（闭环核心）：物理动作携带 expect 时重新截屏，
+            # 核对预期效果是否真实出现；未生效则记入历史强制换策略，
+            # 连续 2 次未生效判定失败；复核不可用（None）静默放行
+            expect = str(action.get("expect", "")).strip()
+            if action["action"] != "wait" and expect:
+                check_shot = ""
+                try:
+                    check_shot = screenshot_b64()
+                    ok, why = _verify(
+                        check_shot,
+                        "刚执行的动作是「%s」，预期屏幕上会出现：%s。"
+                        "请看这张截图判断：预期的效果是否已经出现？"
+                        % (desc, expect))
+                except Exception:
+                    ok, why = None, ""
+                if ok is False:
+                    verify_fails += 1
+                    print("[eyes] 第 %d 步复核未生效（期望：%s；实际：%s）（连续 %d 次）"
+                          % (step, expect[:30], (why or "未出现")[:30],
+                             verify_fails))
+                    if verify_fails >= 2:
+                        return _fail_report(
+                            step,
+                            "连续两次操作未产生预期效果（期望：%s），"
+                            "界面可能未响应或目标不存在" % expect[:40],
+                            check_shot or last_shot, executed)
+                    history.append(
+                        "警告：第%d步操作未生效（期望「%s」未出现，实际：%s），"
+                        "下一步必须换完全不同的做法"
+                        % (step, expect[:30], (why or "未出现")[:30]))
+                else:
+                    verify_fails = 0
 
         # 步数耗尽仍未 done/fail：超限话术 + 最后判断 + 屏幕状态
         print("[eyes] 步数超出上限 %d，中止" % max_steps)
