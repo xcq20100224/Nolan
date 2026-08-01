@@ -100,7 +100,10 @@ _VLM_SYSTEM = (
     '"expect": "动作生效后屏幕上应出现的可见变化"}\n'
     "协议细则：\n"
     "1. x、y 是基于我发给你的这张截图的像素坐标（截图左上角为原点）。"
-    "只有 left_click、double_click、scroll 需要坐标；scroll 的 text 填 up 或 down。\n"
+    "只有 left_click、double_click、scroll 需要坐标；scroll 的 text 填 up 或 down。"
+    "left_click、double_click 时把你要点的元素的可见文字填进 text"
+    "（例如按钮或菜单上的「我喜欢的音乐」「确定」），系统会优先按文字精确定位，"
+    "坐标仍需给出作为兜底。\n"
     "2. type 用于输入文字（text 为内容，支持中文）；key 用于按键"
     "（keys 为单键如 enter，或组合键如 ctrl+v）。\n"
     "3. wait 用于等待界面加载；done 表示任务已完成；fail 表示无法完成。\n"
@@ -394,9 +397,23 @@ def _do_action(action: dict, shot_w: int, shot_h: int,
     act = action["action"]
 
     if act in ("left_click", "double_click"):
-        x, y = _vlm_to_screen(float(action.get("x", 0)),
-                              float(action.get("y", 0)), shot_w, shot_h)
-        x, y = _snap(x, y, controls)
+        # 按名定位优先：VLM 在 text 里给出目标元素的可见文字时，
+        # 先用 UIA 按名查找精确中心——名称是精确的，坐标是估计的；
+        # 找不到再退回坐标 + 就近吸附的老路
+        target_text = str(action.get("text", "")).strip()
+        named_xy = None
+        if target_text and controls and _uia is not None:
+            try:
+                named_xy = _uia.find_element(controls, target_text)
+            except Exception:
+                named_xy = None
+        if named_xy:
+            x, y = named_xy
+            print("[eyes] 按名定位命中「%s」-> (%d, %d)" % (target_text, x, y))
+        else:
+            x, y = _vlm_to_screen(float(action.get("x", 0)),
+                                  float(action.get("y", 0)), shot_w, shot_h)
+            x, y = _snap(x, y, controls)
         pyautogui.moveTo(x, y, duration=0.2)
         if act == "left_click":
             pyautogui.click()
@@ -652,6 +669,22 @@ def perform(task: str, max_steps: int = 12) -> str:
                         % (desc, expect))
                 except Exception:
                     ok, why = None, ""
+                if ok is False:
+                    # 界面加载宽限：动作可能已生效但页面尚未渲染完，
+                    # 等 1.5 秒换一张截图复核第二次，仍不符才计未生效
+                    print("[eyes] 第 %d 步复核未见预期，等 1.5 秒二次复核……" % step)
+                    time.sleep(1.5)
+                    try:
+                        check_shot = screenshot_b64()
+                        ok2, why2 = _verify(
+                            check_shot,
+                            "刚执行的动作是「%s」，预期屏幕上会出现：%s。"
+                            "请看这张截图判断：预期的效果是否已经出现？"
+                            % (desc, expect))
+                        if ok2 is not False:
+                            ok, why = ok2, why2
+                    except Exception:
+                        pass
                 if ok is False:
                     verify_fails += 1
                     print("[eyes] 第 %d 步复核未生效（期望：%s；实际：%s）（连续 %d 次）"

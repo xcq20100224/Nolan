@@ -92,7 +92,7 @@ _FALLBACK_REPLIES = [
 
 # == 规则意图解析：文本 -> (工具名, 参数) 或 None ==
 
-_URL_RE = re.compile(r"https?://\S+")
+_URL_RE = re.compile(r"https?://\S+|www\.[^\s，。！？；]+")
 _FILE_RE = re.compile(r"[^\s，。！？；：「」『』“”]+\.[A-Za-z0-9]+")
 _LOCAL_APPS = ("记事本", "计算器", "画图")
 _TIME_KEYS = ("几点", "时间", "日期", "几号", "星期", "礼拜")
@@ -310,7 +310,12 @@ def _parse_intent(text: str) -> tuple | None:
         app_name = app_name.strip(" ，。！？：:帮我请把")
         # 动词过滤：提取出的「应用名」是纯动词/无意义词时不映射 open_app，
         # 放行给后续规则与 LLM 处理，避免「打开执行」被当成应用名
-        if app_name and app_name not in _OPEN_APP_BLACKLIST:
+        # 复合任务过滤：「应用名」里再含动作动词（播放/输入/搜索等），
+        # 说明是「打开 X 并做 Y」的复合指令，open_app 只能完成前半截，
+        # 必须放行给 LLM 走 gui_control 全链路，避免只打开不干活
+        _VERBS = ("播放", "输入", "搜索", "点击", "写", "打开", "暂停", "下载")
+        if (app_name and app_name not in _OPEN_APP_BLACKLIST
+                and not any(v in app_name for v in _VERBS)):
             return ("open_app", {"app": app_name})
 
     # 打开网址 / 抓取网页

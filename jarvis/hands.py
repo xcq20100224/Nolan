@@ -1019,18 +1019,35 @@ def _wait_for_window(term: str, timeout: float = _WINDOW_VERIFY_TIMEOUT) -> bool
 
 def _bring_window_front(title_substr: str) -> bool:
     """
-    尝试把标题匹配的窗口还原（SW_RESTORE）并置前（SetForegroundWindow）。
-    Windows 对前台窗口有权限限制，置前可能失败——全程容错，返回是否成功，
-    绝不抛异常（失败也无妨，眼睛靠截屏感知，不依赖前台状态）。
+    尝试把标题匹配的窗口还原（SW_RESTORE）并置前。
+    Windows 前台权限锁：后台进程直接 SetForegroundWindow 会被系统静默拒绝，
+    标准解法是 AttachThreadInput——把本线程输入队列挂到当前前台线程上，
+    取得「前台权限」后再 BringWindowToTop + SetForegroundWindow，完事脱钩。
+    最后用 GetForegroundWindow 实测验证，返回是否真的置前成功；
+    全程容错不抛异常（失败也无妨，眼睛靠截屏感知，不依赖前台状态）。
     """
     try:
         hwnd = _find_window_hwnd(title_substr)
         if not hwnd:
             return False
         user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
         user32.ShowWindow(ctypes.c_void_p(hwnd), 9)  # 9 = SW_RESTORE
-        user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
-        return True
+        fore = user32.GetForegroundWindow()
+        fore_tid = user32.GetWindowThreadProcessId(
+            ctypes.c_void_p(fore), None) if fore else 0
+        cur_tid = kernel32.GetCurrentThreadId()
+        attached = False
+        if fore_tid and fore_tid != cur_tid:
+            attached = bool(user32.AttachThreadInput(cur_tid, fore_tid, True))
+        try:
+            user32.BringWindowToTop(ctypes.c_void_p(hwnd))
+            user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
+            user32.SetActiveWindow(ctypes.c_void_p(hwnd))
+        finally:
+            if attached:
+                user32.AttachThreadInput(cur_tid, fore_tid, False)
+        return user32.GetForegroundWindow() == hwnd
     except Exception:
         return False
 

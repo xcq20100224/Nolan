@@ -723,12 +723,17 @@ def q51():
 @q(52, ("gui",), "打开网易云音乐，播放我喜欢列表里的第一首歌")
 def q52():
     # 锁死真机误报回归：应用明明在运行（可能在托盘），绝不许再说「没有看到它的窗口」；
-    # 不验证播放（播放精度属阶段 2），跑完不关闭网易云
+    # 复合指令路由升级后（打开X+播放Y 走 gui_control），合法回应有两种：
+    # 旧式「已经打开/已经在运行」（open_app 路径），
+    # 或接管确认询问（gui_control 路径，确认后才会真实执行播放）；
+    # 不验证播放（播放全链路已由 benchmark_j1 第 20 题覆盖），跑完不关闭网易云
+    hands.execute("open_app", {"app": "网易云音乐"})  # 误报锁的前提：实例必须在运行
     r = brain.think("打开网易云音乐，播放我喜欢列表里的第一首歌", [])
-    ok = ("已经打开" in r or "已经在运行" in r) and (
-        hands._find_window("网易云音乐") or proc_count("cloudmusic.exe") > 0
-    )
-    return (ok, f"回复：{r!r}")
+    brain._pending_shell = None  # 若进入确认态，清空待确认状态机防串题
+    routed = ("已经打开" in r or "已经在运行" in r or "确认" in r)
+    no_false_blind = "没有看到它的窗口" not in r
+    alive = hands._find_window("网易云音乐") or proc_count("cloudmusic.exe") > 0
+    return (routed and no_false_blind and alive, f"回复：{r!r}")
 
 
 @q(53, ("gui",), "open_app 混合句单元式（记事本，顺便帮我看看）")
