@@ -1,5 +1,5 @@
 // NEGA 顶部区：顶部居中细体大名「NOLAN」+ 副标题，右上角细线按钮与在线状态点
-import { Brain, Bell, History, Volume2 } from 'lucide-react'
+import { Brain, Bell, History, Volume2, Ear } from 'lucide-react'
 
 interface NegaHeaderProps {
   /** 后端是否在线（/api/health 成功） */
@@ -14,6 +14,10 @@ interface NegaHeaderProps {
   onHistory: () => void
   /** 点击「声音测试」按钮（🔊，浏览器 + 音箱双通道同时发声） */
   onSoundTest: () => void
+  /** 唤醒词耳蜗是否开启 */
+  wakeOn: boolean
+  /** 点击「唤醒词」开关 */
+  onWakeToggle: () => void
 }
 
 /** 细线边框小按钮的统一样式 */
@@ -22,7 +26,7 @@ const btnClass =
   'text-xs tracking-[0.2em] text-[#8a8578] transition-colors ' +
   'hover:border-[#5a5a60] hover:text-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-40'
 
-export default function NegaHeader({ online, exited, onMemory, onReminders, onHistory, onSoundTest }: NegaHeaderProps) {
+export default function NegaHeader({ online, exited, onMemory, onReminders, onHistory, onSoundTest, wakeOn, onWakeToggle }: NegaHeaderProps) {
   return (
     <header className="relative shrink-0 px-6 pb-4 pt-10">
       {/* 中央：细体大名 + 副标题（letter-spacing 会在末字后留白，用等量左 padding 补偿视觉居中） */}
@@ -43,6 +47,16 @@ export default function NegaHeader({ online, exited, onMemory, onReminders, onHi
           }`}
           title={online ? '后端在线' : '后端离线'}
         />
+        <button
+          type="button"
+          onClick={onWakeToggle}
+          disabled={exited}
+          className={btnClass}
+          title={wakeOn ? '唤醒词耳蜗已开启（说「诺兰」即可唤醒），点击关闭' : '开启唤醒词：对麦克风说「诺兰」即可唤醒 Nolan'}
+        >
+          <Ear className={`h-3.5 w-3.5 ${wakeOn ? 'text-[#c9a86a]' : ''}`} />
+          {wakeOn ? '聆听中' : '唤醒'}
+        </button>
         <button type="button" onClick={onMemory} disabled={exited} className={btnClass} title="查看长期记忆">
           <Brain className="h-3.5 w-3.5" />
           记忆

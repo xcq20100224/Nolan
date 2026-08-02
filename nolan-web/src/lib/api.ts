@@ -126,6 +126,25 @@ export async function getGreeting(): Promise<{ greeted: boolean; text: string | 
   return fetchJson('/api/greeting')
 }
 
+/** 唤醒词状态：GET /api/wake/state → {enabled, listening} */
+export async function getWakeState(): Promise<{ enabled: boolean; listening: boolean }> {
+  return fetchJson('/api/wake/state')
+}
+
+/** 唤醒词开关：POST /api/wake/toggle {enabled} */
+export async function setWake(enabled: boolean): Promise<{ enabled: boolean; listening: boolean }> {
+  return fetchJson('/api/wake/toggle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+}
+
+/** 唤醒事件：GET /api/wake/events → {events: [{text, audio_url}]}（出队即清空） */
+export async function getWakeEvents(): Promise<{ events: { text: string; audio_url: string | null }[] }> {
+  return fetchJson('/api/wake/events')
+}
+
 /** 提醒列表：GET /api/reminders → {"text": "口语化提醒列表"} */
 export async function getRemindersText(): Promise<string> {  const data = await fetchJson<{ text: string }>('/api/reminders')
   return data.text

@@ -8,7 +8,7 @@ import HistoryOverlay from '@/sections/HistoryOverlay'
 import NegaInput from '@/sections/NegaInput'
 import type { WaveMode } from '@/sections/WaveCanvas'
 import type { Message } from '@/types/message'
-import { checkHealth, sendChat, getDueMessages, getGreeting, getMemoryText, getRemindersText, playAudio, soundTest, getBackground, clientLog } from '@/lib/api'
+import { checkHealth, sendChat, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, soundTest, getBackground, clientLog } from '@/lib/api'
 
 /** 当前时间，格式 HH:MM（24 小时制） */
 function nowHHMM(): string {
@@ -56,6 +56,7 @@ export default function ChatApp() {
   const [messages, setMessages] = useState<Message[]>([])
   const [online, setOnline] = useState(false)
   const [exited, setExited] = useState(false)
+  const [wakeOn, setWakeOn] = useState(false)
   /** 等待 brain 回复中（驱动声波快速律动） */
   const [busy, setBusy] = useState(false)
   /** 录音中（服务端录音，驱动声波切换为模拟律动） */
@@ -223,6 +224,49 @@ export default function ChatApp() {
     }
   }, [pushNolan])
 
+  // 「唤醒词」开关（右上角）：开启后服务端耳蜗常驻，说「诺兰」即回应；
+  // 状态落盘在后端，挂载时同步真实状态
+  const handleWakeToggle = useCallback(async () => {
+    try {
+      const next = !wakeOn
+      const st = await setWake(next)
+      setWakeOn(st.enabled && st.listening)
+      pushNolan(st.enabled ? '先生，唤醒词已开启。对麦克风说「诺兰」，我随时在。' : '好的先生，唤醒词已关闭。')
+    } catch {
+      pushNolan('先生，唤醒词开关失败了，请检查后端是否在线。')
+    }
+  }, [wakeOn, pushNolan])
+
+  // 挂载时同步唤醒词真实状态（状态落盘在后端，可能已开启）
+  useEffect(() => {
+    getWakeState()
+      .then((st) => setWakeOn(st.enabled && st.listening))
+      .catch(() => {})
+  }, [])
+
+  // 耳蜗开启时 2.5 秒轮询唤醒事件：命中即播报确认音 + 字幕提示
+  useEffect(() => {
+    if (!wakeOn) return
+    let cancelled = false
+    const poll = async () => {
+      try {
+        const data = await getWakeEvents()
+        if (cancelled) return
+        data.events.forEach((ev) => {
+          pushNolan(ev.text)
+          if (ev.audio_url) playAudio(ev.audio_url)
+        })
+      } catch {
+        // 后端短暂不可用时静默跳过
+      }
+    }
+    const timer = window.setInterval(poll, 2_500)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [wakeOn, pushNolan])
+
   // 声波模式：录音 > 等待回复 > 闲置呼吸
   const waveMode: WaveMode = recording ? 'recording' : busy ? 'busy' : 'idle'
 
@@ -256,6 +300,8 @@ export default function ChatApp() {
           onReminders={handleReminders}
           onHistory={() => setHistoryOpen(true)}
           onSoundTest={handleSoundTest}
+          wakeOn={wakeOn}
+          onWakeToggle={handleWakeToggle}
         />
 
         {/* 中央：声波 + 状态提示 + 字幕 */}

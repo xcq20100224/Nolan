@@ -583,6 +583,7 @@ def _mic_start() -> None:
         _mic_stream = stream
         _mic_recording = True
         _mic_started_at = time.time()
+        _wake_pause_ev.set()  # 指令录音期间耳蜗暂停，防抢麦与锁竞争
         print("[server] 服务端麦克风开始录音。")
 
 
@@ -597,6 +598,7 @@ def _mic_stop() -> str:
             # 未在录音时调用：契约要求返回空文本而不是报错
             return ""
         _mic_stop_locked()
+        _wake_pause_ev.clear()  # 录音结束，耳蜗恢复值守
         frames = _mic_frames
         _mic_frames = []
 
@@ -638,6 +640,152 @@ def _mic_stop() -> str:
         return text
     except Exception as e:
         raise RuntimeError(f"语音识别失败了：{e}")
+
+
+# == 唤醒词（J5 在场感）：常驻耳蜗，主人说「诺兰 / Nolan」即回应 ==
+#
+# 第一性原理：唤醒 = 持续听（sounddevice 常驻流）+ 能量门控（只对语音段
+# 触发识别，静音零开销）+ 关键词命中（复用 medium whisper 中文识别，
+# 与指令录音同模型，唤醒时指令录音暂停耳蜗防抢麦）。
+# 自我触发防护：Nolan 自己播报的音频也含「诺兰」——每次回复/问候/闹钟后
+# 暂停耳蜗一个与播报时长匹配的窗口，绝不陷入「自己叫醒自己」的循环。
+_WAKE_KEYWORDS = ("诺兰", "nolan", "诺蓝", "挪兰", "脑兰")
+_WAKE_STATE_FILE = os.path.join(_JARVIS_DIR, "memory", "wake_state.json")
+_WAKE_ACK = "在的，先生，请讲。"
+_WAKE_RMS_GATE = 0.012          # 语音能量门（float32 RMS，低于视为静音）
+_WAKE_MAX_PAUSE_SEC = 20.0      # 播报后暂停耳蜗的封顶秒数
+
+_wake_enabled = False
+_wake_thread = None
+_wake_stop_ev = threading.Event()
+_wake_pause_ev = threading.Event()   # 指令录音期间置位（防抢麦）
+_wake_pause_until = 0.0              # 播报期间暂停到该时间戳（防自我触发）
+import collections as _collections   # noqa: E402  模块内专用，避免搅动文件头
+_wake_events = _collections.deque(maxlen=10)
+_wake_events_lock = threading.Lock()
+
+
+def _wake_pause_for(seconds: float) -> None:
+    """播报后暂停耳蜗 seconds 秒（封顶 _WAKE_MAX_PAUSE_SEC）。"""
+    global _wake_pause_until
+    _wake_pause_until = max(
+        _wake_pause_until,
+        time.time() + min(max(seconds, 0.0), _WAKE_MAX_PAUSE_SEC))
+
+
+def _wake_load_state() -> bool:
+    try:
+        with open(_WAKE_STATE_FILE, encoding="utf-8") as f:
+            return bool(json.load(f).get("enabled"))
+    except Exception:
+        return False
+
+
+def _wake_save_state(enabled: bool) -> None:
+    try:
+        os.makedirs(os.path.dirname(_WAKE_STATE_FILE), exist_ok=True)
+        with open(_WAKE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"enabled": bool(enabled)}, f)
+    except Exception as e:
+        print("[wake] 状态写入失败（跳过）：%s" % e)
+
+
+def _wake_spot(audio) -> None:
+    """对一段语音做关键词侦测：命中唤醒词即入队事件并暂停播报窗口。"""
+    _load_whisper()
+    if _whisper_model is None:
+        return
+    try:
+        with _whisper_lock:
+            segments, _ = _whisper_model.transcribe(
+                audio, language="zh", beam_size=1, vad_filter=False)
+        text = "".join(s.text for s in segments).strip().lower()
+    except Exception as e:
+        print("[wake] 侦测转写失败（跳过）：%s" % e)
+        return
+    if not text:
+        return
+    print("[wake] 听到：%s" % text[:40])
+    if any(k in text for k in _WAKE_KEYWORDS):
+        print("[wake] 唤醒词命中，通知前端。")
+        with _wake_events_lock:
+            _wake_events.append({"ts": time.time()})
+        _wake_pause_for(8)  # 确认音播报窗口，防自我触发
+
+
+def _wake_loop() -> None:
+    """耳蜗主循环：能量门控收集语音段，逐段侦测唤醒词；可随时停止。"""
+    import numpy as np
+    import sounddevice as sd
+    print("[wake] 耳蜗启动：对麦克风说「诺兰」即可唤醒。")
+    frames_buf = []
+    speech = []
+    in_speech = False
+    silence_hits = 0
+
+    def _cb(indata, frames, time_info, status):
+        frames_buf.append(indata.copy())
+
+    stream = None
+    try:
+        stream = sd.InputStream(samplerate=_MIC_SAMPLERATE, channels=1,
+                                dtype="float32", callback=_cb)
+        stream.start()
+        while not _wake_stop_ev.is_set():
+            # 暂停窗口（指令录音 / 播报）：清空缓冲，静默等待
+            if _wake_pause_ev.is_set() or time.time() < _wake_pause_until:
+                frames_buf.clear()
+                speech.clear()
+                in_speech = False
+                time.sleep(0.2)
+                continue
+            time.sleep(0.05)
+            if not frames_buf:
+                continue
+            chunk = np.concatenate(frames_buf, axis=0).flatten()
+            frames_buf.clear()
+            rms = float(np.sqrt(float(np.mean(chunk ** 2)))) if chunk.size else 0.0
+            if rms > _WAKE_RMS_GATE:
+                speech.append(chunk)
+                in_speech = True
+                silence_hits = 0
+            elif in_speech:
+                speech.append(chunk)
+                silence_hits += 1
+                if silence_hits >= 10:  # 连续约 0.5 秒静音：语音段结束
+                    seg = np.concatenate(speech)
+                    speech.clear()
+                    in_speech = False
+                    secs = seg.shape[0] / _MIC_SAMPLERATE
+                    if 0.3 <= secs <= 6.0:
+                        _wake_spot(seg)
+    except Exception as e:
+        print("[wake] 耳蜗异常退出：%s" % e)
+    finally:
+        try:
+            if stream is not None:
+                stream.stop()
+                stream.close()
+        except Exception:
+            pass
+        print("[wake] 耳蜗已停止。")
+
+
+def _wake_set_enabled(enabled: bool) -> dict:
+    """开关耳蜗：开启拉起守护线程，关闭发停止信号；状态落盘。"""
+    global _wake_enabled, _wake_thread
+    enabled = bool(enabled)
+    if enabled and not (_wake_thread and _wake_thread.is_alive()):
+        _wake_stop_ev.clear()
+        _wake_thread = threading.Thread(target=_wake_loop, daemon=True,
+                                        name="wake-ear")
+        _wake_thread.start()
+    elif not enabled:
+        _wake_stop_ev.set()
+    _wake_enabled = enabled
+    _wake_save_state(enabled)
+    return {"enabled": _wake_enabled,
+            "listening": bool(_wake_thread and _wake_thread.is_alive())}
 
 
 # == 全局状态 ==
@@ -760,11 +908,13 @@ def _chat(user_text: str) -> dict:
     if reply == "__EXIT__":
         farewell = "好的先生，我先去休息了，随时叫我的名字就能唤醒我。"
         # 只走浏览器 audio_url 单通道发声（见下方说明）
+        _wake_pause_for(2 + len(farewell) * 0.3)  # 播报期间耳蜗暂停，防自我触发
         return {"reply": farewell, "audio_url": synth_for(farewell), "exit": True}
 
     # 发声单通道化：网页端只由浏览器播放 audio_url，服务端音箱不再同步播报。
     # 此前音箱 + 浏览器双通道同时发声（引擎/延迟不同），听感是两个人重合说话。
     # 音箱通道仍保留给闹钟提醒（/api/due 的 _speak_alarm_async，必被听见场景）
+    _wake_pause_for(2 + len(reply) * 0.3)
     return {"reply": reply, "audio_url": synth_for(reply)}
 
 
@@ -963,7 +1113,25 @@ class NolanHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"messages": out})
             elif path == "/api/greeting":
                 # 主动晨报：每天首次打开网页时的问候语 + 语音
-                self._send_json(200, _greeting_payload())
+                payload = _greeting_payload()
+                if payload.get("text"):
+                    _wake_pause_for(2 + len(payload["text"]) * 0.3)
+                self._send_json(200, payload)
+            elif path == "/api/wake/state":
+                self._send_json(200, {
+                    "enabled": _wake_enabled,
+                    "listening": bool(_wake_thread and _wake_thread.is_alive()),
+                })
+            elif path == "/api/wake/events":
+                # 唤醒事件出队：前端 2.5 秒轮询，拿到事件即播报确认音
+                with _wake_events_lock:
+                    evs = list(_wake_events)
+                    _wake_events.clear()
+                out = [{"text": _WAKE_ACK,
+                        "audio_url": _tts_cached_url(_WAKE_ACK)} for _ in evs]
+                if evs:
+                    _warm_tts_async(_WAKE_ACK)
+                self._send_json(200, {"events": out})
             elif path == "/api/sound_test":
                 # 声音必达自检：浏览器通道（synth_for 合成返回 audio_url）与
                 # 音箱通道（后台线程 mouth.speak 播报同一句话）同时发声
@@ -997,6 +1165,14 @@ class NolanHandler(BaseHTTPRequestHandler):
                     return
                 result = _chat(str(data.get("text", "") or ""))
                 self._send_json(200, result)
+            elif path == "/api/wake/toggle":
+                # 唤醒词开关：{"enabled": true|false}，状态落盘重启保留
+                try:
+                    data = self._read_json_body()
+                except ValueError as e:
+                    self._send_error_json(400, str(e))
+                    return
+                self._send_json(200, _wake_set_enabled(data.get("enabled")))
             elif path == "/api/asr":
                 # 请求体为原始音频字节（audio/webm|ogg|wav，统统接受）
                 try:
@@ -1074,6 +1250,9 @@ def main() -> None:
     atexit.register(_cleanup_pidfile)
 
     _preload_whisper()  # 后台预加载语音模型，避免第一次录音等待
+    if _wake_load_state():  # 唤醒词开关状态落盘：上次开启过则自动恢复耳蜗
+        _wake_set_enabled(True)
+        print("[server] 唤醒词耳蜗已按落盘状态自动开启（说「诺兰」即可唤醒）")
     print(f"[server] Nolan 网页版后端已启动：http://127.0.0.1:{port}（PID={os.getpid()}，端口独占）")
     print(f"[server] 语音播报：{'启用' if mouth is not None else '静默（mouth 不可用）'}")
     try:
