@@ -121,9 +121,13 @@ export function playAudio(url: string | null): HTMLAudioElement | null {
   return audio
 }
 
+/** 主动晨报：GET /api/greeting → {greeted, text, audio_url}（每天首次有问候语） */
+export async function getGreeting(): Promise<{ greeted: boolean; text: string | null; audio_url: string | null }> {
+  return fetchJson('/api/greeting')
+}
+
 /** 提醒列表：GET /api/reminders → {"text": "口语化提醒列表"} */
-export async function getRemindersText(): Promise<string> {
-  const data = await fetchJson<{ text: string }>('/api/reminders')
+export async function getRemindersText(): Promise<string> {  const data = await fetchJson<{ text: string }>('/api/reminders')
   return data.text
 }
 

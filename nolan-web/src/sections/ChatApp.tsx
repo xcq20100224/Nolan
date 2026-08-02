@@ -8,7 +8,7 @@ import HistoryOverlay from '@/sections/HistoryOverlay'
 import NegaInput from '@/sections/NegaInput'
 import type { WaveMode } from '@/sections/WaveCanvas'
 import type { Message } from '@/types/message'
-import { checkHealth, sendChat, getDueMessages, getMemoryText, getRemindersText, playAudio, soundTest, getBackground, clientLog } from '@/lib/api'
+import { checkHealth, sendChat, getDueMessages, getGreeting, getMemoryText, getRemindersText, playAudio, soundTest, getBackground, clientLog } from '@/lib/api'
 
 /** 当前时间，格式 HH:MM（24 小时制） */
 function nowHHMM(): string {
@@ -129,7 +129,20 @@ export default function ChatApp() {
       clientLog(`健康检查: ${ok}`)
       setOnline(ok)
     })
-    setMessages([{ id: nextId(), role: 'nolan', text: '先生，Nolan 在线，请讲。', time: nowHHMM() }])
+    // 主动晨报（J5）：每天第一次打开时 Nolan 主动问候（时段+日期+待办提醒），
+    // 当天已问候或后端不可用时退回静态欢迎语
+    const fallbackWelcome = () =>
+      setMessages([{ id: nextId(), role: 'nolan', text: '先生，Nolan 在线，请讲。', time: nowHHMM() }])
+    getGreeting()
+      .then((g) => {
+        if (g.text) {
+          setMessages([{ id: nextId(), role: 'nolan', text: g.text, time: nowHHMM() }])
+          playAudio(g.audio_url)
+        } else {
+          fallbackWelcome()
+        }
+      })
+      .catch(fallbackWelcome)
   }, [])
 
   // 每 15 秒轮询到点提醒：逐条作为 Nolan 消息插入字幕（前置 ⏰ 以示闹钟），并按顺序播放合成语音

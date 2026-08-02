@@ -79,7 +79,7 @@ import memory      # noqa: E402  记忆：recall / load / remember / forget
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-01-stage3-closedloop"
+_VERSION = "2026-08-02-j5"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -685,12 +685,54 @@ def _speak_alarm_async(text: str) -> None:
     t.start()
 
 
+# == 主动晨报（J5）：每天第一次打开网页时，Nolan 主动开口问候 ==
+_GREETING_STATE = os.path.join(_JARVIS_DIR, "memory", "greeting_state.json")
+
+
+def _greeting_payload() -> dict:
+    """
+    每天首次请求：时段问候 + 日期星期 + 待办提醒数 + 语音；
+    当天已问候过返回 {"greeted": true}，前端退回静态欢迎语。
+    状态落盘（greeting_state.json），重启服务也不重复问候——
+    同伴的分寸感：主动，但不啰嗦。
+    """
+    lt = time.localtime()
+    today = time.strftime("%Y-%m-%d", lt)
+    try:
+        with open(_GREETING_STATE, encoding="utf-8") as f:
+            if json.load(f).get("date") == today:
+                return {"greeted": True, "text": None, "audio_url": None}
+    except Exception:
+        pass
+    salut = "早上好" if 5 <= lt.tm_hour < 12 else (
+        "下午好" if lt.tm_hour < 18 else "晚上好")
+    text = "%s，先生。今天是%d年%d月%d日，星期%s。" % (
+        salut, lt.tm_year, lt.tm_mon, lt.tm_mday,
+        "一二三四五六日"[lt.tm_wday])
+    try:
+        rem_file = os.path.join(_JARVIS_DIR, "memory", "reminders.txt")
+        with open(rem_file, encoding="utf-8") as f:
+            n = sum(1 for line in f if line.strip())
+        if n:
+            text += "您有 %d 个待办提醒，需要时对我说「我的提醒」。" % n
+    except Exception:
+        pass
+    text += "Nolan 在线，随时吩咐。"
+    try:
+        os.makedirs(os.path.dirname(_GREETING_STATE), exist_ok=True)
+        with open(_GREETING_STATE, "w", encoding="utf-8") as f:
+            json.dump({"date": today}, f)
+    except Exception:
+        pass
+    return {"greeted": False, "text": text, "audio_url": synth_for(text)}
+
+
 def _chat(user_text: str) -> dict:
     """
     处理一轮对话：串行调用 brain.think，维护 history（裁剪 20 轮）。
     返回 {"reply": str, "audio_url": str|null}，exit 时附加 "exit": True。
     audio_url 为 TTS 发声链合成的回复语音（缓存复用），合成失败为 None。
-    非 exit 回复在后台线程播报。
+    回复语音只由浏览器播放（单通道），服务端音箱仅用于闹钟提醒。
     """
     global _history
     user_text = (user_text or "").strip()
@@ -717,10 +759,12 @@ def _chat(user_text: str) -> dict:
 
     if reply == "__EXIT__":
         farewell = "好的先生，我先去休息了，随时叫我的名字就能唤醒我。"
-        _speak_async(farewell)
+        # 只走浏览器 audio_url 单通道发声（见下方说明）
         return {"reply": farewell, "audio_url": synth_for(farewell), "exit": True}
 
-    _speak_async(reply)
+    # 发声单通道化：网页端只由浏览器播放 audio_url，服务端音箱不再同步播报。
+    # 此前音箱 + 浏览器双通道同时发声（引擎/延迟不同），听感是两个人重合说话。
+    # 音箱通道仍保留给闹钟提醒（/api/due 的 _speak_alarm_async，必被听见场景）
     return {"reply": reply, "audio_url": synth_for(reply)}
 
 
@@ -917,6 +961,9 @@ class NolanHandler(BaseHTTPRequestHandler):
                     # 闹钟必响：服务端音箱连续播报两遍
                     _speak_alarm_async(msg)
                 self._send_json(200, {"messages": out})
+            elif path == "/api/greeting":
+                # 主动晨报：每天首次打开网页时的问候语 + 语音
+                self._send_json(200, _greeting_payload())
             elif path == "/api/sound_test":
                 # 声音必达自检：浏览器通道（synth_for 合成返回 audio_url）与
                 # 音箱通道（后台线程 mouth.speak 播报同一句话）同时发声

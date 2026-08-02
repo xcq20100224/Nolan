@@ -74,6 +74,31 @@ def _append_line(line: str) -> bool:
 
 # == 契约接口 ==
 
+# 记忆分类（J5 结构化）：remember 时按关键词自动归类，recall 时分组播报。
+# 同伴的本质是「懂」——分类让记忆从流水账变成对主人的结构化理解。
+_CATEGORY_RULES = (
+    ("偏好", ("喜欢", "不爱", "讨厌", "偏好", "常喝", "爱吃", "最爱")),
+    ("习惯", ("每天", "经常", "通常", "习惯", "一般", "总是", "每周")),
+    ("工作", ("项目", "会议", "工作", "评审", "同事", "客户", "汇报", "deadline", "截止")),
+    ("人际", ("朋友", "家人", "父亲", "母亲", "老婆", "老公", "孩子", "叫", "名字")),
+)
+_DEFAULT_CATEGORY = "事实"
+
+
+def _classify(fact: str) -> str:
+    """按关键词把一条记忆归类；都不命中归入「事实」。"""
+    for tag, keys in _CATEGORY_RULES:
+        if any(k in fact for k in keys):
+            return tag
+    return _DEFAULT_CATEGORY
+
+
+def _strip_tag(line: str) -> str:
+    """去掉行内的【类别】标签，返回纯内容（兼容旧格式无标签行）。"""
+    import re as _re
+    return _re.sub(r"【[^】]+】", "", line)
+
+
 def load() -> str:
     """返回全部长期记忆原文（供大脑注入 prompt）；无记忆返回空字符串；永不抛异常。"""
     try:
@@ -83,13 +108,14 @@ def load() -> str:
 
 
 def remember(fact: str) -> str:
-    """追加一条记忆，返回口语化确认文本；空内容返回提示。"""
+    """追加一条记忆（自动归类），返回口语化确认文本；空内容返回提示。"""
     try:
         fact = (fact or "").strip()
         if not fact:
             return "抱歉先生，我没有听清要记住的内容，请您再说一遍。"
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        if _append_line(f"[{stamp}] {fact}"):
+        tag = _classify(fact)
+        if _append_line(f"[{stamp}]【{tag}】{fact}"):
             return f"好的先生，我已经记住：{fact}"
         return "抱歉先生，记忆写入文件时出了点问题，这条恐怕没存下来。"
     except Exception:
@@ -97,15 +123,30 @@ def remember(fact: str) -> str:
 
 
 def recall() -> str:
-    """口语化列出全部记忆（供播报）。"""
+    """按类别分组、口语化列出全部记忆（供播报）。"""
     try:
         lines = _read_lines()
         if not lines:
             return "抱歉先生，我目前还不了解您，您可以对我说「记住……」"
-        items = "；".join(
-            f"{_cn_num(i + 1)}、{line}" for i, line in enumerate(lines)
-        )
-        return f"先生，我目前记得{_cn_num(len(lines))}件事：{items}。"
+        groups: dict = {}
+        order: list = []  # 保持首次出现顺序的类别列表
+        for line in lines:
+            import re as _re
+            m = _re.search(r"【([^】]+)】", line)
+            tag = m.group(1) if m else _DEFAULT_CATEGORY
+            if tag not in groups:
+                groups[tag] = []
+                order.append(tag)
+            groups[tag].append(_strip_tag(line))
+        parts = []
+        idx = 0  # 全局连续编号（跨类别不重置，保持播报可指认「第几件」）
+        for tag in order:
+            body_items = []
+            for it in groups[tag]:
+                idx += 1
+                body_items.append(f"{_cn_num(idx)}、{it.split(']', 1)[-1].strip()}")
+            parts.append(f"{tag}方面：" + "；".join(body_items))
+        return f"先生，关于您我目前记得{_cn_num(len(lines))}件事。" + "。".join(parts) + "。"
     except Exception:
         return "抱歉先生，读取记忆时出了点状况，暂时想不起来了。"
 
