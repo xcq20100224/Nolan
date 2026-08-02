@@ -90,11 +90,55 @@ def _kill(*exe):
         subprocess.run(["taskkill", "/f", "/im", e], capture_output=True)
 
 
+def _cn_variants(word):
+    """纯数字断言词 -> 中文数字写法集合。Nolan 是语音助手，答「六十」和「60」
+    等价（TTS 场景中文数字反而更自然），任一写法命中即过。"""
+    if not word.isdigit():
+        return {word}
+    n = int(word)
+    if n == 0:
+        return {word, "零"}
+    d = "零一二三四五六七八九"
+    units = ["", "十", "百", "千"]
+
+    def four(x):  # 0-9999 -> 中文（「十五」省略前导一）
+        s, zero, xs = "", False, str(x)
+        for i, ch in enumerate(xs):
+            v, pos = int(ch), len(xs) - 1 - i
+            if v == 0:
+                zero = True
+                continue
+            if zero and s:
+                s += "零"
+            zero = False
+            if not (v == 1 and pos == 1 and not s):
+                s += d[v]
+            s += units[pos]
+        return s
+
+    high, low = divmod(n, 10000)
+    parts = []
+    if high:
+        parts.append(four(high) + "万")
+    if low:
+        if high and low < 1000:
+            parts.append("零")
+        parts.append(four(low))
+    cn = "".join(parts)
+    out = {word, cn}
+    if n >= 1000:
+        out.add(f"{n:,}")  # 千分位：65,536
+    if "二" in cn:
+        out.add(cn.replace("二", "两", 1))  # 量词前读「两」：两斤/两百
+    return out
+
+
 def check(spec, reply):
     """按断言规格检查，返回 (ok, 说明)。"""
     kind = spec[0]
     if kind == "c":
-        return (spec[1] in reply, "含「%s」" % spec[1])
+        hit = any(v in reply for v in _cn_variants(spec[1]))
+        return (hit, "含「%s」" % spec[1])
     if kind == "nf":
         return (no_fail(reply), "话术 %s…" % reply[:36])
     if kind == "len":

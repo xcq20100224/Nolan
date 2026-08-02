@@ -95,7 +95,7 @@ _FALLBACK_REPLIES = [
 _URL_RE = re.compile(r"https?://\S+|www\.[^\s，。！？；]+")
 _FILE_RE = re.compile(r"[^\s，。！？；：「」『』“”]+\.[A-Za-z0-9]+")
 _LOCAL_APPS = ("记事本", "计算器", "画图")
-_TIME_KEYS = ("几点", "时间", "日期", "几号", "星期", "礼拜")
+_TIME_KEYS = ("几点", "时间", "日期", "几号", "星期几", "礼拜几")
 _SEARCH_KEYS = ("搜索", "搜一下", "查一下", "百度一下")
 _READ_KEYS = ("读取", "看看文件", "读一下", "读")
 _WRITE_KEYS = ("写文件", "记录", "记下来")
@@ -274,7 +274,13 @@ def _parse_intent(text: str) -> tuple | None:
     """
     # 时间 / 日期 / 星期
     if any(k in text for k in _TIME_KEYS):
-        return ("get_time", {})
+        # 排除「我一般几点起床」类：疑问主体是用户自身习惯/属性，不是问当下时间，
+        # 放行给记忆/大模型层（长期记忆已注入系统提示，LLM 能据记忆回答）。
+        # 含「现在/今天」等时间副词的一定是当下时间查询，优先报时。
+        _NOW_WORDS = ("现在", "今天", "明天", "后天", "昨天", "当前", "这会儿", "此刻")
+        if (any(w in text for w in _NOW_WORDS)
+                or not re.search(r"我[^，。！？]{0,10}(一般|通常|平时|习惯|生日|电话|地址|名字|喜欢|几|什么|哪|多少)", text)):
+            return ("get_time", {})
 
     # 媒体控制（播放/暂停/切歌/音量/静音）
     # 注意：「播放」单独出现不在此映射——「播放某首歌」类指令交给大模型判断，
