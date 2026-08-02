@@ -594,9 +594,10 @@ def q40():
 
 # ---------- 八、搜索抓取（4 题，NET 组） ----------
 
-def _web_search_opened(text, expect_query):
-    """web_search 会真开浏览器——monkeypatch os.startfile 记录 URL 代替，
-    物理验证 = 必应搜索 URL 正确拼出且查询词被 URL 编码。"""
+def _search_answered(text):
+    """「搜一下 X」新语义（2026-08-02 起）：不再把浏览器打开推回给主人，
+    而是 search_web 抓结果文本 -> LLM 一次性总结后口语汇报。
+    物理验证 = 全程不开浏览器 + 回复是有内容的总结且无失败话术。"""
     opened = []
     real_startfile = os.startfile
 
@@ -610,21 +611,20 @@ def _web_search_opened(text, expect_query):
         os.startfile = real_startfile
     ok = (
         no_fail(r)
-        and bool(opened)
-        and opened[-1].startswith("https://www.bing.com/search?q=")
-        and expect_query not in opened[-1]  # 中文必须被 URL 编码
+        and not opened  # 绝不再打开浏览器把活推回给主人
+        and len(r.strip()) >= 20  # 真实总结（或如实说没找到）有实质内容
     )
-    return (ok, f"回复：{r!r}；URL：{opened[-1] if opened else None!r}")
+    return (ok, f"回复（截断）：{r[:60]!r}；打开浏览器：{opened!r}")
 
 
-@q(41, ("net",), "搜一下 人工智能")
+@q(41, ("net", "llm"), "搜一下 人工智能")
 def q41():
-    return _web_search_opened("搜一下 人工智能", "人工智能")
+    return _search_answered("搜一下 人工智能")
 
 
-@q(42, ("net",), "搜一下 今天的新闻")
+@q(42, ("net", "llm"), "搜一下 今天的新闻")
 def q42():
-    return _web_search_opened("搜一下 今天的新闻", "今天的新闻")
+    return _search_answered("搜一下 今天的新闻")
 
 
 @q(43, ("net", "llm"), "把 人工智能新闻 搜一下写到 gaokao_news.txt")
@@ -639,8 +639,8 @@ def q43():
 
 @q(44, ("net",), "无意义词搜索（诚实题）")
 def q44():
-    # 规则层「搜一下」只负责打开浏览器（web_search），诚实语义在 search_web：
-    # 无结果时必须如实说「没有找到相关结果」，绝不谎称搜到了
+    # 诚实语义在 search_web：无结果时必须如实说「没有找到相关结果」，绝不谎称搜到了
+    # （规则层「搜一下」自 2026-08-02 起走 search_web -> LLM 总结快速通道，见 q41/q42）
     r = hands.execute("search_web", {"query": "asdfqwerzxcv不存在的词xyz"})
     ok = (
         isinstance(r, str)

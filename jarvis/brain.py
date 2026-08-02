@@ -687,6 +687,52 @@ def _think_via_llm(user_text: str, history: list[dict]) -> str | None:
 
 # == 对外接口（契约签名，勿改动） ==
 
+
+def _answer_from_search(query: str) -> str:
+    """
+    规则层搜索快速通道：search_web 抓结果文本 -> 单次 LLM 口语化总结。
+
+    为什么存在：「搜一下/查一下 X」的真实意图是知道 X 的内容，
+    web_search 只把浏览器打开给主人看，等于把活推回给主人——贾维斯不这么干。
+    这里复用 search_web（抓必应结果文本）+ 单次 LLM 调用（不走 Agent 循环），
+    比 _think_via_llm 省一半延迟且行为确定；LLM 不可用时如实降级给原文截断，
+    绝不谎称总结过。
+    """
+    result = hands.execute("search_web", {"query": query})
+    if not isinstance(result, str) or not result.strip():
+        return "抱歉先生，这次搜索没有拿到结果，您换个说法我再试试。"
+    cfg = _load_llm_config()
+    api_key = cfg.get("api_key")
+    if not api_key:
+        return "先生，我查到以下内容（大模型不在线，未能总结，给您原文要点）：" + result[:300]
+    base_url = cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
+    payload = {
+        "model": cfg.get("model", "gpt-4o-mini"),
+        "messages": [
+            {"role": "system", "content": (
+                "你是 Nolan 的搜索总结器。根据给定的搜索结果，用两三句口语向先生汇报要点："
+                "先给结论，再补关键细节；全文不超过 100 字；"
+                "结果里没有的信息不要编造；结果空洞或与问题无关时，"
+                "如实说「网上没有找到可靠信息」。")},
+            {"role": "user", "content": "主人问：%s\n\n搜索结果：\n%s" % (query, result)},
+        ],
+        "temperature": 0.3,
+    }
+    extra_body = cfg.get("extra_body")
+    if extra_body:
+        try:
+            extra = json.loads(extra_body)
+            if isinstance(extra, dict):
+                payload.update(extra)
+        except ValueError:
+            pass
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    reply = _request_llm(base_url + "/chat/completions", payload, headers)
+    if reply:
+        return reply
+    return "先生，我查到以下内容（总结失败，给您原文要点）：" + result[:300]
+
+
 def think(user_text: str, history: list[dict]) -> str:
     """
     Nolan 大脑主入口。
@@ -732,6 +778,10 @@ def think(user_text: str, history: list[dict]) -> str:
     intent = None if _is_composite(text) else _parse_intent(text)
     if intent is not None and hands is not None:
         tool, args = intent
+        if tool == "web_search":
+            # 「搜一下 X」要的是答案而不是看浏览器打开：
+            # 走 search_web 抓文本 -> LLM 一次性总结的快速通道
+            return _answer_from_search(args["query"])
         return _execute_tool(tool, args)
 
     # 7. 大模型层（含长期记忆与工具协议）
