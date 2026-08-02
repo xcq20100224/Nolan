@@ -1161,6 +1161,19 @@ def _gui_control(task: str, confirmed: bool = False) -> str:
         if hint:
             _ensure_app_ready(hint)
 
+        # 技能快路（J3）：命中已固化技能则直接重放——确定性动作序列，
+        # 不做 VLM 逐步推理；重放任何一步失败自动回退正常视觉闭环
+        try:
+            import skills as _skills_mod
+            hit = _skills_mod.find(task) if _skills_mod else None
+        except Exception:
+            hit = None
+        if hit:
+            r = _eyes.replay(task, hit[1], target_hint=hint)
+            if isinstance(r, str) and r:
+                return r
+            print("[hands] 技能重放未成功，回退正常视觉闭环")
+
         # 确认后委托眼睛模块执行（步数上限等安全参数用其默认值；
         # 目标应用词一并传入，眼睛每步截屏前做前台保障）
         return _eyes.perform(task, target_hint=hint)

@@ -26,7 +26,8 @@ import edge_tts
 import pygame
 
 # ===== 可配置常量 =====
-VOICE = "zh-CN-YunjianNeural"       # edge-tts 备用音色（浑厚男声）
+VOICE = "zh-CN-YunjianNeural"       # edge-tts 备用音色（浑厚男声；云野端点不可用已实测回退）
+VOICE_RATE = "-4%"                  # 语速放慢 4%：沉稳不急促（贾维斯式从容）
 GLM_TTS_VOICE = "male"              # GLM-TTS 主通道男声
 GLM_TTS_TIMEOUT = 60                # GLM-TTS 请求超时（秒）
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_config.json")
@@ -102,7 +103,7 @@ def _synthesize_glm_tts(text: str) -> bytes:
 def _synthesize_to_file(text: str, out_path: str) -> None:
     """第二级：edge-tts 合成，失败间隔 1 秒重试一次，仍失败抛异常交由调用方降级。"""
     async def _run() -> None:
-        communicate = edge_tts.Communicate(text, VOICE)
+        communicate = edge_tts.Communicate(text, VOICE, rate=VOICE_RATE)
         await communicate.save(out_path)
 
     try:

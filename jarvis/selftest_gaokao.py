@@ -881,6 +881,28 @@ def q56():
         kill_apps(*NOTEPAD_PROCS)
 
 
+# ---------- 十三、阶段 3+4 合并主线：技能固化（1 题） ----------
+
+@q(57, (), "技能固化：record/find 闭环 + 相似命中 + 不误命中（临时文件）")
+def q57():
+    import tempfile
+    import skills as _sk
+    old = _sk._PATH
+    with tempfile.TemporaryDirectory() as td:
+        _sk._PATH = os.path.join(td, "skills.jsonl")
+        try:
+            steps = [{"action": "left_click", "text": "我喜欢的音乐", "keys": ""},
+                     {"action": "wait"}]
+            ok1 = _sk.record("在某某软件中播放我喜欢的第一首歌", steps)
+            hit = _sk.find("在某某软件里播放我喜欢的第一首歌")  # 一字之差应模糊命中
+            ok2 = hit is not None and len(hit[1]) == 1  # wait 被过滤
+            ok3 = _sk.find("在记事本中输入一段文字") is None  # 不相似不误命中
+            return (ok1 and ok2 and ok3,
+                    f"record={ok1} hit={bool(hit)} steps={len(hit[1]) if hit else 0} 误命中={not ok3}")
+        finally:
+            _sk._PATH = old
+
+
 # == 备份 / 恢复 ==
 
 def _read_bytes(path):

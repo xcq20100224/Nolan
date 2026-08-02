@@ -52,6 +52,13 @@ try:
 except Exception:
     _uia = None
 
+# 技能固化：成功任务的动作序列沉淀与重放（J3）。
+# 防御式导入：模块缺失时退化回纯 VLM 闭环，功能不缺、只是不学习。
+try:
+    import skills as _skills
+except Exception:
+    _skills = None
+
 # ---------------------------------------------------------------------------
 # 初始化与常量
 # ---------------------------------------------------------------------------
@@ -521,6 +528,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
     print("[eyes] 任务开始：%s（步数上限 %d）" % (task, max_steps))
 
     history: list[str] = []  # 已执行动作历史，每步带给 VLM 防止重复动作
+    done_steps: list = []    # 结构化动作序列，任务成功后固化进技能库
     executed = 0             # 已执行的物理动作数（wait 不计）
     repeat_sigs: list = []   # 动作签名序列，用于死循环检测（同一动作连续重复即介入）
     early_fail_retries = 0   # 「零动作早退 fail」的宽限次数
@@ -626,6 +634,13 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                 summary = thought or "任务已完成。"
                 print("[eyes] 任务完成%s：%s"
                       % ("（复核通过）" if ok is True else "", summary))
+                # 技能固化：经复核确认成功的动作序列沉淀为可复用技能，
+                # 下次同类任务直接重放，不再逐步掷骰子
+                if _skills is not None and done_steps:
+                    try:
+                        _skills.record(task, done_steps)
+                    except Exception:
+                        pass
                 return summary
             if action["action"] == "fail":
                 reason = thought or "视觉模块判断无法完成。"
@@ -684,6 +699,9 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
             history.append("第%d步 %s" % (step, desc))
             if action["action"] != "wait":
                 executed += 1
+                done_steps.append({"action": action["action"],
+                                   "text": action.get("text", ""),
+                                   "keys": action.get("keys", "")})
 
             # 4.5) 死循环检测：同一动作（动作+坐标+文本）连续重复——
             # 第 3 次重复给 VLM 换路强提示，第 4 次直接判定失败，
@@ -767,6 +785,88 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
         return _fail_report(max(1, executed + 1),
                             "执行过程中出现异常（%s），已停止" % exc,
                             last_shot, executed)
+
+
+# ---------------------------------------------------------------------------
+# 技能重放：replay
+# ---------------------------------------------------------------------------
+
+def replay(task: str, steps: list, target_hint: str | None = None):
+    """
+    技能重放：按固化的动作序列直接执行，不做 VLM 逐步推理。
+    点击一律按名定位（UIA 重新解析当前位置，坐标不参与固化），
+    任何一步解析不到或执行异常立即返回 None，由调用方回退正常视觉闭环。
+    全部动作执行完做一次终态复核（全程唯一一次模型调用），
+    复核未过同样返回 None——重放是捷径，不是免检通道。
+    触发 FAILSAFE 返回中止话术（字符串结果，不是 None）。
+    """
+    if not steps:
+        return None
+    print("[eyes] 技能重放：%s（%d 步）" % (task, len(steps)))
+    for i, s in enumerate(steps, 1):
+        # 前台保障（与 perform 同款）：目标被遮挡先置前
+        if target_hint and _uia is not None:
+            try:
+                if target_hint.lower() not in _uia.foreground_title().lower():
+                    _uia.bring_to_front(target_hint)
+                    time.sleep(0.5)
+            except Exception:
+                pass
+        act = s.get("action")
+        try:
+            if act in ("left_click", "double_click"):
+                if _uia is None:
+                    return None
+                controls = _uia.dump_window_controls() or []
+                xy = _uia.find_element(controls, str(s.get("text", "")))
+                if not xy:
+                    print("[eyes] 重放第 %d 步：按名未找到「%s」，放弃重放"
+                          % (i, s.get("text")))
+                    return None
+                pyautogui.moveTo(xy[0], xy[1], duration=0.2)
+                if act == "left_click":
+                    pyautogui.click()
+                else:
+                    pyautogui.doubleClick()
+            elif act == "type":
+                pyperclip.copy(str(s.get("text", "")))
+                time.sleep(0.1)
+                pyautogui.hotkey("ctrl", "v")
+            elif act == "key":
+                parts = [k.strip() for k in str(s.get("keys", "")).lower()
+                         .split("+") if k.strip()]
+                if not parts:
+                    return None
+                if len(parts) == 1:
+                    pyautogui.press(parts[0])
+                else:
+                    pyautogui.hotkey(*parts)
+            elif act == "scroll":
+                pyautogui.scroll(3 if str(s.get("text", "down")).lower()
+                                 == "up" else -3)
+            else:
+                return None
+        except pyautogui.FailSafeException:
+            print("[eyes] 重放触发 FAILSAFE，安全中止")
+            return _MSG_FAILSAFE
+        except Exception as exc:
+            print("[eyes] 重放第 %d 步异常（%s），放弃重放" % (i, exc))
+            return None
+        time.sleep(0.8)
+
+    # 终态复核：唯一一次模型调用，确认目标真实达成
+    try:
+        ok, why = _verify(
+            screenshot_b64(),
+            "任务目标是「%s」。请只看这张截图判断："
+            "该目标是否已经在屏幕上真正完成？" % task)
+    except Exception:
+        ok, why = None, ""
+    if ok is False:
+        print("[eyes] 技能重放终态复核未通过（%s），回退正常闭环" % why)
+        return None
+    print("[eyes] 技能重放完成：%s" % task)
+    return "先生，按我已掌握的技能为您完成了：%s。" % task
 
 
 # ---------------------------------------------------------------------------
