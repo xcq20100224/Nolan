@@ -154,6 +154,12 @@ def parse_time(text: str):
     text = (text or "").strip()
     if not text:
         return None
+    # 组合口语词归一化：明早=明天早上、明晚=明天晚上（正则不增词表，预处理后走标准路径）
+    for alias, std in (("明早", "明天早上"), ("明晚", "明天晚上"),
+                       ("今早", "今天早上"), ("今晚", "今天晚上")):
+        if text.startswith(alias):
+            text = std + text[len(alias):]
+            break
     now = datetime.now()
 
     # 相对时间：X秒钟后 / X秒后 / X分钟后 / X小时后
@@ -229,6 +235,13 @@ def _extract_time_prefix(raw: str):
     返回 (datetime, 剩余内容)；解析不出返回 (None, raw)。
     """
     raw = raw.strip()
+    # 组合口语词归一化：明早=明天早上、明晚=明天晚上——正则在原始串上匹配，
+    # 归一化必须发生在前缀提取之前（放在 parse_time 里对本函数无效，实测踩过）
+    for alias, std in (("明早", "明天早上"), ("明晚", "明天晚上"),
+                       ("今早", "今天早上"), ("今晚", "今天晚上")):
+        if raw.startswith(alias):
+            raw = std + raw[len(alias):]
+            break
     # 相对时间优先（绝对时间正则以「点」结尾，不会误吞相对表达）
     for regex in (_RE_REL, _RE_ABS):
         m = regex.match(raw)

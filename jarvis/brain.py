@@ -135,7 +135,14 @@ _ACTION_GROUPS = (
     ("打开",),                                                # 打开组
     ("抓取", "看看网页", "网页内容"),                          # 抓取组
     ("运行", "执行"),                                          # 命令组
+    ("提醒", "闹钟", "叫醒"),                                  # 提醒组
+    ("读给", "读出来", "念给"),                                # 朗读组
 )
+
+# 「搜索并总结 X」算单意图：搜索快速通道（_answer_from_search）内部自带总结，
+# 判复合会让它绕进 Agent 循环用本地低质量抓取（实测 P1 第 2/7 题）
+_SEARCH_AND_SUMMARY = (("搜索", "搜一下", "查一下", "百度"),
+                       ("总结", "概括", "归纳"))
 
 
 def _is_composite(text: str) -> bool:
@@ -149,6 +156,12 @@ def _is_composite(text: str) -> bool:
     ):
         return True
     hits = sum(1 for group in _ACTION_GROUPS if any(word in text for word in group))
+    if hits == 2:
+        # 「搜索并总结 X」单意图化：命中恰为搜索组+总结组时不判复合
+        hit_search = any(w in text for w in _SEARCH_AND_SUMMARY[0])
+        hit_summary = any(w in text for w in _SEARCH_AND_SUMMARY[1])
+        if hit_search and hit_summary:
+            return False
     return hits >= 2
 
 
@@ -247,6 +260,13 @@ def _handle_reminder_intent(text: str) -> str | None:
             if not raw:
                 return "好的先生，请问要我在什么时候提醒您什么？"
             return reminders.add(raw)
+        # 「设（一个|个|置）…（的）提醒」句式（规划器拆步常见说法）：
+        # 提取「提醒」前的时间与事项交给 reminders
+        m = re.search(r"设(?:一个|个|置|一下)?(.+?)的?提醒", text)
+        if m:
+            raw = m.group(1).strip(" ，。！？：:帮我请把")
+            if raw:
+                return reminders.add(raw)
         # 闹钟/叫醒：叫醒我 / 叫我起床 / 叫我起来 / 闹钟 / 叫我（排除问句）
         alarm_raw = _extract_alarm_raw(text)
         if alarm_raw is not None:
@@ -270,13 +290,31 @@ def _handle_reminder_intent(text: str) -> str | None:
 
 
 def _parse_write_file(text: str) -> tuple | None:
-    """解析写文件两种句式，解析不出返回 None。"""
+    """解析写文件两种句式，解析不出返回 None。
+    「把计划/安排/总结/结果/清单/日程写到 F」类：内容是**指代待生成内容的抽象名词**，
+    规则层只会把「计划」二字写进文件（实测真这么干过），必须放行给 LLM 生成后写入。"""
+    _ABSTRACT_CONTENT = ("计划", "安排", "总结", "结果", "清单", "日程", "行程",
+                         "笔记", "心得", "报告", "大纲", "方案", "攻略", "要点", "规划")
+    # 内容指代待生成/前序结果：「上一步的结果」「X算出来」「X等于多少」——
+    # 规则层只能写字面量，必须放行给 LLM 生成（实测「上一步的结果」被字面写入）
+    _GENERATIVE_HINTS = ("上一步", "算出来", "计算", "等于多少", "的结果")
     # 句式一：把 xxx 写到/记到 yyy
     m = re.search(r"把(.+?)(?:写到|记到)\s*([^\s，。！？]+)", text)
     if m:
-        return ("write_file", {"name": m.group(2), "content": m.group(1).strip()})
+        content = m.group(1).strip()
+        if any(h in content for h in _GENERATIVE_HINTS):
+            return None
+        # 内容整体是抽象名词（允许「的/今天/明天/本周」等修饰）：需要生成，放行
+        stripped = content
+        for w in ("今天的", "明天的", "本周的", "这周的", "今天的", "我的", "的"):
+            stripped = stripped.replace(w, "")
+        if stripped in _ABSTRACT_CONTENT or content in _ABSTRACT_CONTENT:
+            return None
+        return ("write_file", {"name": m.group(2), "content": content})
     # 句式二：写文件 yyy 内容 xxx
-    m = re.search(r"写文件\s*([^\s，。！？]+)\s*内容[:：]?\s*(.+)", text)
+    # 「内容(为|是) X」的连接词消化：规划器拆步常把「内容 第一题」润色成
+    # 「内容为 第一题」，不消化会把「为」字写进文件（实测高考 q46）
+    m = re.search(r"写文件\s*([^\s，。！？]+)\s*内容[:：]?\s*(?:为|是)?\s*(.+)", text)
     if m:
         return ("write_file", {"name": m.group(1), "content": m.group(2).strip()})
     return None
@@ -361,6 +399,13 @@ def _parse_intent(text: str) -> tuple | None:
     # 搜索
     if any(k in text for k in _SEARCH_KEYS):
         query = _strip_triggers(text, _SEARCH_KEYS)
+        # 清洗开头的连接/动作残留：规划器子任务常是「搜索并总结 X」，
+        # 剥掉触发词后「并总结」混进 query 会把搜索带偏（实测）
+        for junk in ("并总结", "再总结", "然后总结", "接着总结", "总结一下",
+                     "并概括", "并", "再", "总结", "概括"):
+            if query.startswith(junk):
+                query = query[len(junk):].lstrip(" ，。：:")
+                break
         if query:
             return ("web_search", {"query": query})
 
@@ -722,6 +767,122 @@ def _think_via_llm(user_text: str, history: list[dict]) -> str | None:
 
 # == 对外接口（契约签名，勿改动） ==
 
+# == 分层规划（P1）：大目标 -> 拆步 -> 逐步执行 -> 汇总 ==
+#
+# 为什么需要这一层：P0 证明单步任务可靠（300/300），但「帮我准备明天出差」
+# 这类大目标是 3 步以上复合——平铺 Agent 循环（4 轮上限）实测漏步、乱序、
+# 内容错（P1 基线仅 20%）。第一性原理：把大目标还原为一串单步任务，
+# 每个子任务复用已验证的 think 全链路（规则层/快速通道/Agent 循环），
+# 确定性来自「单步可靠」而不是更大的临场自由。
+
+_PLAN_DEPTH = 0  # 规划执行深度：子任务执行期间不再触发规划器（防递归）
+_PLAN_MAX_STEPS = 6
+
+
+def _llm_plan(text, cfg):
+    """规划器：大目标 -> 有序子任务清单（每步一句单意图中文指令），失败返回 None。"""
+    payload = {
+        "model": cfg.get("model", "gpt-4o-mini"),
+        "messages": [
+            {"role": "system", "content": (
+                "你是 Nolan 的规划器。把主人的大目标拆成 2-%d 个有序子任务，"
+                "每个子任务是一句可以独立执行的简单中文指令（单意图，不含「然后/接着/并且」）。\n"
+                "可利用的能力：查时间天气、搜索并总结、写/读文件（文件名带扩展名）、"
+                "记住事情、设提醒、心算算术、打开应用或网站、执行系统命令、操作软件界面。\n"
+                "规则：后续步骤需要前面结果时，在指令里写「上一步的结果」；"
+                "提醒类子任务必须用「提醒我 + 时间 + 事项」完整句式，"
+                "时间规范为「X点X分」或「明早X点」（如「提醒我明早7点收拾出差行李」）；"
+                "文件类子任务把文件名说完整。\n"
+                "只输出 JSON 数组，例如："
+                "[\"查一下北京明天天气\", \"把行李清单写到 出差清单.txt\"]，"
+                "不要输出任何其他字符。" % _PLAN_MAX_STEPS)},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.2,
+    }
+    extra_body = cfg.get("extra_body")
+    if extra_body:
+        try:
+            extra = json.loads(extra_body)
+            if isinstance(extra, dict):
+                payload.update(extra)
+        except ValueError:
+            pass
+    base_url = cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
+    headers = {"Authorization": "Bearer " + cfg["api_key"],
+               "Content-Type": "application/json"}
+    reply = _request_llm(base_url + "/chat/completions", payload, headers)
+    if not reply:
+        return None
+    # 解析 JSON 数组：定位首个 [ 后 raw_decode，容忍前后杂散文本
+    decoder = json.JSONDecoder(strict=False)
+    for idx, ch in enumerate(reply):
+        if ch != "[":
+            continue
+        try:
+            steps, _end = decoder.raw_decode(reply[idx:])
+        except ValueError:
+            continue
+        if isinstance(steps, list) and all(isinstance(s, str) and s.strip() for s in steps):
+            steps = [s.strip() for s in steps if s.strip()][: _PLAN_MAX_STEPS]
+            return steps if len(steps) >= 2 else None
+    print("[brain] 规划器返回了无法解析的步骤列表：%r" % reply[:120])
+    return None
+
+
+def _summarize_plan(goal, outcomes, cfg):
+    """汇总器：各步结果 -> 一段口语汇报，失败步骤如实说明。"""
+    lines = "\n".join(
+        "第%d步「%s」：%s" % (i, s, (r or "").replace("\n", " ")[:150])
+        for i, s, r in outcomes)
+    payload = {
+        "model": cfg.get("model", "gpt-4o-mini"),
+        "messages": [
+            {"role": "system", "content": (
+                "你是 Nolan。主人交代了一个大目标，你已分步执行完毕。"
+                "用两三句口语向先生汇报：先说完成了什么、关键结果是什么；"
+                "若有步骤失败，如实说哪一步没成、原因是什么。不超过 120 字。")},
+            {"role": "user", "content": "主人的目标：%s\n\n各步执行结果：\n%s" % (goal, lines)},
+        ],
+        "temperature": 0.3,
+    }
+    base_url = cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
+    headers = {"Authorization": "Bearer " + cfg["api_key"],
+               "Content-Type": "application/json"}
+    reply = _request_llm(base_url + "/chat/completions", payload, headers)
+    if reply:
+        return reply
+    # 汇总失败兜底：直接拼接各步结果，绝不静默
+    return "先生，目标已分步执行，结果如下：" + "；".join(
+        "%s：%s" % (s, (r or "")[:60]) for _, s, r in outcomes)
+
+
+def _plan_and_execute(text, history):
+    """分层规划主流程：拆步 -> 逐步 think（结果经对话历史传递）-> 汇总。
+    任何一环不可用即降级回平铺 Agent 循环。"""
+    global _PLAN_DEPTH
+    cfg = _load_llm_config()
+    if not cfg.get("api_key"):
+        return _think_via_llm(text, history)
+    steps = _llm_plan(text, cfg)
+    if not steps:
+        return _think_via_llm(text, history)
+    print("[brain] 规划器拆出 %d 步：%s" % (len(steps), " | ".join(steps)))
+    outcomes = []
+    _PLAN_DEPTH += 1
+    try:
+        for i, step in enumerate(steps, 1):
+            # 结果传递：前序步骤问答拼成对话历史，LLM 处理「上一步的结果」
+            sub_history = []
+            for _, prev_step, prev_reply in outcomes:
+                sub_history.append({"role": "user", "content": prev_step})
+                sub_history.append({"role": "assistant", "content": prev_reply or ""})
+            reply = think(step, sub_history)
+            outcomes.append((i, step, reply))
+    finally:
+        _PLAN_DEPTH -= 1
+    return _summarize_plan(text, outcomes, cfg)
+
 # 「搜 X 总结写到 F」复合任务正则：query 非贪婪截到「总结/写到」之前，
 # 「总结」与条数修饰（两条/3 条）可缺省；文件名必须是带扩展名的词
 _SEARCH_WRITE_RE = re.compile(
@@ -733,7 +894,12 @@ _SEARCH_WRITE_RE = re.compile(
 
 
 def _parse_search_write(text):
-    """解析「搜 X（总结 N 条）写到 F」复合指令，返回 (query, 文件名) 或 None。"""
+    """解析「搜 X（总结 N 条）写到 F」复合指令，返回 (query, 文件名) 或 None。
+    只处理纯「搜+写」两步任务；带提醒/「然后/还要/再」等第三动作的
+    大目标放行给分层规划器，避免本通道把整个多步目标错误吞进 query。"""
+    if any(k in text for k in ("提醒", "闹钟", "叫醒", "然后", "接着",
+                               "还要", "再设", "再帮", "再记", "顺便")):
+        return None
     m = _SEARCH_WRITE_RE.search(text)
     if not m:
         return None
@@ -752,16 +918,57 @@ def _run_search_write(query, filename):
     return summary + "\n（已为您存到文件柜「%s」）" % filename
 
 
+def _glm_web_search(query: str, cfg: dict) -> str | None:
+    """智谱联网搜索通道：服务端检索+回答一步完成。
+    为什么优先它：本地抓必应对中文长尾查询命中率差（实测约 1/3 查询返回
+    词典释义/无关结果），智谱服务端搜索质量高一个量级且零额外成本；
+    仅在智谱端点启用，任何异常返回 None 走本地兜底。"""
+    base_url = cfg.get("base_url", "")
+    if "bigmodel.cn" not in base_url or not cfg.get("api_key"):
+        return None
+    payload = {
+        "model": cfg.get("model", "glm-5.2"),
+        "messages": [
+            {"role": "system", "content": (
+                "你是 Nolan 的搜索总结器。用联网搜索查主人问的事，"
+                "用两三句口语汇报要点：先给结论，再补关键细节；不超过 100 字；"
+                "查不到就如实说，绝不编造。")},
+            {"role": "user", "content": query},
+        ],
+        "tools": [{"type": "web_search", "web_search": {"enable": True}}],
+        "temperature": 0.3,
+    }
+    headers = {"Authorization": "Bearer " + cfg["api_key"],
+               "Content-Type": "application/json"}
+    try:
+        resp = httpx.post(base_url.rstrip("/") + "/chat/completions",
+                          json=payload, headers=headers, timeout=_API_TIMEOUT)
+        resp.raise_for_status()
+        reply = resp.json()["choices"][0]["message"]["content"].strip()
+        return reply or None
+    except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
+        print("[brain] 智谱联网搜索失败，降级本地抓取: %s" % e)
+        return None
+
+
 def _answer_from_search(query: str) -> str:
     """
     规则层搜索快速通道：search_web 抓结果文本 -> 单次 LLM 口语化总结。
 
     为什么存在：「搜一下/查一下 X」的真实意图是知道 X 的内容，
     web_search 只把浏览器打开给主人看，等于把活推回给主人——贾维斯不这么干。
-    这里复用 search_web（抓必应结果文本）+ 单次 LLM 调用（不走 Agent 循环），
-    比 _think_via_llm 省一半延迟且行为确定；LLM 不可用时如实降级给原文截断，
-    绝不谎称总结过。
+    优先走智谱联网搜索（服务端检索，质量高）；不可用时本地抓必应 +
+    单次 LLM 总结（不走 Agent 循环），比 _think_via_llm 省一半延迟且行为确定；
+    LLM 不可用时如实降级给原文截断，绝不谎称总结过。
     """
+    cfg = _load_llm_config()
+    glm_reply = _glm_web_search(query, cfg)
+    # 质量门：GLM 未真正调用搜索工具时会给推托回答（实测「抱歉，我现在
+    # 没法联网搜索」），此时降级本地必应通道再试一次，诚实性不变
+    _GLM_EXCUSES = ("没法联网", "无法联网", "不能联网", "无法搜索",
+                    "没法搜索", "查不到", "没办法查")
+    if glm_reply and not any(m in glm_reply for m in _GLM_EXCUSES):
+        return glm_reply
     result = hands.execute("search_web", {"query": query})
     if not isinstance(result, str) or not result.strip():
         return "抱歉先生，这次搜索没有拿到结果，您换个说法我再试试。"
@@ -826,12 +1033,14 @@ def think(user_text: str, history: list[dict]) -> str:
         return pending_reply
 
     # 4. 记忆意图：记住 / 回忆 / 忘掉，结果文本零包装直接返回
-    memory_reply = _handle_memory_intent(text)
+    #    复合任务跳过本层——「搜 X 再记住 Y」被本层劫持会丢掉前半截（实测）
+    memory_reply = None if _is_composite(text) else _handle_memory_intent(text)
     if memory_reply is not None:
         return memory_reply
 
     # 5. 提醒意图：提醒我 / 我的提醒，结果文本零包装直接返回
-    reminder_reply = _handle_reminder_intent(text)
+    #    复合任务同样跳过（「写日报然后提醒我晚上看」被本层劫持会丢掉写日报）
+    reminder_reply = None if _is_composite(text) else _handle_reminder_intent(text)
     if reminder_reply is not None:
         return reminder_reply
 
@@ -855,7 +1064,13 @@ def think(user_text: str, history: list[dict]) -> str:
         return _execute_tool(tool, args)
 
     # 7. 大模型层（含长期记忆与工具协议）
-    reply = _think_via_llm(text, history)
+    #    复合任务（大目标）先过分层规划器：拆步 -> 逐步执行 -> 汇总；
+    #    规划器不可用（无 LLM/拆不出步骤）时降级回平铺 Agent 循环。
+    #    _PLAN_DEPTH > 0 说明当前是规划器派生的子任务，直接走原路径防递归。
+    if _is_composite(text) and _PLAN_DEPTH == 0:
+        reply = _plan_and_execute(text, history)
+    else:
+        reply = _think_via_llm(text, history)
     if reply:
         return reply
 

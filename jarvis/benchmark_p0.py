@@ -153,6 +153,14 @@ def _cn_variants(word):
 def check(spec, reply):
     """按断言规格检查，返回 (ok, 说明)。"""
     kind = spec[0]
+    if kind == "all":  # 复合断言：子断言全部通过（大目标题的多重验证）
+        details = []
+        for sub in spec[1]:
+            ok, d = check(sub, reply)
+            details.append(("✓" if ok else "✗") + d)
+            if not ok:
+                return (False, "；".join(details))
+        return (True, "；".join(details))
     if kind == "c":
         hit = any(v in reply for v in _cn_variants(spec[1]))
         return (hit, "含「%s」" % spec[1])
@@ -576,11 +584,16 @@ def _read_bytes(path):
         return None
 
 
-def backup_state():
+def backup_state(tasks=None):
     names = set()
-    for t in TASKS:
-        if t[2][0] == "file":
-            names.add(t[2][1])
+    for t in (tasks or TASKS):
+        spec = t[2]
+        if spec[0] == "file":
+            names.add(spec[1])
+        elif spec[0] == "all":  # 复合断言：收集子断言里的 file 文件名
+            for sub in spec[1]:
+                if sub[0] == "file":
+                    names.add(sub[1])
     return {
         "mem": _read_bytes(MEM_FILE),
         "rem": _read_bytes(REM_FILE),
@@ -610,13 +623,14 @@ def restore_state(st):
                 f.write(data)
 
 
-def show_stats():
+def show_stats(results_file=None, label="P0"):
     """读取历史结果，输出每批成功率趋势。"""
-    if not os.path.isfile(RESULTS_FILE):
-        print("还没有历史结果，先跑一批：python jarvis/benchmark_p0.py 1-30")
+    path = results_file or RESULTS_FILE
+    if not os.path.isfile(path):
+        print("还没有历史结果，先跑一批。")
         return
     batches = {}
-    with open(RESULTS_FILE, encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             try:
                 r = json.loads(line)
@@ -624,7 +638,7 @@ def show_stats():
                 continue
             b = batches.setdefault(r["batch"], {"PASS": 0, "FAIL": 0, "SKIP": 0})
             b[r["status"]] = b.get(r["status"], 0) + 1
-    print("== P0 成功率趋势 ==")
+    print("== %s 成功率趋势 ==" % label)
     for batch in sorted(batches):
         b = batches[batch]
         ran = b["PASS"] + b["FAIL"]
@@ -633,31 +647,24 @@ def show_stats():
               % (batch, ran, rate, b["PASS"], b["FAIL"], b.get("SKIP", 0)))
 
 
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "stats":
-        show_stats()
-        return
-    lo, hi = 1, len(TASKS)
-    if len(sys.argv) > 1 and "-" in sys.argv[1]:
-        lo, hi = map(int, sys.argv[1].split("-", 1))
+def run_tasks(tasks, results_file, title):
+    """通用跑批主循环：备份 -> 逐题执行落盘 -> 恢复清理 -> 汇总。P0/P1 复用。"""
     batch = datetime.now().strftime("%Y-%m-%d %H:%M")
-    print("== P0 真实任务水库 · %d-%d ==" % (lo, hi))
+    print(title)
     print("环境：NET=%s LLM=%s  批次：%s\n"
           % ("OK" if NET_OK else "DOWN", "OK" if LLM_OK else "DOWN", batch))
-    st = backup_state()
+    st = backup_state(tasks)
     results = []
     try:
-        for row in TASKS:
+        for row in tasks:
             num = row[0]
-            if not (lo <= num <= hi):
-                continue
             status, dt, detail, fail_note = run_one(row)
-            results.append((num, row[3], status))
+            results.append((num, row[4], status))
             line = "第%03d题 [%s] %-4s %6.1fs  %s" % (num, row[4], status, dt, detail)
             if fail_note:
                 line += "  -> " + fail_note
             print(line, flush=True)
-            with open(RESULTS_FILE, "a", encoding="utf-8") as f:
+            with open(results_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps({
                     "batch": batch, "num": num, "cat": row[4],
                     "status": status, "sec": round(dt, 1),
@@ -668,16 +675,14 @@ def main():
               "SystemSettings.exe")
         brain._pending_shell = None
     ran = [s for _, _, s in results if s != "SKIP"]
-    passed = sum(1 for s in ran if s == "PASS")
+    passed = sum(1 for _, _, s in results if s == "PASS")
     print("\n== 本批汇总 ==")
     print("跑 %d 题 / PASS %d / FAIL %d / SKIP %d / 成功率 %.1f%%" % (
         len(ran), passed, len(ran) - passed,
-        sum(1 for s in ran if s == "SKIP"),
+        sum(1 for _, _, s in results if s == "SKIP"),
         100.0 * passed / len(ran) if ran else 0))
-    # 类目分项
     cats = {}
-    for num, dep, status in results:
-        cat = next(t[4] for t in TASKS if t[0] == num)
+    for num, cat, status in results:
         if status == "SKIP":
             continue
         c = cats.setdefault(cat, [0, 0])
@@ -686,6 +691,18 @@ def main():
     for cat in sorted(cats):
         p, n = cats[cat]
         print("  类目 %s：%d/%d（%.0f%%）" % (cat, p, n, 100.0 * p / n))
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "stats":
+        show_stats()
+        return
+    lo, hi = 1, len(TASKS)
+    if len(sys.argv) > 1 and "-" in sys.argv[1]:
+        lo, hi = map(int, sys.argv[1].split("-", 1))
+    rows = [t for t in TASKS if lo <= t[0] <= hi]
+    run_tasks(rows, RESULTS_FILE,
+              "== P0 真实任务水库 · %d-%d ==" % (lo, hi))
     print("\n查看历史趋势：python jarvis/benchmark_p0.py stats")
 
 
