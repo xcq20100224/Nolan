@@ -107,6 +107,20 @@ def _mouse_home():
         pass  # 无 GUI 环境时静默跳过（GUI 题自身会因依赖判定跳过）
 
 
+def _clear_notepad():
+    """清空记事本内容：Win11 记事本默认恢复上次会话（杀进程重开照样带出旧
+    文本，实测污染跑批与技能重放环境），启动后全选删除保证从空白开始。"""
+    try:
+        import pyautogui
+        import time as _t
+        pyautogui.hotkey("ctrl", "a")
+        _t.sleep(0.2)
+        pyautogui.press("delete")
+        _t.sleep(0.2)
+    except Exception:
+        pass
+
+
 def _cn_variants(word):
     """纯数字断言词 -> 中文数字写法集合。Nolan 是语音助手，答「六十」和「60」
     等价（TTS 场景中文数字反而更自然），任一写法命中即过。"""
@@ -563,6 +577,7 @@ def run_one(row):
                 hands.execute("open_app", {"app": "记事本"})
                 hands._wait_for_window("记事本", timeout=8)
                 hands._bring_window_front("记事本")
+                _clear_notepad()
             reply = drive_gui(task)
         else:
             reply = brain.think(task, [])
