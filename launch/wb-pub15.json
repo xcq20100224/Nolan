@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(function(){var want=['人工智能'];var clicked=[];document.querySelectorAll('*').forEach(function(el){var t=(el.textContent||'').trim();if(el.children.length===0&&t==='人工智能'&&el.offsetParent){el.click();clicked.push(t)}});return JSON.stringify(clicked)})()"}

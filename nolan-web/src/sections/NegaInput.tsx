@@ -6,7 +6,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { Mic, SendHorizontal, Square } from 'lucide-react'
-import { micStart, micStop, micState, clientLog, stopSpeak } from '@/lib/api'
+import { micStart, micStop, micState, clientLog, stopSpeak, stopAllAudio } from '@/lib/api'
 
 /** 「没听清」等占位提示的显示时长（毫秒） */
 const HINT_MS = 3000
@@ -123,7 +123,12 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
       return
     }
 
-    // 开始：双保险机制——
+    // 开始：主人要说话，Nolan 必须先闭嘴——
+    // 手动打断（物理直觉：拿起麦克风 = 别说了听我说）：
+    // 双通道静音（浏览器 audio 注册表 + 服务端音箱），再发起录音。
+    stopAllAudio()
+    stopSpeak()
+    // 双保险机制——
     // ① 发起 start 请求（内部最多重试 3 次，服务端录音幂等可重开）；
     // ② 不依赖单次请求的响应，随后轮询 /api/mic/state 确认服务端真实录音状态，
     //    响应丢失也能自愈。6 秒内未确认才判定失败（保持空闲态，可重试，不置灰）。
@@ -274,6 +279,7 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
           type="button"
           onClick={() => {
             clientLog('点击-停止说话')
+            stopAllAudio() // 浏览器通道静音（此前只停服务端音箱，浏览器照播）
             stopSpeak()
           }}
           disabled={disabled}

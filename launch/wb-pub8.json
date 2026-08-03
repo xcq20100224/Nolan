@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(function(){var r=[];document.querySelectorAll('button,a').forEach(function(el){var t=(el.textContent||'').trim();if(t&&t.length<12&&/发布|存草稿|提交/.test(t))r.push(t+' <'+el.tagName+' id='+(el.id||'')+' class='+(el.className||'').toString().slice(0,40)+'>')});return JSON.stringify(r.slice(0,8))})()"}

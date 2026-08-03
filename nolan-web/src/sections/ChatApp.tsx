@@ -8,7 +8,7 @@ import HistoryOverlay from '@/sections/HistoryOverlay'
 import NegaInput from '@/sections/NegaInput'
 import type { WaveMode } from '@/sections/WaveCanvas'
 import type { Message } from '@/types/message'
-import { checkHealth, sendChat, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, soundTest, getBackground, clientLog } from '@/lib/api'
+import { checkHealth, sendChat, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, stopAllAudio, stopSpeak, soundTest, getBackground, clientLog } from '@/lib/api'
 
 /** 当前时间，格式 HH:MM（24 小时制） */
 function nowHHMM(): string {
@@ -125,7 +125,7 @@ export default function ChatApp() {
     if (bootedRef.current) return
     bootedRef.current = true
 
-    clientLog('页面加载 build 0727-6')
+    clientLog('页面加载 build 0803-1')
     checkHealth().then((ok) => {
       clientLog(`健康检查: ${ok}`)
       setOnline(ok)
@@ -244,7 +244,10 @@ export default function ChatApp() {
       .catch(() => {})
   }, [])
 
-  // 耳蜗开启时 2.5 秒轮询唤醒事件：命中即播报确认音 + 字幕提示
+  // 耳蜗开启时 2.5 秒轮询事件：
+  //   wake 事件 → 播报确认音 + 字幕提示（原有行为）；
+  //   bargein 事件（P3 全双工）→ 主人打断了播报：立即停掉浏览器播报，
+  //   把听到的指令原文作为用户消息自动发送（物理闭环：开口 → 静音 → 执行）
   useEffect(() => {
     if (!wakeOn) return
     let cancelled = false
@@ -253,6 +256,14 @@ export default function ChatApp() {
         const data = await getWakeEvents()
         if (cancelled) return
         data.events.forEach((ev) => {
+          if (ev.kind === 'bargein' && ev.text) {
+            clientLog(`打断事件: ${ev.text.slice(0, 30)}`)
+            stopAllAudio()
+            stopSpeak() // 双通道都静音：浏览器 + 服务端音箱（闹钟场景）
+            pushNolan('⏸️ 收到打断，先生。')
+            handleSend(ev.text) // 指令原文自动发送，走正常对话链路
+            return
+          }
           pushNolan(ev.text)
           if (ev.audio_url) playAudio(ev.audio_url)
         })
@@ -265,7 +276,7 @@ export default function ChatApp() {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [wakeOn, pushNolan])
+  }, [wakeOn, pushNolan, handleSend])
 
   // 声波模式：录音 > 等待回复 > 闲置呼吸
   const waveMode: WaveMode = recording ? 'recording' : busy ? 'busy' : 'idle'
@@ -333,7 +344,7 @@ export default function ChatApp() {
 
         {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
         <span className="pointer-events-none absolute bottom-2 right-3 text-[10px] font-light tracking-widest text-[#3a3a40]">
-          build 0727-6
+          build 0803-1
         </span>
       </div>
     </div>

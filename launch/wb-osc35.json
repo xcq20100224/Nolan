@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){var el=Array.from(document.querySelectorAll(\"*\")).find(function(e){return e.children.length===0&&e.offsetParent&&(e.textContent||\"\").trim()===\"AI & 大数据\"});if(!el)return \"NO\";el.click();return \"CLICKED\"})()"}

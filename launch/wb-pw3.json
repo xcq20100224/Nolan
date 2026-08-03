@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  return JSON.stringify({title:document.title,body:(document.body.innerText||\"\").slice(0,400)});\n})()"}

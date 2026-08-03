@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){var t=document.body.innerText||\"\";return JSON.stringify({len:t.length,tail:t.slice(-600)})})()"}

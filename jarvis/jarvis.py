@@ -130,12 +130,21 @@ def main() -> None:
                 continue
 
             if user_text is None:
-                # 超时、纯静音或空输入：顺手弹出到点提醒（阶段四·主动性），再继续听
+                # 超时、纯静音或空输入：顺手弹出到点提醒（阶段四·主动性），
+                # 并评估条件触发任务（P4：如果X就Y / 每隔N做Y），再继续听
                 try:
                     import reminders
                     due_items = reminders.check_due()
                 except Exception:  # noqa: BLE001 —— reminders 未就绪或存储异常时静默跳过
                     due_items = []
+                try:
+                    import triggers
+                    due_items += triggers.check_due(
+                        executor=lambda cmd: brain.think(cmd, history),
+                        evaluator=brain.eval_condition,
+                    )
+                except Exception:  # noqa: BLE001 —— triggers 未就绪时静默跳过
+                    pass
                 for item in due_items:
                     print(f"⏰ Nolan：{item}")
                     speak(item)

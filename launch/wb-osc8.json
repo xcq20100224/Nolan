@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(async function(){try{var r=await fetch('https://www.oschina.net/action/apiv2/user_info',{credentials:'include'});var t=await r.text();return t.slice(0,400)}catch(e){var r2=await fetch('https://my.oschina.net/',{credentials:'include'});return 'fallback:'+r2.url}})()","awaitPromise":true}

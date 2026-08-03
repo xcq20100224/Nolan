@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(function(){var sel=[];document.querySelectorAll('.badge-tag,.tag-item,[class*=selected-tag],[class*=choosed] *').forEach(function(e){var t=(e.textContent||'').trim();if(t&&t.length<20)sel.push(t)});var area=document.body.innerText;var i=area.indexOf('标签');return JSON.stringify({nearTags:area.slice(i,i+80)})})()"}

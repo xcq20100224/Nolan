@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var b=Array.from(document.querySelectorAll(\"button,a,div\")).find(function(e){return (e.textContent||\"\").trim()===\"保存修改\"&&e.offsetParent});\n  if(!b) return \"NO_BTN\";\n  b.click();\n  return \"SAVE_CLICKED\";\n})()"}

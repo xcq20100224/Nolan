@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var p=window.page||{};\n  return JSON.stringify({g_user_code:p.g_user_code,spaceId:p.spaceId,space_user_url:p.space_user_url,api_prefix:p.api_prefix,user:p.user,keys:Object.keys(p).slice(0,30)});\n})()"}

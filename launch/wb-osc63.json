@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(async function(){\n  var r=await fetch(\"https://static.oschina.net/new-osc/dist/js/space-blog-write.e59e6c1c.js\");\n  var t=await r.text();\n  window.__wbjs=t;\n  return \"len=\"+t.length;\n})()", "awaitPromise": true}

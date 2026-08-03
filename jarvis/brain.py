@@ -57,6 +57,11 @@ try:
 except ImportError:  # pragma: no cover - reminders 未就绪时大脑仍可降级运行
     reminders = None
 
+try:
+    import triggers  # P4「条件触发」引擎：如果X就Y / 每隔N做Y / 每当X就Y
+except ImportError:  # pragma: no cover - triggers 未就绪时大脑仍可降级运行
+    triggers = None
+
 # == 常量与配置 ==
 
 EXIT_SIGNAL = "__EXIT__"          # 退出约定字符串，主循环据此结束
@@ -286,6 +291,64 @@ def _handle_reminder_intent(text: str) -> str | None:
             return reminders.list_pending()
     except Exception:  # pragma: no cover - 提醒模块异常时大脑不崩，降级放行
         return None
+    return None
+
+
+# == 条件触发意图（P4）：如果X就Y / 每隔N做Y / 每当X就Y（在提醒意图之前判定） ==
+#
+# 为什么排在提醒意图之前：「每隔 30 分钟提醒我喝水」同时含「每隔」与「提醒我」，
+# 先进提醒分支会被 reminders 当一次性定时解析（解析不出周期，白白劫持）。
+# 防误劫双闸门：必须同时含触发词与动作词——
+# 「如果明天下雨怎么办」是提问（无动作词），绝不拦截。
+
+_TRIGGER_KEYS = ("如果", "若", "要是", "每当", "每次", "一旦", "每隔")
+_TRIGGER_ACTION_KEYS = ("提醒", "告诉", "叫醒", "叫我", "执行", "帮我", "替我", "播报")
+_TRIGGER_LIST_KEYS = ("我的触发", "触发列表", "条件提醒列表", "我的条件提醒")
+
+
+def _handle_trigger_intent(text: str) -> str | None:
+    """条件触发意图分支：命中且解析成功返回确认文本；否则返回 None 放行。"""
+    if triggers is None:
+        return None
+    if any(k in text for k in _TRIGGER_LIST_KEYS):
+        try:
+            return triggers.list_pending()
+        except Exception:
+            return None
+    if not any(k in text for k in _TRIGGER_KEYS):
+        return None
+    if not any(k in text for k in _TRIGGER_ACTION_KEYS):
+        return None
+    try:
+        return triggers.add(text)  # 解析不出返回 None，自然放行后续层
+    except Exception:  # pragma: no cover - 触发引擎异常时大脑不崩，降级放行
+        return None
+
+
+def eval_condition(condition: str) -> bool | None:
+    """P4 条件评估（triggers.check_due 的 evaluator 注入点）：
+    联网搜索核实一个自然语言条件此刻是否成立。
+    返回 True/False；无法评估（LLM 不在线/回答模糊）返回 None——
+    本轮顺延不触发，绝不瞎猜。"""
+    cfg = _load_llm_config()
+    # 日期锚点：GLM 不知道「今天」是哪天（实测把 2026 年的真条件判假），
+    # 条件评估几乎都含时间前提（明天/现在/最近），必须显式锚定
+    import time as _time
+    _lt = _time.localtime()
+    today = "%d年%d月%d日" % (_lt.tm_year, _lt.tm_mon, _lt.tm_mday)
+    verdict = _glm_web_search(
+        "参考信息：今天是%s。请联网核实并判断：「%s」此刻是否属实？"
+        "先简述依据，结尾必须单独给出判定字「是」或「否」。" % (today, condition),
+        cfg)
+    if not verdict:
+        return None
+    v = verdict.strip()
+    # 从结尾取判定字：判定词只出现在结尾，防正文里的「是否」干扰
+    tail = v[-12:]
+    if re.search(r"是[。！!．.\s]*$", tail) and "不是" not in tail:
+        return True
+    if re.search(r"否[。！!．.\s]*$", tail):
+        return False
     return None
 
 
@@ -1037,6 +1100,14 @@ def think(user_text: str, history: list[dict]) -> str:
     memory_reply = None if _is_composite(text) else _handle_memory_intent(text)
     if memory_reply is not None:
         return memory_reply
+
+    # 4.5 条件触发意图（P4）：如果X就Y / 每隔N做Y / 每当X就Y
+    #    必须排在提醒意图之前——「每隔30分钟提醒我喝水」含「提醒我」，
+    #    先进提醒分支会被当一次性提醒劫持（周期信息丢失）。
+    #    复合任务跳过本层，同记忆/提醒层的防劫持理由。
+    trigger_reply = None if _is_composite(text) else _handle_trigger_intent(text)
+    if trigger_reply is not None:
+        return trigger_reply
 
     # 5. 提醒意图：提醒我 / 我的提醒，结果文本零包装直接返回
     #    复合任务同样跳过（「写日报然后提醒我晚上看」被本层劫持会丢掉写日报）

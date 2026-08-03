@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(function(){var el=Array.from(document.querySelectorAll('a,button,span')).find(function(e){return (e.textContent||'').trim()==='切换老版本'&&e.offsetParent});if(!el)return 'NO';el.click();return 'CLICKED tag='+el.tagName+' href='+(el.href||'')})()"}

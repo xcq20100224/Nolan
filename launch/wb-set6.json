@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var t=document.body.innerText||\"\";\n  var i=t.indexOf(\"非法\");\n  var j=t.indexOf(\"成功\");\n  var f=document.querySelector(\"input[name=user_code]\");\n  return JSON.stringify({url:location.href,uc:f?f.value:null,err:i>=0?t.slice(i,i+30):null,ok:j>=0?t.slice(j,j+30):null});\n})()"}

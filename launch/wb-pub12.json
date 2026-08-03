@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(function(){var b=Array.from(document.querySelectorAll('button,a')).find(function(e){return (e.textContent||'').trim().indexOf('添加标签')>=0});if(!b)return 'NO';b.click();return 'CLICKED'})()"}

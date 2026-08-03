@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){var r=[];document.querySelectorAll(\"[class*=submit],[class*=publish]\").forEach(function(e){var t=(e.textContent||\"\").trim();if(t&&t.length<12)r.push(t.split(String.fromCharCode(10)).join(\"\")+\"<\"+(e.className||\"\").toString().slice(0,45)+\">\")});return JSON.stringify(r.slice(0,15))})()"}

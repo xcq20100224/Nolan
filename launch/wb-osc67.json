@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  window.__cap=[];\n  var b=Array.from(document.querySelectorAll(\"[class*=submit]\")).find(function(e){return (e.textContent||\"\").trim().indexOf(\"保存草稿\")>=0});\n  if(!b) return \"NO_BTN\";\n  b.click();\n  return \"DRAFT_CLICKED\";\n})()"}

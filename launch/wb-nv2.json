@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var t=document.body.innerText||\"\";\n  var hasEmail=t.indexOf(\"邮箱\")>=0;\n  var hasPhone=t.indexOf(\"手机\")>=0;\n  return JSON.stringify({url:location.href,title:document.title,hasEmail:hasEmail,hasPhone:hasPhone,snippet:t.slice(0,250)});\n})()"}

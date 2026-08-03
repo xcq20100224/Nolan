@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(function(){var dd=document.querySelector('.dropdown-menu.show');return JSON.stringify({text:dd?(dd.innerText||'').slice(0,400):'closed'})})()"}

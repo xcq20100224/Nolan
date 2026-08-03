@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(function(){var a=Array.from(document.querySelectorAll('a.search-item')).find(function(e){return (e.textContent||'').trim()==='人工智能'});if(!a)return 'NOT_FOUND';a.click();return 'CLICKED'})()"}

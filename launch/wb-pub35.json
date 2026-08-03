@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(function(){var dd=document.querySelector('.dropdown-menu.show');if(!dd)return 'CLOSED';var el=Array.from(dd.querySelectorAll('*')).find(function(e){return e.children.length===0&&e.offsetParent&&(e.textContent||'').trim()==='开源项目介绍'});if(!el)return 'NOT_FOUND';el.click();return 'CLICKED'})()"}

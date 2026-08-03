@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var t=document.body.innerText||\"\";\n  var i=t.indexOf(\"审核\");\n  var j=t.indexOf(\"贾维斯\");\n  return JSON.stringify({url:location.href,title:document.title.slice(0,60),audit:i>=0?t.slice(Math.max(0,i-40),i+60):null,found:j>=0});\n})()"}

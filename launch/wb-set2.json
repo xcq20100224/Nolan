@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var inputs=Array.from(document.querySelectorAll(\"input\")).map(function(e){return {name:e.name,ph:e.placeholder||\"\",val:(e.value||\"\").slice(0,30)}});\n  return JSON.stringify({url:location.href,inputs:inputs.slice(0,10)});\n})()"}

@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){window.scrollTo(0,document.body.scrollHeight);var t=document.body.innerText||\"\";var i=t.indexOf(\"权限设\");return JSON.stringify({ctx:t.slice(i,i+200)})})()"}

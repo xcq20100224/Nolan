@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var srcs=Array.from(document.querySelectorAll(\"script[src]\")).map(function(s){return s.src}).filter(function(u){return u.indexOf(\"ckeditor\")<0&&u.indexOf(\"jquery\")<0});\n  return JSON.stringify(srcs.slice(0,20));\n})()"}

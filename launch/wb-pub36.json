@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(function(){var sel=[];document.querySelectorAll('[class*=tag]').forEach(function(e){var t=(e.textContent||'').trim();if(t&&t.indexOf('开源')>=0&&t.length<25)sel.push(t)});return JSON.stringify(sel.slice(0,6))})()"}

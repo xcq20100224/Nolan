@@ -108,15 +108,49 @@ export async function getDueMessages(): Promise<DueMessage[]> {
 }
 
 /**
+ * 当前正在播放的 Audio 实例（全局唯一注册点）。
+ * playAudio 每次开播前停掉上一个——同一时刻只应有一个 Nolan 在出声，
+ * 这也是「打断」的物理执行点：stopAllAudio() 一调，浏览器通道立即静音。
+ */
+let currentAudio: HTMLAudioElement | null = null
+
+/**
+ * 立即停止浏览器通道的全部播报（手动/语音打断共用）。
+ * pause + 摘掉 src 双保险：部分内嵌 webview 对单独 pause 响应迟缓。
+ */
+export function stopAllAudio(): void {
+  if (currentAudio) {
+    try {
+      currentAudio.pause()
+      currentAudio.removeAttribute('src')
+      currentAudio.load()
+    } catch {
+      /* 忽略 */
+    }
+    currentAudio = null
+  }
+}
+
+/**
  * 播放一段音频：url 非空时创建 Audio 并尝试播放。
  * play() 返回的 promise 被浏览器自动播放策略拒绝时静默吞掉（用户交互过页面后通常允许），
  * 返回 Audio 实例，方便调用方用 ended 事件串联多段音频。
+ * 开播前自动停掉上一条（注册表语义），播完自动出清注册表。
  */
 export function playAudio(url: string | null): HTMLAudioElement | null {
   if (!url) return null
+  stopAllAudio()
   const audio = new Audio(url)
+  currentAudio = audio
+  audio.addEventListener('ended', () => {
+    if (currentAudio === audio) currentAudio = null
+  })
+  audio.addEventListener('error', () => {
+    if (currentAudio === audio) currentAudio = null
+  })
   audio.play().catch(() => {
     // 自动播放被拦截：静默失败，字幕已展示文本，不影响主流程
+    if (currentAudio === audio) currentAudio = null
   })
   return audio
 }
@@ -140,8 +174,12 @@ export async function setWake(enabled: boolean): Promise<{ enabled: boolean; lis
   })
 }
 
-/** 唤醒事件：GET /api/wake/events → {events: [{text, audio_url}]}（出队即清空） */
-export async function getWakeEvents(): Promise<{ events: { text: string; audio_url: string | null }[] }> {
+/** 唤醒/打断事件：GET /api/wake/events → {events: [{kind, text, audio_url}]}（出队即清空）。
+ * kind='wake'（缺省兼容）：唤醒词命中，text 为确认音文案；
+ * kind='bargein'：主人打断了播报，text 为听到的指令原文，audio_url 为 null */
+export async function getWakeEvents(): Promise<{
+  events: { kind?: 'wake' | 'bargein'; text: string; audio_url: string | null }[]
+}> {
   return fetchJson('/api/wake/events')
 }
 

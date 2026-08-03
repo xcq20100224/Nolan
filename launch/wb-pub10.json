@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"JSON.stringify({url:location.href,modal:(document.body.innerText||'').slice(0,600)})"}

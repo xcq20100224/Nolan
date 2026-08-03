@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var f=document.querySelector(\"form.write-article\");\n  if(!f) return \"NO\";\n  var fields=Array.from(f.querySelectorAll(\"input,textarea,select\")).map(function(e){return {tag:e.tagName,type:e.type,name:e.name,val:(e.value||\"\").slice(0,50)}});\n  return JSON.stringify(fields);\n})()"}

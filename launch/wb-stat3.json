@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var t=document.body.innerText||\"\";\n  var m=t.match(/阅读\\s*([0-9,]+)/);\n  var panel=[];\n  document.querySelectorAll(\"[class*=count]\").forEach(function(e){var x=(e.textContent||\"\").trim();if(x&&x.length<12)panel.push(x)});\n  return JSON.stringify({read:m?m[1]:null,counts:panel.slice(0,8)});\n})()"}

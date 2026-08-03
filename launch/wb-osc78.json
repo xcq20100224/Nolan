@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var p=window.page||{};\n  return JSON.stringify({bind_phone:p.g_user_bind_phone,name:p.g_user_name,active_logins:p.UserActiveLoginCount});\n})()"}

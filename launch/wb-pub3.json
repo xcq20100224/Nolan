@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"JSON.stringify({hasLogin:/登录|注册/.test((document.querySelector('header')||document.body).innerText.slice(0,500)),bodyHead:(document.body.innerText||'').slice(0,300)})"}

@@ -664,6 +664,20 @@ import collections as _collections   # noqa: E402  模块内专用，避免搅�
 _wake_events = _collections.deque(maxlen=10)
 _wake_events_lock = threading.Lock()
 
+# == 播报打断（P3 全双工·网页版）：耳蜗在播报窗口内不丢帧，转为打断侦测 ==
+# 第一性原理：打断 = 唤醒的免费副产品——常驻麦克风流、能量门控、语音段收集、
+# whisper 转写全都现成，唯一新问题是「区分主人声音和 Nolan 自己的播报回声」。
+# 无 AEC 条件下的双保险（两道独立防线，各自都能单独拦住回声）：
+#   ① 自适应能量门：基线取近期帧 RMS 中位数（含播报声），门 = 基线 × 倍率，
+#      主人近场语音远高于音箱到麦克风的回声，回声本身够不到门；
+#   ② 回声文本过滤：服务端知道 Nolan 正在说什么（_now_speaking_text），
+#      转写文本与播报文本高度相似即判定回声丢弃——即使回声触发能量门也过不了这关。
+_BARGEIN_GATE_MULT = 2.0       # 自适应门倍率（基线含播报声，主人语音须明显盖过）
+_BARGEIN_BASELINE_N = 40       # 滚动基线窗口（约 2 秒帧能量）
+_BARGEIN_ECHO_RATIO = 0.45     # 与播报文本相似度阈值（超过即判回声）
+_now_speaking_text = ""        # Nolan 当前正在播报的文本（回声判定依据）
+_bargein_silence_until = 0.0   # 打断成立后的硬静默期（前端接管期间丢帧，防重复触发）
+
 
 def _wake_pause_for(seconds: float) -> None:
     """播报后暂停耳蜗 seconds 秒（封顶 _WAKE_MAX_PAUSE_SEC）。"""
@@ -690,38 +704,96 @@ def _wake_save_state(enabled: bool) -> None:
         print("[wake] 状态写入失败（跳过）：%s" % e)
 
 
-def _wake_spot(audio) -> None:
-    """对一段语音做关键词侦测：命中唤醒词即入队事件并暂停播报窗口。"""
+def _note_speaking(text: str) -> None:
+    """登记 Nolan 即将播报的文本：播报窗口内回声文本过滤的判定依据。"""
+    global _now_speaking_text
+    _now_speaking_text = (text or "").strip()
+
+
+def _transcribe_seg(audio, beam_size: int = 1) -> str:
+    """对一段语音做小代价转写（耳蜗/打断侦测共用）；失败或模型不可用返回空串。"""
     _load_whisper()
     if _whisper_model is None:
-        return
+        return ""
     try:
         with _whisper_lock:
             segments, _ = _whisper_model.transcribe(
-                audio, language="zh", beam_size=1, vad_filter=False)
-        text = "".join(s.text for s in segments).strip().lower()
+                audio, language="zh", beam_size=beam_size, vad_filter=False)
+        return "".join(s.text for s in segments).strip()
     except Exception as e:
-        print("[wake] 侦测转写失败（跳过）：%s" % e)
-        return
+        print("[wake] 转写失败（跳过）：%s" % e)
+        return ""
+
+
+def _normalize_text(s: str) -> str:
+    """相似度比较前的归一化：小写 + 去标点空白，只看字面内容。"""
+    return "".join(ch for ch in s.lower() if ch.isalnum() or "一" <= ch <= "鿿")
+
+
+def _is_echo(heard: str) -> bool:
+    """听到的文本是否为 Nolan 自己播报的回声：与当前播报文本高度相似即判回声。"""
+    a = _normalize_text(heard)
+    b = _normalize_text(_now_speaking_text)
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio() >= _BARGEIN_ECHO_RATIO
+
+
+def _wake_spot(audio) -> None:
+    """对一段语音做关键词侦测：命中唤醒词即入队事件并暂停播报窗口。"""
+    text = _transcribe_seg(audio).lower()
     if not text:
         return
     print("[wake] 听到：%s" % text[:40])
     if any(k in text for k in _WAKE_KEYWORDS):
         print("[wake] 唤醒词命中，通知前端。")
         with _wake_events_lock:
-            _wake_events.append({"ts": time.time()})
+            _wake_events.append({"ts": time.time(), "kind": "wake"})
         _wake_pause_for(8)  # 确认音播报窗口，防自我触发
 
 
+def _bargein_check(audio) -> None:
+    """播报窗口内的打断侦测：转写语音段，非回声即判定主人打断，入队 bargein 事件。
+
+    回声双保险：能量门已在采集侧拦住大部分播报声（见 _wake_loop 自适应门），
+    此处做文本级终审——听到的内容与 Nolan 正在说的话高度相似，必是自己人。
+    """
+    text = _transcribe_seg(audio)
+    if not text:
+        return
+    if _is_echo(text):
+        print("[bargein] 回声段（自己的播报声），忽略：%s" % text[:30])
+        return
+    print("[bargein] 主人打断了播报：%s" % text[:40])
+    with _wake_events_lock:
+        _wake_events.append({"ts": time.time(), "kind": "bargein", "text": text})
+    # 打断成立后进入硬静默期：前端轮询到事件需要几秒，期间丢帧不侦测，
+    # 防止主人后半句话被二次侦测成重复事件（同一指令发两遍）
+    global _wake_pause_until, _bargein_silence_until
+    _wake_pause_until = 0.0
+    _bargein_silence_until = time.time() + 6
+
+
 def _wake_loop() -> None:
-    """耳蜗主循环：能量门控收集语音段，逐段侦测唤醒词；可随时停止。"""
+    """耳蜗主循环：能量门控收集语音段，逐段侦测唤醒词；可随时停止。
+
+    三种状态（第一性原理：一条常驻流，分时复用）：
+      硬暂停（指令录音 / 打断后静默期）：丢帧静默，麦克风让位；
+      播报窗口（_wake_pause_until 内）：打断侦测——自适应能量门（基线含
+        播报声）收集语音段，转写后经回声文本过滤，主人声音入队 bargein 事件；
+      正常值守：固定能量门收集语音段，侦测唤醒词。
+    """
     import numpy as np
     import sounddevice as sd
-    print("[wake] 耳蜗启动：对麦克风说「诺兰」即可唤醒。")
+    print("[wake] 耳蜗启动：对麦克风说「诺兰」即可唤醒，播报时直接说话即可打断。")
     frames_buf = []
     speech = []
     in_speech = False
     silence_hits = 0
+    baseline = _collections.deque(maxlen=_BARGEIN_BASELINE_N)  # 播报窗口滚动能量基线
 
     def _cb(indata, frames, time_info, status):
         frames_buf.append(indata.copy())
@@ -732,33 +804,58 @@ def _wake_loop() -> None:
                                 dtype="float32", callback=_cb)
         stream.start()
         while not _wake_stop_ev.is_set():
-            # 暂停窗口（指令录音 / 播报）：清空缓冲，静默等待
-            if _wake_pause_ev.is_set() or time.time() < _wake_pause_until:
+            now = time.time()
+            # 硬暂停（指令录音 / 打断后静默期）：清空缓冲，静默等待
+            if _wake_pause_ev.is_set() or now < _bargein_silence_until:
                 frames_buf.clear()
                 speech.clear()
                 in_speech = False
+                baseline.clear()
                 time.sleep(0.2)
                 continue
+            in_playback = now < _wake_pause_until
             time.sleep(0.05)
             if not frames_buf:
                 continue
             chunk = np.concatenate(frames_buf, axis=0).flatten()
             frames_buf.clear()
             rms = float(np.sqrt(float(np.mean(chunk ** 2)))) if chunk.size else 0.0
-            if rms > _WAKE_RMS_GATE:
+
+            if in_playback:
+                # 打断侦测：自适应门 = 滚动基线（含播报声）× 倍率
+                gate = max(
+                    float(np.median(baseline)) * _BARGEIN_GATE_MULT if baseline else 0.0,
+                    _WAKE_RMS_GATE)
+            else:
+                baseline.clear()
+                gate = _WAKE_RMS_GATE
+
+            if rms > gate:
                 speech.append(chunk)
                 in_speech = True
                 silence_hits = 0
+                if not in_playback or len(speech) <= 2:
+                    # 基线只收「未判定为语音」的能量；语音头两帧不污染基线
+                    pass
             elif in_speech:
                 speech.append(chunk)
                 silence_hits += 1
+                if in_playback:
+                    baseline.append(rms)  # 语音间隙的能量回充基线（播报声是连续底噪）
                 if silence_hits >= 10:  # 连续约 0.5 秒静音：语音段结束
                     seg = np.concatenate(speech)
                     speech.clear()
                     in_speech = False
                     secs = seg.shape[0] / _MIC_SAMPLERATE
                     if 0.3 <= secs <= 6.0:
-                        _wake_spot(seg)
+                        if in_playback:
+                            _bargein_check(seg)
+                        else:
+                            _wake_spot(seg)
+            else:
+                # 纯静音帧：正常值守忽略；播报窗口回充基线，跟踪播报音量变化
+                if in_playback:
+                    baseline.append(rms)
     except Exception as e:
         print("[wake] 耳蜗异常退出：%s" % e)
     finally:
@@ -908,14 +1005,48 @@ def _chat(user_text: str) -> dict:
     if reply == "__EXIT__":
         farewell = "好的先生，我先去休息了，随时叫我的名字就能唤醒我。"
         # 只走浏览器 audio_url 单通道发声（见下方说明）
-        _wake_pause_for(2 + len(farewell) * 0.3)  # 播报期间耳蜗暂停，防自我触发
+        _note_speaking(farewell)  # 登记播报文本：打断侦测的回声判定依据
+        _wake_pause_for(2 + len(farewell) * 0.3)  # 播报窗口=打断侦测窗口
         return {"reply": farewell, "audio_url": synth_for(farewell), "exit": True}
 
     # 发声单通道化：网页端只由浏览器播放 audio_url，服务端音箱不再同步播报。
     # 此前音箱 + 浏览器双通道同时发声（引擎/延迟不同），听感是两个人重合说话。
     # 音箱通道仍保留给闹钟提醒（/api/due 的 _speak_alarm_async，必被听见场景）
+    _note_speaking(reply)  # 登记播报文本：打断侦测的回声判定依据
     _wake_pause_for(2 + len(reply) * 0.3)
     return {"reply": reply, "audio_url": synth_for(reply)}
+
+
+# == 条件触发后台检查（P4 · 主动性进阶）==
+# 为什么独立线程：条件评估要走 LLM 联网搜索（秒级），放进 /api/due 会挂住
+# 15 秒轮询、占满浏览器连接池（此前 TTS 同步合成挂死全链路的教训）。
+# 后台线程每分钟评估一轮，触发的消息进队列，/api/due 出队即走（毫秒级）；
+# 音箱通道同步播报两遍（闹钟语义：必被听见）。
+_trigger_fired = _collections.deque(maxlen=20)
+_trigger_fired_lock = threading.Lock()
+
+
+def _trigger_loop() -> None:
+    """条件触发检查守护线程：定期评估 triggers，触发消息入队 + 音箱播报。"""
+    import triggers
+    print("[triggers] 条件触发检查线程启动（每分钟一轮）。")
+    while True:
+        try:
+            def _exec(cmd: str) -> str:
+                # 执行型动作经大脑跑完整工具链（与 /api/chat 同锁串行化）
+                with _brain_lock:
+                    return brain.think(cmd, [])
+            msgs = triggers.check_due(
+                executor=_exec, evaluator=brain.eval_condition)
+            if msgs:
+                with _trigger_fired_lock:
+                    for m in msgs:
+                        _trigger_fired.append(m)
+                # 语音与闹钟提醒同一路径：/api/due 出队时暖 TTS + 音箱播报两遍，
+                # 此处不单独播报（否则与 /api/due 的播报叠音）
+        except Exception as e:
+            print("[triggers] 检查异常（下轮继续）：%s" % e)
+        time.sleep(60)
 
 
 # == HTTP 处理器 ==
@@ -1100,6 +1231,11 @@ class NolanHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"version": _VERSION, "pid": os.getpid()})
             elif path == "/api/due":
                 messages = reminders.check_due() or []
+                # P4 条件触发：后台线程评估好的触发消息随本通道出队（毫秒级，不阻塞）
+                with _trigger_fired_lock:
+                    fired = list(_trigger_fired)
+                    _trigger_fired.clear()
+                messages += fired
                 out = []
                 for msg in messages:
                     # 音频异步化（关键修复）：响应只带缓存命中（毫秒级，通常首轮为 None），
@@ -1115,6 +1251,7 @@ class NolanHandler(BaseHTTPRequestHandler):
                 # 主动晨报：每天首次打开网页时的问候语 + 语音
                 payload = _greeting_payload()
                 if payload.get("text"):
+                    _note_speaking(payload["text"])  # 回声判定依据
                     _wake_pause_for(2 + len(payload["text"]) * 0.3)
                 self._send_json(200, payload)
             elif path == "/api/wake/state":
@@ -1123,14 +1260,23 @@ class NolanHandler(BaseHTTPRequestHandler):
                     "listening": bool(_wake_thread and _wake_thread.is_alive()),
                 })
             elif path == "/api/wake/events":
-                # 唤醒事件出队：前端 2.5 秒轮询，拿到事件即播报确认音
+                # 事件出队：前端 2.5 秒轮询。
+                # wake 事件 → 确认音「在的，先生，请讲。」；
+                # bargein 事件 → 带上听到的指令文本，前端停播报并自动发送该指令
                 with _wake_events_lock:
                     evs = list(_wake_events)
                     _wake_events.clear()
-                out = [{"text": _WAKE_ACK,
-                        "audio_url": _tts_cached_url(_WAKE_ACK)} for _ in evs]
-                if evs:
+                out = []
+                for ev in evs:
+                    if ev.get("kind") == "bargein" and ev.get("text"):
+                        out.append({"kind": "bargein", "text": ev["text"],
+                                    "audio_url": None})
+                    else:
+                        out.append({"kind": "wake", "text": _WAKE_ACK,
+                                    "audio_url": _tts_cached_url(_WAKE_ACK)})
+                if any(ev.get("kind") != "bargein" for ev in evs):
                     _warm_tts_async(_WAKE_ACK)
+                    _note_speaking(_WAKE_ACK)  # 确认音也是播报声，纳入回声判定
                 self._send_json(200, {"events": out})
             elif path == "/api/sound_test":
                 # 声音必达自检：浏览器通道（synth_for 合成返回 audio_url）与
@@ -1250,6 +1396,8 @@ def main() -> None:
     atexit.register(_cleanup_pidfile)
 
     _preload_whisper()  # 后台预加载语音模型，避免第一次录音等待
+    threading.Thread(target=_trigger_loop, daemon=True,
+                     name="trigger-checker").start()  # P4 条件触发后台检查
     if _wake_load_state():  # 唤醒词开关状态落盘：上次开启过则自动恢复耳蜗
         _wake_set_enabled(True)
         print("[server] 唤醒词耳蜗已按落盘状态自动开启（说「诺兰」即可唤醒）")

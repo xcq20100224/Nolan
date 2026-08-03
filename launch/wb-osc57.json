@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var scripts=Array.from(document.querySelectorAll(\"script\"));\n  for(var s=0;s<scripts.length;s++){\n    var t=scripts[s].textContent||\"\";\n    var i=t.indexOf(\"invalid-button\");\n    if(i>=0) return t.slice(Math.max(0,i-800),i+400);\n  }\n  return \"NOT_FOUND_INLINE\";\n})()"}

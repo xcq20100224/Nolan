@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var html=document.documentElement.innerHTML;\n  var i=html.indexOf(\"AI & 大数据\");\n  if(i<0) i=html.indexOf(\"AI &amp; 大数据\");\n  if(i<0) return \"NOT_IN_HTML\";\n  return html.slice(Math.max(0,i-200),i+50);\n})()"}

@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var forms=Array.from(document.querySelectorAll(\"form\")).map(function(f){\n    return {action:f.action,method:f.method,id:f.id,cls:(f.className||\"\").toString().slice(0,40),fieldCount:f.querySelectorAll(\"input,textarea,select\").length};\n  });\n  return JSON.stringify(forms);\n})()"}

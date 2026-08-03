@@ -1,0 +1,1 @@
+{"session":"nolan-check","action":"evaluate","code":"(function(){var hits=[];document.querySelectorAll('*').forEach(function(el){var t=(el.textContent||'').trim();if(el.children.length===0&&el.offsetParent&&(t==='开源'||t==='开源软件'))hits.push(t)});return JSON.stringify(hits.slice(0,5))})()"}

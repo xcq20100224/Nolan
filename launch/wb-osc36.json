@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){var b=Array.from(document.querySelectorAll(\"[class*=submit]\")).find(function(e){return (e.textContent||\"\").trim().indexOf(\"发布文章\")>=0});return JSON.stringify({cls:(b.className||\"\").toString()})})()"}

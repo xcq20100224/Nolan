@@ -1,0 +1,1 @@
+{"session": "nolan-check", "action": "evaluate", "code": "(function(){\n  var a=Array.from(document.querySelectorAll(\"a\")).find(function(e){return (e.textContent||\"\").trim()===\"帐号设置\"});\n  return a?a.href:\"NOT_FOUND\";\n})()"}
