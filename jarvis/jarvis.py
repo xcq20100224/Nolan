@@ -77,6 +77,8 @@ def main() -> None:
 
         print("（纯文本测试模式：直接打字，Ctrl+C 或输入退出指令结束）")
     else:
+        import threading
+
         import brain
         import ears
         import mouth
@@ -85,9 +87,32 @@ def main() -> None:
             return ears.listen_once()
 
         def speak(text: str) -> None:
-            """语音播报；失败时仅打印提示，不抛出异常。"""
+            """可打断播报（P3 全双工）：播放期间后台监听，主人持续开口即打断。
+
+            打断是增强而非必需：监听线程任何异常都静默退出，绝不拖垮播报；
+            被打断后主循环自然进入下一轮 listen()，接住主人的新指令。
+            """
             try:
-                mouth.speak(text)
+                stop = threading.Event()
+                interrupted = threading.Event()
+
+                def _on_voice() -> None:
+                    interrupted.set()
+                    mouth.interrupt()  # mouth 播放轮询 50ms 内响应
+
+                t = threading.Thread(
+                    target=ears.watch_for_voice,
+                    args=(_on_voice, stop),
+                    daemon=True,  # 守护线程：主流程退出不残留
+                )
+                t.start()
+                try:
+                    mouth.speak(text)
+                finally:
+                    stop.set()
+                    t.join(timeout=2)  # 等监听流关闭，避免与下一轮 listen 撞流
+                if interrupted.is_set():
+                    print("⏸️ Nolan：主人打断了播报，请讲。")
             except Exception as exc:  # noqa: BLE001 —— 播报失败不应中断主循环
                 print(f"⚠️ 语音播报失败：{exc}")
 

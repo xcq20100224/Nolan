@@ -33,6 +33,65 @@ import sounddevice as sd
 模型设备 = "cpu"
 模型精度 = "int8"
 
+# ---- 播报打断（barge-in, P3）参数 ----
+打断触发帧数 = 13           # 连续 13 帧（约 0.4s）超阈值才判定「主人开口」，
+                            # 防咳嗽/敲击/短时杂音误触
+打断标定秒 = 0.3            # 打断监听启动时的环境标定时长（此时 Nolan 自己的
+                            # 播报声成为底噪基线，阈值自动抬高到播报声之上）
+
+
+class _VoiceTrigger:
+    """持续语音判定器：喂入逐帧 RMS，连续超阈值达帧数即触发。
+    纯逻辑无硬件依赖，单元测试直接喂合成能量序列。"""
+
+    def __init__(self, env_rms: float, trigger_frames: int = 打断触发帧数):
+        self.阈值 = max(env_rms * 阈值倍率, 最小阈值)
+        self.需要帧数 = max(1, trigger_frames)
+        self._连续 = 0
+
+    def feed(self, rms: float) -> bool:
+        """喂一帧能量，返回本帧后是否进入「主人开口」状态。"""
+        if rms >= self.阈值:
+            self._连续 += 1
+        else:
+            self._连续 = 0
+        return self._连续 >= self.需要帧数
+
+
+def watch_for_voice(on_voice, stop_event, frame_source=None) -> None:
+    """后台打断监听：检测到主人持续开口即回调 on_voice() 后返回；
+    stop_event 置位（播报结束）时安静退出。
+
+    frame_source 可注入自定义帧迭代器（单元测试喂合成帧），
+    缺省使用真实麦克风输入流。任何异常静默退出——打断是增强，
+    绝不能拖垮播报主流程。
+    """
+    try:
+        if frame_source is not None:
+            # 测试路径：帧源为可迭代的一维数组序列（首段作环境标定）
+            frames = iter(frame_source)
+            标定帧数 = max(1, int(打断标定秒 * 1000 / 帧长毫秒))
+            env = [_计算RMS(f) for _, f in zip(range(标定帧数), frames)]
+            trig = _VoiceTrigger(float(np.median(env)) if env else 0.0)
+            for f in frames:
+                if stop_event.is_set():
+                    return
+                if trig.feed(_计算RMS(f)):
+                    on_voice()
+                    return
+            return
+        with sd.RawInputStream(samplerate=采样率, blocksize=帧样本数,
+                               dtype=数据类型, channels=声道数) as 流:
+            标定帧数 = max(1, int(打断标定秒 * 1000 / 帧长毫秒))
+            env = [_计算RMS(_录一帧(流)) for _ in range(标定帧数)]
+            trig = _VoiceTrigger(float(np.median(env)) if env else 0.0)
+            while not stop_event.is_set():
+                if trig.feed(_计算RMS(_录一帧(流))):
+                    on_voice()
+                    return
+    except Exception:
+        return  # 静默：打断监听失败不影响播报
+
 # ========== 模型单例（模块级懒加载） ==========
 _模型 = None
 _模型加载失败 = False
