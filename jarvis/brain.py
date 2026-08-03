@@ -38,6 +38,7 @@ import re
 import json
 import random
 import time
+import urllib.parse
 
 import httpx
 
@@ -98,6 +99,20 @@ _LOCAL_APPS = ("记事本", "计算器", "画图")
 _TIME_KEYS = ("几点", "时间", "日期", "几号", "星期几", "礼拜几")
 _SEARCH_KEYS = ("搜索", "搜一下", "查一下", "百度一下")
 _READ_KEYS = ("读取", "看看文件", "读一下", "读")
+
+# 「打开 X 的网站/官网/网页」：网址意图而非本机应用——
+# open_app 会把「哔哩哔哩的网站」整串当应用名去瞎找程序，必然失败。
+# 常见站点直达域名；未知站点打开必应「X 官网」搜索页，主人一眼看到入口。
+_SITE_DOMAINS = {
+    "哔哩哔哩": "https://www.bilibili.com", "b站": "https://www.bilibili.com",
+    "bilibili": "https://www.bilibili.com",
+    "知乎": "https://www.zhihu.com", "微博": "https://weibo.com",
+    "淘宝": "https://www.taobao.com", "京东": "https://www.jd.com",
+    "抖音": "https://www.douyin.com", "百度": "https://www.baidu.com",
+    "github": "https://github.com", "网易云": "https://music.163.com",
+    "腾讯视频": "https://v.qq.com", "爱奇艺": "https://www.iqiyi.com",
+    "优酷": "https://youku.com", "小红书": "https://www.xiaohongshu.com",
+}
 _WRITE_KEYS = ("写文件", "记录", "记下来")
 _LIST_KEYS = ("列出", "有哪些文件")
 _RUN_KEYS = ("运行", "执行")
@@ -300,6 +315,17 @@ def _parse_intent(text: str) -> tuple | None:
         return ("media_control", {"action": "mute"})
 
     url_match = _URL_RE.search(text)
+
+    # 「打开 X 的网站/官网/网页」：网址意图，优先于 open_app 判定
+    if not url_match:
+        site_match = re.search(r"打开\s*(.+?)\s*的?\s*(?:网站|官网|网页)\s*$", text)
+        if site_match:
+            site = site_match.group(1).strip()
+            domain = _SITE_DOMAINS.get(site) or _SITE_DOMAINS.get(site.lower())
+            if domain:
+                return ("open_url", {"url": domain})
+            return ("open_url", {"url": "https://www.bing.com/search?q="
+                                       + urllib.parse.quote(site + " 官网")})
 
     # 打开本地应用
     if "打开" in text and not url_match:
@@ -504,6 +530,9 @@ def _build_system_prompt() -> str:
         "研究、新闻、资料查询类任务必须用 search_web（它返回结果文本供你阅读），"
         "拿到结果后自己总结，需要保存再调 write_file；"
         "web_search 只是把浏览器打开给主人看，对你完成任务没有帮助。"
+        "写作类任务（邮件/短信/文案/诗歌/清单等）：直接把成品全文作为回复交给主人；"
+        "只有主人明确给出文件名时才调 write_file 保存，且保存后仍要把全文复述给主人——"
+        "只说一句「已保存」等于让主人自己翻文件，不算完成。"
         "能力边界：软件界面内的操作（点击按钮、点选列表项等）用 gui_control 工具"
         "（会自动截屏看界面再操作鼠标键盘，执行前系统会向主人请求确认）；"
         "run_shell 用于命令行能完成的事；媒体播放控制优先用 media_control；"
@@ -693,6 +722,35 @@ def _think_via_llm(user_text: str, history: list[dict]) -> str | None:
 
 # == 对外接口（契约签名，勿改动） ==
 
+# 「搜 X 总结写到 F」复合任务正则：query 非贪婪截到「总结/写到」之前，
+# 「总结」与条数修饰（两条/3 条）可缺省；文件名必须是带扩展名的词
+_SEARCH_WRITE_RE = re.compile(
+    r"(?:搜一下|搜索|查一下|百度一下)\s*(?P<query>.+?)"
+    r"(?:[，,]?\s*(?:总结|概括|归纳)[^，。！？]{0,8})?[，,]?\s*"
+    r"(?:写到|写进|写入|保存到|记到)\s*"
+    r"(?P<name>[^\s，。！？；：「」『』“”]+\.[A-Za-z0-9]+)"
+)
+
+
+def _parse_search_write(text):
+    """解析「搜 X（总结 N 条）写到 F」复合指令，返回 (query, 文件名) 或 None。"""
+    m = _SEARCH_WRITE_RE.search(text)
+    if not m:
+        return None
+    query = m.group("query").strip(" ，。！？：:帮我请把")
+    return (query, m.group("name")) if query else None
+
+
+def _run_search_write(query, filename):
+    """搜索+写文件快速通道：固定三段执行 抓->总结->写，零 LLM 临场决策。
+    实测 Agent 循环在此类任务上行为不稳（死循环调 get_time / 写空文件），
+    确定性优先；搜索失败时如实上报且绝不写空文件。"""
+    summary = _answer_from_search(query)
+    if summary.startswith("抱歉先生"):
+        return summary
+    hands.execute("write_file", {"name": filename, "content": summary})
+    return summary + "\n（已为您存到文件柜「%s」）" % filename
+
 
 def _answer_from_search(query: str) -> str:
     """
@@ -781,6 +839,12 @@ def think(user_text: str, history: list[dict]) -> str:
     #    （run_shell 的待确认拦截在 _execute_tool 内统一处理）
     #    复合任务（含「然后/接着/并且」等连接词）跳过规则层——
     #    规则层是单意图分发，会劫持多步任务；交给 LLM Agent 循环拆解。
+    #    例外：「搜 X 总结写到 F」复合任务走固定三段快速通道（确定性优先，
+    #    实测 Agent 循环在此类任务上不稳：死循环调 get_time / 写空文件）。
+    if hands is not None:
+        sw = _parse_search_write(text)
+        if sw is not None:
+            return _run_search_write(*sw)
     intent = None if _is_composite(text) else _parse_intent(text)
     if intent is not None and hands is not None:
         tool, args = intent

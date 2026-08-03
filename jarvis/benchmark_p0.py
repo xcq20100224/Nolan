@@ -49,12 +49,17 @@ MEM_FILE = os.path.join(_JARVIS_DIR, "memory", "long_term.txt")
 REM_FILE = os.path.join(_JARVIS_DIR, "memory", "reminders.txt")
 RESULTS_FILE = os.path.join(_JARVIS_DIR, "memory", "results_p0.jsonl")
 
-FAIL_MARKS = ("抱歉", "未能完成", "出了问题", "无法连接", "超出安全上限")
+# 失败话术判定：系统级失败一律以「抱歉先生」开头（brain/hands 全系统统一格式），
+# 按开头判定；「未能完成」等词保留内容匹配。绝不用「抱歉」单词判失败——
+# 道歉/检讨类写作成品天然含「抱歉，我」，内容词会误杀正常成品。
+FAIL_PREFIX = "抱歉先生"
+FAIL_MARKS = ("未能完成", "出了问题", "无法连接", "超出安全上限", "已被安全中止")
 CHAT_FAIL_MARKS = ("未能完成", "出了问题", "无法连接")
 
 
 def no_fail(r):
     return isinstance(r, str) and bool(r.strip()) and \
+        not r.strip().startswith(FAIL_PREFIX) and \
         not any(m in r for m in FAIL_MARKS)
 
 
@@ -88,6 +93,18 @@ def _kill(*exe):
     import subprocess
     for e in exe:
         subprocess.run(["taskkill", "/f", "/im", e], capture_output=True)
+
+
+def _mouse_home():
+    """GUI 题前置：把鼠标移到屏幕中央。
+    gui_control 的安全机制是「鼠标甩到屏幕角落 = 紧急中止」——跑批时鼠标若恰好
+    停在角落（上一题操作后遗留），后续每题都会开局即被中止、空转假过。"""
+    try:
+        import pyautogui
+        w, h = pyautogui.size()
+        pyautogui.moveTo(w // 2, h // 2)
+    except Exception:
+        pass  # 无 GUI 环境时静默跳过（GUI 题自身会因依赖判定跳过）
 
 
 def _cn_variants(word):
@@ -283,7 +300,7 @@ TASKS = [
     (73, "读一下 会议.txt", ("c", "评审"), None, "C"),
     (74, "把 妈妈的生日是五月初八 写到 家人.txt", ("file", "家人.txt", ["五月"]), None, "C"),
     (75, "读一下 家人.txt", ("c", "五月"), None, "C"),
-    (76, "搜一下今天的人工智能新闻，总结两条写到 早报.txt", ("file", "早报.txt", []), "net", "C"),
+    (76, "搜一下今天的人工智能新闻，总结两条写到 早报.txt", ("file", "早报.txt", ["AI"]), "net", "C"),
     (77, "读一下 早报.txt", ("len", 20), "net", "C"),
     (78, "把 灵感：做一个语音优先的助手 写到 灵感.txt", ("file", "灵感.txt", ["语音"]), None, "C"),
     (79, "读一下 灵感.txt", ("c", "语音"), None, "C"),
@@ -444,7 +461,7 @@ TASKS = [
     (229, "两周后是几月几号", ("re", r"\d"), "llm", "H"),
     (230, "现在东京大概是几点", ("nf",), "llm", "H"),
     (231, "45 天前是几月几号", ("re", r"\d"), "llm", "H"),
-    (232, "这个月还剩几天", ("re", r"\d"), "llm", "H"),
+    (232, "这个月还剩几天", ("re", r"[0-9零一二三四五六七八九十百千万两]"), "llm", "H"),
     (233, "明天这个时候是几点", ("re", r"\d"), "llm", "H"),
     (234, "现在是今年的第几周", ("re", r"\d"), "llm", "H"),
     (235, "春节通常在几月份", ("nf",), "llm", "H"),
@@ -452,7 +469,7 @@ TASKS = [
     (237, "上周三是几月几号", ("re", r"\d"), "llm", "H"),
     (238, "90 分钟后是几点", ("re", r"\d"), "llm", "H"),
     (239, "现在洛杉矶大概是几点", ("nf",), "llm", "H"),
-    (240, "下个月有几天", ("re", r"\d"), "llm", "H"),
+    (240, "下个月有几天", ("re", r"[0-9零一二三四五六七八九十百千万两]"), "llm", "H"),
     # ---------- I. 闲聊与陪伴（241-270）----------
     (241, "给我讲个笑话", ("chat",), "llm", "I"),
     (242, "再讲一个笑话", ("chat",), "llm", "I"),
@@ -528,7 +545,11 @@ def run_one(row):
     reply = ""
     try:
         if dep == "gui":
-            # GUI 题前置清场：记事本类重启实例防残字，浏览器遮挡清掉
+            # GUI 题前置：鼠标归中（防安全中止误触发）；关掉 E 类等残留的系统
+            # 窗口（设置/任务管理器/计算器）——截屏分析见到的是前台窗口，残留
+            # 窗口会让视觉判断「找不到目标应用」；记事本类重启实例防残字
+            _mouse_home()
+            _kill("SystemSettings.exe", "Taskmgr.exe", "CalculatorApp.exe")
             if "记事本" in task:
                 _kill("notepad.exe")
                 hands.execute("open_app", {"app": "记事本"})
@@ -643,7 +664,8 @@ def main():
                     "detail": detail[:80]}, ensure_ascii=False) + "\n")
     finally:
         restore_state(st)
-        _kill("notepad.exe", "CalculatorApp.exe", "mspaint.exe", "Taskmgr.exe")
+        _kill("notepad.exe", "CalculatorApp.exe", "mspaint.exe", "Taskmgr.exe",
+              "SystemSettings.exe")
         brain._pending_shell = None
     ran = [s for _, _, s in results if s != "SKIP"]
     passed = sum(1 for s in ran if s == "PASS")

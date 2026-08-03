@@ -40,6 +40,17 @@ except Exception:  # noqa: BLE001 - 任何导入期异常都按「眼睛不可�
 # 沙盒目录：只允许读写 jarvis\files\ 下的文件
 SANDBOX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
 
+# 系统组件/UWP 直达协议：os.startfile 原生可解析，启动即成功（系统组件必在），
+# 命中后跳过别名/PATH/快捷方式整条猜测链——实测该链对这些目标全部超时失败
+# （UWP 无 PATH 项、无传统 lnk；窗口枚举对 ApplicationFrameHost 宿主不稳定）。
+APP_PROTOCOLS = {
+    "设置": "ms-settings:",
+    "系统设置": "ms-settings:",
+    "微软商店": "ms-windows-store:",
+    "应用商店": "ms-windows-store:",
+    "任务管理器": "taskmgr",
+}
+
 # 应用别名表：用户口语叫法（查找时转小写）-> 统一搜索词
 APP_ALIASES = {
     "记事本": "notepad",
@@ -343,6 +354,17 @@ def _open_app(app: str) -> str:
 
         # 语音指令常把任务描述混进应用名：取标点前的第一段作为候选应用名
         name = re.split(r"[，。！？；,.!?;]", app, maxsplit=1)[0].strip() or app
+
+        # 第零步：系统组件/UWP 直达协议——启动即成功（系统组件必在，
+        # 协议由 Windows 原生解析），软等窗口做确认但不以窗口为成败依据
+        proto = APP_PROTOCOLS.get(name.strip().lower() if name.isascii() else name)
+        if proto is None:
+            proto = APP_PROTOCOLS.get(name)
+        if proto is not None:
+            if _start_app(proto):
+                _wait_for_window(name, timeout=4)  # 软确认，不判成败
+                return f"好的先生，{name}已经打开了。"
+            return f"抱歉先生，打开{name}时出了问题，请稍后再试。"
 
         # 第一步：通用别名解析（归一化 + 精确 + 双向子串），得到统一搜索词
         term = _resolve_alias(name)
