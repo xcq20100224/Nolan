@@ -73,6 +73,45 @@ try:
 except Exception:
     _rel = None
 
+# 屏幕状态流（Gap5-P1）：动作前后界面指纹 diff，「没变不重看」——
+# 等待后界面无实质变化时省下二次 VLM 复核往返；diff 实况同时作为
+# 地面实况写入历史，让 VLM 知道上一刀下去界面到底变了没有。
+try:
+    import perception as _perception
+except Exception:
+    _perception = None
+
+# 窗口上下文记忆（Gap5-P2）：记住每个窗口的已知控件、成功定位策略与
+# 失败教训，注入 VLM prompt——不再每次都从「这是哪里」重新理解。
+try:
+    import win_context as _wctx
+except Exception:
+    _wctx = None
+
+
+def _wkey(target_hint: str | None) -> str:
+    """当前窗口的上下文键：hint 优先，否则取前台标题；进程名不可得传空。"""
+    if _wctx is None:
+        return ""
+    try:
+        title = target_hint or (_uia.foreground_title() if _uia else "")
+        return _wctx.make_key("", title or "未知窗口")
+    except Exception:
+        return ""
+
+
+def _capture_screen_state(target_hint: str | None, shot_b64: str,
+                          controls: list):
+    """从现成的截图与控件清单算屏幕状态指纹（失败返回 None，绝不抛）。"""
+    if _perception is None:
+        return None
+    try:
+        title = target_hint or (_uia.foreground_title() if _uia else "")
+        return _perception.capture_state(
+            (0, title or "?"), base64.b64decode(shot_b64), controls or [])
+    except Exception:
+        return None
+
 # ---------------------------------------------------------------------------
 # 初始化与常量
 # ---------------------------------------------------------------------------
@@ -633,6 +672,18 @@ def _remedy_verify_failure(step: int, action: dict, expect: str, why: str,
     category = _rel.classify(ev)
     decision = _rel.decide(category, ledger, ev)
     cat_cn = _rel.CATEGORY_CN.get(category, category)
+    # Gap5-P2：失败教训沉淀进窗口上下文，下次同窗口任务带着经验上场
+    if _wctx is not None:
+        try:
+            _wctx.record_failure(
+                _wkey(target_hint),
+                ("%s %s" % (ev["action"], ev["text"])).strip()[:60],
+                category,
+                ("%s：%s" % (cat_cn,
+                             decision.get("hint") or decision.get("reason", "")
+                             ))[:120])
+        except Exception:
+            pass
     if decision["action"] == "give_up":
         print("[eyes] 第 %d 步失败分类：%s -> 放弃自愈（%s）"
               % (step, cat_cn, decision.get("reason", "")))
@@ -683,6 +734,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
     # 结构化重试账本（Gap2）：每类失败独立预算 + 全局总预算封顶；
     # reliability 缺失时为 None，复核失败处置走旧逻辑
     ledger = _rel.RetryLedger() if _rel is not None else None
+    prev_state = None  # 屏幕状态流（Gap5）：上一步的界面指纹，diff 基准
 
     try:
         for step in range(1, max_steps + 1):
@@ -711,10 +763,24 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                     controls = _uia.dump_window_controls() or []
                 except Exception:
                     controls = []
+            # Gap5-P2：控件清单增量登记进窗口上下文（毫秒级，失败静默）
+            if controls and _wctx is not None:
+                try:
+                    _wctx.record_controls(_wkey(target_hint), controls)
+                except Exception:
+                    pass
 
             # 2) 思考：问 VLM 下一步动作；非法 JSON 原地重试一次
             prompt = "当前任务：%s。这是第 %d 步（上限 %d 步）。" % (
                 task, step, max_steps)
+            # Gap5-P2：窗口历史经验注入——已知控件/上次成功策略/失败教训
+            if _wctx is not None:
+                try:
+                    _wbrief = _wctx.brief(_wkey(target_hint))
+                    if _wbrief:
+                        prompt += "本窗口的历史经验：%s。" % _wbrief
+                except Exception:
+                    pass
             if history:
                 prompt += "已执行的动作历史：%s。" % "；".join(history)
             if controls:
@@ -870,6 +936,23 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
             # 5) 等界面响应，进入下一步
             time.sleep(_STEP_INTERVAL)
 
+            # 5.6) 屏幕状态流（Gap5-P1）：动作后界面到底变了没有，diff 实况
+            # 作为地面实况写入历史——VLM 不再凭想象判断自己的动作有没有生效；
+            # 截屏+枚举仅毫秒级，相比一次 VLM 往返（秒级）成本可忽略
+            if _perception is not None:
+                try:
+                    _s6 = screenshot_b64()
+                    _c6 = _uia.dump_window_controls() if _uia else []
+                    curr = _capture_screen_state(target_hint, _s6, _c6 or [])
+                    if prev_state is not None and curr is not None:
+                        _d6 = _perception.diff_states(prev_state, curr)
+                        _change = _perception.describe_change(_d6)
+                        if _change:
+                            history.append("系统感知：%s" % _change)
+                    prev_state = curr or prev_state
+                except Exception:
+                    pass
+
             # 5.5) 执行复核（闭环核心）：物理动作携带 expect 时，
             # 先用 UIA 控件树做廉价复核（阳性确认即视为生效，省一次截图 +
             # VLM 往返）；UIA 答不了再重新截屏复核。未生效则先经 reliability
@@ -905,17 +988,39 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                     # 等 1.5 秒换一张截图复核第二次，仍不符才计未生效
                     print("[eyes] 第 %d 步复核未见预期，等 1.5 秒二次复核……" % step)
                     time.sleep(1.5)
-                    try:
-                        check_shot = screenshot_b64()
-                        ok2, why2 = _verify(
-                            check_shot,
-                            "刚执行的动作是「%s」，预期屏幕上会出现：%s。"
-                            "请看这张截图判断：预期的效果是否已经出现？"
-                            % (desc, expect))
-                        if ok2 is not False:
-                            ok, why = ok2, why2
-                    except Exception:
-                        pass
+                    # Gap5-P1「没变不重看」：等完界面仍无实质变化时，
+                    # 再问一次 VLM「出现了吗」是纯粹的浪费（答案不会变），
+                    # 直接计未生效走处置；变了才值得花一次 VLM 复核
+                    _skip2 = False
+                    if _perception is not None and prev_state is not None:
+                        try:
+                            _s7 = screenshot_b64()
+                            _c7 = _uia.dump_window_controls() if _uia else []
+                            _st7 = _capture_screen_state(target_hint, _s7,
+                                                         _c7 or [])
+                            if (_st7 is not None
+                                    and not _perception.should_review(
+                                        prev_state, _st7)):
+                                ok, why = False, "等待后界面仍无实质变化"
+                                _skip2 = True
+                                check_shot = _s7
+                                print("[eyes] 第 %d 步界面无实质变化，"
+                                      "跳过二次 VLM 复核（省下往返）" % step)
+                            prev_state = _st7 or prev_state
+                        except Exception:
+                            pass
+                    if not _skip2:
+                        try:
+                            check_shot = screenshot_b64()
+                            ok2, why2 = _verify(
+                                check_shot,
+                                "刚执行的动作是「%s」，预期屏幕上会出现：%s。"
+                                "请看这张截图判断：预期的效果是否已经出现？"
+                                % (desc, expect))
+                            if ok2 is not False:
+                                ok, why = ok2, why2
+                        except Exception:
+                            pass
                 if ok is False:
                     verify_fails += 1
                     print("[eyes] 第 %d 步复核未生效（期望：%s；实际：%s）（连续 %d 次）"
@@ -946,6 +1051,16 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                             % (step, expect[:30], (why or "未出现")[:30]))
                 else:
                     verify_fails = 0
+                    # Gap5-P2：成功定位沉淀——下次同窗口任务带着经验上场
+                    if _wctx is not None:
+                        try:
+                            _wctx.record_success(
+                                _wkey(target_hint), desc[:60],
+                                str(action.get("text", "")
+                                    or action.get("keys", "") or "")[:40],
+                                "UIA按名吸附" if controls else "纯截图坐标")
+                        except Exception:
+                            pass
 
         # 步数耗尽仍未 done/fail：超限话术 + 最后判断 + 屏幕状态
         print("[eyes] 步数超出上限 %d，中止" % max_steps)
