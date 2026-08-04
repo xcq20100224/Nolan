@@ -59,6 +59,11 @@ except ImportError:  # pragma: no cover - 未就绪时降级，行为与旧版�
     memory_v2 = None
 
 try:
+    import episodic  # H1 情景记忆（时间线经历：近期事件注入 + 轮后记录）
+except ImportError:  # pragma: no cover
+    episodic = None
+
+try:
     import reminders  # 阶段四「主动提醒」模块（由并行工程师编写，按契约调用）
 except ImportError:  # pragma: no cover - reminders 未就绪时大脑仍可降级运行
     reminders = None
@@ -611,6 +616,14 @@ def _build_system_prompt() -> str:
             profile = ""
         if profile:
             prompt += "\n以下是你对主人的画像摘要（偏好与习惯）：\n" + profile
+    # H1 情景记忆注入：近 48 小时高显著度经历（任务成败/错误/里程碑）
+    if episodic is not None:
+        try:
+            epi = episodic.brief_for_prompt().strip()
+        except Exception:  # pragma: no cover
+            epi = ""
+        if epi:
+            prompt += "\n" + epi
     if hands is None:
         return prompt
     tool_lines = "\n".join(
@@ -1212,6 +1225,13 @@ def think(user_text: str, history: list[dict]) -> str:
     异步进行，回复延迟零增加；萃取失败只损失一条记忆，不影响对话。
     """
     reply = _think_impl(user_text, history)
+    if episodic is not None and reply and reply != EXIT_SIGNAL:
+        try:
+            episodic.log_event(
+                "conversation",
+                "先生：%s｜我：%s" % (user_text.strip()[:40], reply[:60]))
+        except Exception:
+            pass
     if memory_v2 is not None and reply and reply != EXIT_SIGNAL:
         u, a = user_text, reply
 

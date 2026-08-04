@@ -6,7 +6,8 @@ eyes.py —— Nolan 的「眼睛」与「手」的延伸（阶段五：屏幕�
 拆成一条可验证的闭环链路：
 
     截屏 -> 视觉模型理解界面并返回动作 JSON（含预期效果 expect）
-    -> pyautogui 执行 -> sleep 1 秒 -> 重新截屏复核上一步是否生效
+    -> pyautogui 执行 -> 条件等待界面稳定（上限 1 秒，稳定即提前走）
+    -> 重新截屏复核上一步是否生效
     （未生效则换策略重试，连续 2 次判失败；done 也需复核通过才生效）
     -> ... 直到 done / fail / 步数上限
 
@@ -88,6 +89,23 @@ try:
 except Exception:
     _wctx = None
 
+# 情景记忆（H1）：任务级事件进时间线（开始/成功/失败），
+# 供「上次那个任务后来怎么样了」类回忆
+try:
+    import episodic as _episodic
+except Exception:
+    _episodic = None
+
+
+def _log_epi(kind: str, summary: str) -> None:
+    """情景记忆写入（失败静默，绝不阻断任务闭环）。"""
+    if _episodic is None:
+        return
+    try:
+        _episodic.log_event(kind, summary[:120])
+    except Exception:
+        pass
+
 
 def _wkey(target_hint: str | None) -> str:
     """当前窗口的上下文键：hint 优先，否则取前台标题；进程名不可得传空。"""
@@ -112,6 +130,155 @@ def _capture_screen_state(target_hint: str | None, shot_b64: str,
     except Exception:
         return None
 
+
+# ---------------------------------------------------------------------------
+# 条件等待原语（B1 速度战役：盲等 -> 条件等待）
+#
+# 第一性原理：等待的唯一正当理由是「物理条件未成立」，不是「秒数没走完」。
+# 三个原语把过去按秒数的盲等改成按证据的等待，共享同一条保底契约：
+#   上限 >= 原固定值；perception/UIA 不可用、无基准指纹、或任何异常，
+#   一律回退为原固定 sleep——条件等待只是「提前走」的加速器，
+#   绝不引入「等不到」的新失败模式。
+# ---------------------------------------------------------------------------
+
+def _sample_state(target_hint: str | None):
+    """条件等待的单次轻量采样：截屏 + UIA 枚举 -> 屏幕状态指纹。
+    单次约 200ms；perception 缺失或采样失败返回 None（等待侧按证据缺失处理）。"""
+    if _perception is None:
+        return None
+    try:
+        shot = screenshot_b64()
+        controls = []
+        if _uia is not None:
+            try:
+                controls = _uia.dump_window_controls() or []
+            except Exception:
+                controls = []
+        return _capture_screen_state(target_hint, shot, controls)
+    except Exception:
+        return None
+
+
+def _wait_screen_settled(base, target_hint: str | None, timeout: float,
+                         min_wait: float = 0.2, poll: float = 0.15,
+                         stable_needed: int = 2, sample_fn=None) -> tuple:
+    """
+    条件等待（动作后等待）：等到「界面已变化且变化后连续 stable_needed 次
+    采样稳定」即提前返回；上限封顶 timeout（>= 原固定值），超时安静返回，
+    调用方按原逻辑继续——超时不是新失败模式。
+    防假稳：最小等待 min_wait 后才开始判稳（点击后渲染有启动延迟）。
+    返回 (实际等待秒数, 最后一帧指纹或 None)，末帧供调用方复用省一次采样。
+    """
+    if _perception is None or base is None:
+        time.sleep(timeout)  # 保底：无判定能力/无基准，回退原固定 sleep
+        return timeout, None
+    t0 = time.monotonic()
+    try:
+        sample = sample_fn or (lambda: _sample_state(target_hint))
+        deadline = t0 + max(0.0, timeout)
+        samples = []
+        last = None
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                return now - t0, last
+            last = sample()
+            samples.append(last)
+            now = time.monotonic()
+            if now >= deadline:
+                return now - t0, last
+            if now - t0 >= min_wait:
+                st = _perception.settle_status(base, samples,
+                                               required=stable_needed)
+                if st["settled"]:
+                    return now - t0, last
+            time.sleep(min(poll, max(0.0, deadline - now)))
+    except Exception:
+        # 异常回退：补足原固定值的剩余预算，行为与旧版固定 sleep 等价
+        remaining = timeout - (time.monotonic() - t0)
+        if remaining > 0:
+            time.sleep(remaining)
+        return timeout, None
+
+
+def _wait_for_change(base, target_hint: str | None, timeout: float,
+                     poll: float = 0.25, sample_fn=None) -> tuple:
+    """
+    条件等待（宽限等待）：等到指纹相对 base 出现实质变化即提前返回；
+    上限封顶 timeout（= 原固定值），超时安静返回。保底契约同上。
+    返回 (实际等待秒数, 是否等到变化, 最后一帧指纹或 None)。
+    """
+    if _perception is None or base is None:
+        time.sleep(timeout)  # 保底：回退原固定 sleep
+        return timeout, False, None
+    t0 = time.monotonic()
+    try:
+        sample = sample_fn or (lambda: _sample_state(target_hint))
+        deadline = t0 + max(0.0, timeout)
+        samples = []
+        last = None
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                return now - t0, False, last
+            last = sample()
+            samples.append(last)
+            now = time.monotonic()
+            if _perception.first_change(base, samples):
+                return now - t0, True, last
+            if now >= deadline:
+                return now - t0, False, last
+            time.sleep(min(poll, max(0.0, deadline - now)))
+    except Exception:
+        # 异常回退：补足原固定值的剩余预算
+        remaining = timeout - (time.monotonic() - t0)
+        if remaining > 0:
+            time.sleep(remaining)
+        return timeout, False, None
+
+
+def _wait_foreground(target_hint: str | None, timeout: float,
+                     poll: float = 0.1, title_fn=None) -> float:
+    """
+    条件等待（置前后等待）：轮询前台窗口标题，确认目标真的到前台即提前走；
+    上限封顶 timeout（= 原固定值）。UIA 不可用或异常时回退固定 sleep(timeout)。
+    返回实际等待秒数。
+    """
+    get_title = title_fn or (_uia.foreground_title if _uia is not None else None)
+    if get_title is None or not target_hint:
+        time.sleep(timeout)  # 保底：无判定能力，回退原固定 sleep
+        return timeout
+    t0 = time.monotonic()
+    try:
+        deadline = t0 + max(0.0, timeout)
+        while True:
+            try:
+                if target_hint.lower() in (get_title() or "").lower():
+                    return time.monotonic() - t0
+            except Exception:
+                pass  # 单次标题读取失败继续轮询，直到上限
+            now = time.monotonic()
+            if now >= deadline:
+                return now - t0
+            time.sleep(min(poll, max(0.0, deadline - now)))
+    except Exception:
+        # 异常回退：补足原固定值的剩余预算
+        remaining = timeout - (time.monotonic() - t0)
+        if remaining > 0:
+            time.sleep(remaining)
+        return timeout
+
+
+def _print_timing(t_sense0, t_think0, t_act0=None, t_wait0=None) -> None:
+    """分段计时仪表：没有测量就没有速度战役。缺失的分段按 0.00 打印。"""
+    now = time.monotonic()
+    sense = (t_think0 - t_sense0) if (t_sense0 and t_think0) else 0.0
+    think = (t_act0 - t_think0) if (t_think0 and t_act0) else 0.0
+    act = (t_wait0 - t_act0) if (t_act0 and t_wait0) else 0.0
+    wait = (now - t_wait0) if t_wait0 else 0.0
+    print("[eyes] 计时：感知%.2fs 思考%.2fs 动作%.2fs 等待%.2fs"
+          % (sense, think, act, wait))
+
 # ---------------------------------------------------------------------------
 # 初始化与常量
 # ---------------------------------------------------------------------------
@@ -135,7 +302,7 @@ _DEFAULT_VISION_EXTRA_BODY = '{"thinking": {"type": "disabled"}}'
 _VLM_TIMEOUT = 60.0                # VLM 请求超时（秒）
 _SHOT_MAX_WIDTH = 1280             # 发送给 VLM 的截图最大宽度（像素）
 _JPEG_QUALITY = 80                 # 截图 JPEG 质量（兼顾清晰度与体积）
-_STEP_INTERVAL = 1.0               # 每步执行后的等待秒数，等界面响应
+_STEP_INTERVAL = 1.0               # 每步执行后的等待秒数上限（条件等待：界面稳定即提前走，此为封顶值）
 
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "llm_config.json")
@@ -724,6 +891,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
     永不向调用方抛异常。
     """
     print("[eyes] 任务开始：%s（步数上限 %d）" % (task, max_steps))
+    _log_epi("task", "开始任务「%s」（上限%d步）" % (task[:60], max_steps))
 
     history: list[str] = []  # 已执行动作历史，每步带给 VLM 防止重复动作
     done_steps: list = []    # 结构化动作序列，任务成功后固化进技能库
@@ -741,6 +909,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
 
     try:
         for step in range(1, max_steps + 1):
+            _t_sense0 = time.monotonic()  # 计时锚点：感知段起点
             # 0) 前台保障：目标窗口被遮挡时先置前，再截屏。
             # 失败静默（托盘/标题漂移），不阻断主闭环
             if target_hint and _uia is not None:
@@ -749,7 +918,9 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                         if _uia.bring_to_front(target_hint):
                             print("[eyes] 目标窗口「%s」曾被遮挡，已重新置前"
                                   % target_hint)
-                            time.sleep(0.5)  # 等窗口完成切换动画
+                            # 原固定值 0.5 秒 → 条件等待上限 0.5 秒：
+                            # 轮询前台标题确认真的到前台即走
+                            _wait_foreground(target_hint, 0.5)
                 except Exception:
                     pass
 
@@ -772,6 +943,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                     _wctx.record_controls(_wkey(target_hint), controls)
                 except Exception:
                     pass
+            _t_think0 = time.monotonic()  # 计时锚点：思考段起点（感知段结束）
 
             # 2) 思考：问 VLM 下一步动作；非法 JSON 原地重试一次
             prompt = "当前任务：%s。这是第 %d 步（上限 %d 步）。" % (
@@ -831,6 +1003,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
             last_thought = thought
             print("[eyes] 第 %d 步：%s | %s"
                   % (step, action["action"], thought))
+            _t_act0 = time.monotonic()  # 计时锚点：动作段起点（思考段结束）
 
             # 3) 终态判定：done 必须先经复核才生效，防 VLM 谎报完成
             if action["action"] == "done":
@@ -845,11 +1018,15 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                     history.append(
                         "第%d步 系统复核：任务尚未真正完成（%s），请继续未完成的部分"
                         % (step, (why or "目标未达成")[:40]))
-                    time.sleep(_STEP_INTERVAL)
+                    # 原固定值 1.0 秒 → 条件等待上限 1.0 秒：稳定即提前走
+                    _wait_screen_settled(prev_state, target_hint, _STEP_INTERVAL)
+                    _print_timing(_t_sense0, _t_think0, _t_act0)
                     continue
                 summary = thought or "任务已完成。"
                 print("[eyes] 任务完成%s：%s"
                       % ("（复核通过）" if ok is True else "", summary))
+                _log_epi("outcome", "任务「%s」完成：%s" % (task[:40], summary[:60]))
+                _print_timing(_t_sense0, _t_think0, _t_act0)
                 # 技能固化：经复核确认成功的动作序列沉淀为可复用技能，
                 # 下次同类任务直接重放，不再逐步掷骰子
                 if _skills is not None and done_steps:
@@ -877,12 +1054,16 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                             print("[eyes] 目标窗口存在但被遮挡（VLM 报缺失为误报），"
                                   "置前重看（%d/2）" % early_fail_retries)
                             _uia.bring_to_front(target_hint)
-                            time.sleep(1.0)
+                            # 原固定值 1.0 秒 → 条件等待上限 1.0 秒：
+                            # 确认真的到前台即走
+                            _wait_foreground(target_hint, 1.0)
                             history.append(
                                 "第%d步 目标窗口被其他界面遮挡，已重新置前，请重新观察"
                                 % step)
+                            _print_timing(_t_sense0, _t_think0, _t_act0)
                             continue
                     print("[eyes] 目标应用缺失：%s" % reason)
+                    _print_timing(_t_sense0, _t_think0, _t_act0)
                     return _join_zh(_MSG_FAIL_PREFIX, reason,
                                     "请先让我用 open_app 打开它")
                 # 零动作早退宽限：尚未执行任何物理动作时的 fail 没有副作用，
@@ -894,9 +1075,14 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                           % (step, reason, early_fail_retries))
                     history.append("第%d步 视觉判断「%s」但尚未尝试，继续观察"
                                    % (step, reason[:30]))
-                    time.sleep(_STEP_INTERVAL)
+                    # 原固定值 1.0 秒 → 条件等待上限 1.0 秒：稳定即提前走
+                    _wait_screen_settled(prev_state, target_hint, _STEP_INTERVAL)
+                    _print_timing(_t_sense0, _t_think0, _t_act0)
                     continue
                 print("[eyes] 任务失败（第 %d 步）：%s" % (step, reason))
+                _log_epi("error", "任务「%s」失败（第%d步）：%s"
+                         % (task[:40], step, reason[:50]))
+                _print_timing(_t_sense0, _t_think0, _t_act0)
                 return _fail_report(step, reason, last_shot, executed)
 
             # 4) 执行动作（FAILSAFE 抛异常即中止）
@@ -905,6 +1091,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
             except pyautogui.FailSafeException:
                 print("[eyes] FAILSAFE 触发，安全中止")
                 return _MSG_FAILSAFE
+            _t_wait0 = time.monotonic()  # 计时锚点：等待段起点（动作段结束）
 
             # 记入历史：下一步带给 VLM，避免模型无记忆而重复同一动作
             desc = action["action"]
@@ -936,17 +1123,24 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                                "下一步必须换完全不同的策略（滚动页面、换其他入口、"
                                "或直接 fail 并说明真实原因，例如列表为空/需要登录）")
 
-            # 5) 等界面响应，进入下一步
-            time.sleep(_STEP_INTERVAL)
+            # 5) 等界面响应（原固定值 1.0 秒 → 条件等待上限 1.0 秒）：
+            # 界面变化后连续 2 次采样稳定即提前走；超时/异常回退原固定 sleep，
+            # prev_state 即动作前指纹（上一步 5.6 采样，零额外成本）作基准
+            _waited, _settled_frame = _wait_screen_settled(
+                prev_state, target_hint, _STEP_INTERVAL)
+            _print_timing(_t_sense0, _t_think0, _t_act0, _t_wait0)
 
             # 5.6) 屏幕状态流（Gap5-P1）：动作后界面到底变了没有，diff 实况
             # 作为地面实况写入历史——VLM 不再凭想象判断自己的动作有没有生效；
             # 截屏+枚举仅毫秒级，相比一次 VLM 往返（秒级）成本可忽略
             if _perception is not None:
                 try:
-                    _s6 = screenshot_b64()
-                    _c6 = _uia.dump_window_controls() if _uia else []
-                    curr = _capture_screen_state(target_hint, _s6, _c6 or [])
+                    if _settled_frame is not None:
+                        curr = _settled_frame  # 复用条件等待末帧，省一次截屏+枚举
+                    else:
+                        _s6 = screenshot_b64()
+                        _c6 = _uia.dump_window_controls() if _uia else []
+                        curr = _capture_screen_state(target_hint, _s6, _c6 or [])
                     if prev_state is not None and curr is not None:
                         _d6 = _perception.diff_states(prev_state, curr)
                         _change = _perception.describe_change(_d6)
@@ -988,9 +1182,12 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                         ok, why = None, ""
                 if ok is False:
                     # 界面加载宽限：动作可能已生效但页面尚未渲染完，
-                    # 等 1.5 秒换一张截图复核第二次，仍不符才计未生效
-                    print("[eyes] 第 %d 步复核未见预期，等 1.5 秒二次复核……" % step)
-                    time.sleep(1.5)
+                    # 原固定值 1.5 秒 → 条件等待上限 1.5 秒：
+                    # 轮询指纹，一旦出现实质变化即提前走，换一张截图复核第二次，
+                    # 仍不符才计未生效
+                    print("[eyes] 第 %d 步复核未见预期，等界面变化后二次复核"
+                          "（上限 1.5 秒）……" % step)
+                    _wait_for_change(prev_state, target_hint, 1.5)
                     # Gap5-P1「没变不重看」：等完界面仍无实质变化时，
                     # 再问一次 VLM「出现了吗」是纯粹的浪费（答案不会变），
                     # 直接计未生效走处置；变了才值得花一次 VLM 复核
@@ -1102,7 +1299,8 @@ def replay(task: str, steps: list, target_hint: str | None = None):
             try:
                 if target_hint.lower() not in _uia.foreground_title().lower():
                     _uia.bring_to_front(target_hint)
-                    time.sleep(0.5)
+                    # 原固定值 0.5 秒 → 条件等待上限 0.5 秒：确认到前台即走
+                    _wait_foreground(target_hint, 0.5)
             except Exception:
                 pass
         act = s.get("action")
@@ -1145,6 +1343,8 @@ def replay(task: str, steps: list, target_hint: str | None = None):
         except Exception as exc:
             print("[eyes] 重放第 %d 步异常（%s），放弃重放" % (i, exc))
             return None
+        # 步间等待保留固定 0.8 秒：重放路径没有现成基准指纹，每步前置采样
+        # （截屏 ~200ms）会抵消条件等待的提前走收益，保守不动
         time.sleep(0.8)
 
     # 终态复核：唯一一次模型调用，确认目标真实达成

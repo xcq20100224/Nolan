@@ -10,6 +10,7 @@ ears.py —— 贾维斯的耳朵 👂
         超时或纯静音返回 None。
 """
 
+import os
 import time
 import numpy as np
 import sounddevice as sd
@@ -22,12 +23,36 @@ import sounddevice as sd
 帧长毫秒 = 30             # 每帧 30ms，用于 VAD 能量计算
 帧样本数 = int(采样率 * 帧长毫秒 / 1000)
 
-环境标定秒 = 0.5          # 录音前采集环境噪声的时长
-阈值倍率 = 2.5            # 语音判定阈值 = 环境 RMS × 倍率
-最小阈值 = 0.01           # 阈值下限，防止安静环境下阈值过低误判
-语音起判帧数 = 3          # 连续 3 帧超阈值才认为“说话开始”
-静音结束秒 = 1.0          # 语音后连续静音多久判定“说完了”
+
+def _读环境浮点(名: str, 默认: float) -> float:
+    """读浮点环境变量，缺失/非法值回落默认——配置出错绝不拖垮耳朵。"""
+    try:
+        return float(os.environ.get(名, "") or 默认)
+    except ValueError:
+        return 默认
+
+
+def _读环境整数(名: str, 默认: int) -> int:
+    try:
+        return int(os.environ.get(名, "") or 默认)
+    except ValueError:
+        return 默认
+
+
+# ---- VAD 自适应门限（B4：环境噪声底估计的窗口/系数全部可做环境变量微调） ----
+# 默认值与旧版一字不差；嘈杂环境可调，例如 NOLAN_VAD_THRESHOLD_RATIO=3.0
+环境标定秒 = _读环境浮点("NOLAN_VAD_ENV_SECONDS", 0.5)    # 录音前采集环境噪声的时长
+阈值倍率 = _读环境浮点("NOLAN_VAD_THRESHOLD_RATIO", 2.5)  # 语音判定阈值 = 环境 RMS × 倍率
+最小阈值 = _读环境浮点("NOLAN_VAD_MIN_THRESHOLD", 0.01)   # 阈值下限，防安静环境阈值过低误判
+语音起判帧数 = _读环境整数("NOLAN_VAD_START_FRAMES", 3)   # 连续 3 帧超阈值才认为“说话开始”
+静音结束秒 = _读环境浮点("NOLAN_VAD_END_SILENCE", 1.0)    # 语音后连续静音多久判定“说完了”
 最长句子秒 = 15.0         # 单句最长录音时长，防止无限录音
+
+# ---- 突发噪声免疫（B4） ----
+# 第一性原理：语音是「持续」信号，咳嗽/敲桌是「瞬态」信号——人类最短音节
+# 也在 150ms 量级，而敲击类突发通常在 100ms 内。因此「能量突增但有声部分
+# 持续不足 150ms」的片段不送进 ASR。设为 0 完全关闭，恢复旧版逐字行为。
+突发免疫毫秒 = _读环境整数("NOLAN_BURST_IMMUNE_MS", 150)
 
 模型名称 = "small"         # P5 换代：实测 small/beam1 = 1.53x 实时倍率、准确率 92%，
                            # 与 medium/beam5（5.49x/92%）准确率持平、提速 3.6 倍；
@@ -133,6 +158,12 @@ def _录一帧(流: sd.RawInputStream) -> np.ndarray:
     return 帧
 
 
+def _片段是否语音(有声帧数: int) -> bool:
+    """突发噪声免疫判定：有声部分持续 ≥ 突发免疫毫秒 才算语音。
+    突发免疫毫秒 = 0 时恒真（完全关闭，恢复旧版行为）。"""
+    return 有声帧数 * 帧长毫秒 >= 突发免疫毫秒
+
+
 def _录音(timeout: float) -> np.ndarray | None:
     """
     从默认麦克风录一句话。
@@ -141,6 +172,7 @@ def _录音(timeout: float) -> np.ndarray | None:
     帧列表: list[np.ndarray] = []
     已说话 = False
     静音帧数 = 0
+    有声帧数 = 0          # 累计超阈值帧数，用于突发噪声免疫（B4）
     静音结束帧数 = max(1, int(静音结束秒 * 1000 / 帧长毫秒))
     最长帧数 = int(最长句子秒 * 1000 / 帧长毫秒)
 
@@ -184,13 +216,25 @@ def _录音(timeout: float) -> np.ndarray | None:
                         已说话 = True
                         帧列表.append(帧)
                         静音帧数 = 0
+                        有声帧数 = 连续超阈值  # 起判的连续高帧全部计入有声
                 else:
                     帧列表.append(帧)
                     if 能量 < 阈值:
                         静音帧数 += 1
                     else:
                         静音帧数 = 0
+                        有声帧数 += 1
                     if 静音帧数 >= 静音结束帧数:
+                        if not _片段是否语音(有声帧数):
+                            # 突发噪声免疫：咳嗽/敲桌等短促高能片段不进 ASR，
+                            # 清空状态回到「等说话」继续值守，而不是结束录音
+                            print(f"👂 耳朵：忽略 {有声帧数 * 帧长毫秒}ms 突发噪声 🛡️")
+                            已说话 = False
+                            帧列表 = []
+                            静音帧数 = 0
+                            连续超阈值 = 0
+                            有声帧数 = 0
+                            continue
                         break  # 说完后的尾静音达标，结束
                     if len(帧列表) >= 最长帧数:
                         break  # 达到单句最长时长
@@ -199,6 +243,11 @@ def _录音(timeout: float) -> np.ndarray | None:
         return None
 
     if not 已说话 or not 帧列表:
+        return None
+
+    # 超时/最长帧数收尾路径也要过一遍突发免疫：短促噪声不配进 ASR
+    if not _片段是否语音(有声帧数):
+        print(f"👂 耳朵：忽略 {有声帧数 * 帧长毫秒}ms 突发噪声 🛡️")
         return None
 
     # 去掉尾部静音帧，减少 Whisper 的无效输入
@@ -231,6 +280,79 @@ def _转写(音频: np.ndarray) -> str | None:
         return None
 
 
+# ========== 声纹门禁（B4，默认关闭） ==========
+# 第一性原理：唤醒词工作在文本层，任何人喊「Nolan」都会命中；门禁在声学层
+# 补一道「谁在说」的过滤。默认关闭的两个理由：
+#   1) 没录入声纹的家庭/办公场景，门禁开了等于没开（verify 恒放行），
+#      平白多一层复杂度；
+#   2) 声纹是轻量质心模板而非安防级，误拒代价（主人被锁门外）远高于
+#      误放代价（陌生人误唤醒一次）——默认行为必须与旧版一字不差。
+_VOICE_GATE = os.environ.get("NOLAN_VOICE_GATE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _取声纹模块():
+    """懒加载同目录 voiceprint 模块；脚本/包两种导入方式都兜底，缺模块返回 None。"""
+    try:
+        import voiceprint  # type: ignore
+        return voiceprint
+    except Exception:
+        try:
+            from . import voiceprint  # type: ignore
+            return voiceprint
+        except Exception:
+            return None
+
+
+def voice_gate_pass(音频: np.ndarray, 采样率_: int = 采样率) -> bool:
+    """声纹门禁：判断这段音频是否主人在说。
+
+    放行条件（任一即过）：门禁未开启 / 未注册模板 / 打分通过 / 门禁自身故障。
+    拒绝只在一种情况发生：门禁已开、模板已录、打分低于阈值——此时打印一行日志。
+    「宁可放行不可误拒」是刻意选择，见上方 _VOICE_GATE 注释。
+    """
+    if not _VOICE_GATE:
+        return True
+    vp = _取声纹模块()
+    if vp is None or not vp.is_enrolled():
+        return True  # 没录入就不过滤，绝不把主人锁在门外
+    try:
+        通过, 分数 = vp.verify(音频, 采样率_)
+    except Exception as 错误:
+        print(f"👂 耳朵：声纹打分异常（{错误}），本次放行 ⚠️")
+        return True
+    if not 通过:
+        print(f"👂 耳朵：声纹不匹配（{分数:.2f}），忽略本次唤醒 🚫")
+    return 通过
+
+
+def enroll_voice(段数: int = 3, 每段超时: float = 25.0) -> bool:
+    """引导式声纹注册：复用 _录音 路径采集 N 段主人语音，交给 voiceprint 建档。
+    每段最多两次尝试；任一段失败即中止（不覆盖旧模板）。返回是否注册成功。
+    注册完成后设 NOLAN_VOICE_GATE=1 才会真正启用门禁。
+    """
+    vp = _取声纹模块()
+    if vp is None:
+        print("👂 耳朵：voiceprint 模块不可用，无法注册声纹 😢")
+        return False
+    样本: list[np.ndarray] = []
+    for 第几段 in range(1, 段数 + 1):
+        print(f"👂 声纹注册 {第几段}/{段数}：请自然说一句话（例如「诺兰，今天天气怎么样」）🎙️")
+        音频 = None
+        for _ in range(2):
+            音频 = _录音(每段超时)
+            if 音频 is not None and len(音频) >= int(采样率 * 0.8):
+                break
+            print("👂 没录到有效语音，请再试一次……")
+        if 音频 is None or len(音频) < int(采样率 * 0.8):
+            print("👂 声纹注册中止：有效语音不足 😢")
+            return False
+        样本.append(音频)
+    成功 = bool(vp.enroll(样本, 采样率))
+    print("👂 声纹注册完成 ✅（设 NOLAN_VOICE_GATE=1 后门禁生效）" if 成功
+          else "👂 声纹注册失败 😢")
+    return 成功
+
+
 # ========== 对外接口（契约函数） ==========
 def listen_once(timeout: float = 30.0) -> str | None:
     """
@@ -241,6 +363,8 @@ def listen_once(timeout: float = 30.0) -> str | None:
         音频 = _录音(timeout)
         if 音频 is None:
             return None
+        if not voice_gate_pass(音频):
+            return None  # 门禁开启且声纹不匹配：这次「听到」作废
         文本 = _转写(音频)
         if 文本:
             print(f"👂 耳朵：识别结果「{文本}」✅")

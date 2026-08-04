@@ -268,3 +268,55 @@ def describe_change(d: dict) -> str:
     if ratio > _PIXEL_CHANGE_RATIO:
         parts.append("画面内容变化约 %d%%" % round(ratio * 100))
     return "；".join(parts) if parts else "界面有变化"
+
+
+# ---------------------------------------------------------------------------
+# 条件等待的稳定性判定（B1 速度战役：盲等 -> 条件等待，纯新增不改旧契约）
+#
+# 第一性原理：等待的唯一正当理由是「物理条件未成立」，不是「秒数没走完」。
+# 以下两个纯函数把「等到什么时候算够」从时间维度翻译到证据维度：
+# 调用方（eyes）按序注入采样指纹，这里只做同一性判断，不做任何 IO。
+# ---------------------------------------------------------------------------
+
+def settle_status(base, samples, required=2) -> dict:
+    """
+    「变化后稳定」判定（纯函数，零 IO）：
+    base     动作前的基准指纹；None 表示无基准——无法证明发生过变化，保守判未稳定
+    samples  动作后按时间顺序采到的指纹序列（可含 None：该帧证据缺失）
+    required 变化被观察到之后，需要的连续稳定帧数
+    返回 {"changed": bool, "stable_count": int, "settled": bool}：
+      changed      序列中是否出现过相对 base 的实质变化
+      stable_count 最后一次变化之后、与前一帧无实质变化的连续帧数
+                   （None 帧会清零——证据缺失无法证明稳定，宁多等不误判稳定）
+      settled      changed 且 stable_count >= required，即「变化后稳定」成立
+    """
+    changed = False
+    stable_count = 0
+    prev = base
+    for s in samples:
+        if s is None:
+            stable_count = 0  # 证据缺失帧：无法证明稳定，计数清零
+            continue
+        if prev is None:
+            prev = s  # 无基准时的首帧只作后续帧的比较基准，不算变化证据
+            continue
+        if diff_states(prev, s)["changed"]:
+            if prev is base:
+                changed = True  # 相对动作前基准发生实质变化
+            stable_count = 0    # 帧间仍在变：稳定计数清零，基准推进到本帧
+            prev = s
+        else:
+            stable_count += 1
+    return {"changed": changed, "stable_count": stable_count,
+            "settled": bool(changed and stable_count >= required)}
+
+
+def first_change(base, samples) -> bool:
+    """序列中是否已出现相对 base 的实质变化（纯函数，零 IO）。
+    base 为 None 时保守返回 False（证明不了变化就按没变处理，继续等）。"""
+    if base is None:
+        return False
+    for s in samples:
+        if s is not None and diff_states(base, s)["changed"]:
+            return True
+    return False

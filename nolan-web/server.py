@@ -101,7 +101,7 @@ except ImportError:
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-04-gap34"
+_VERSION = "2026-08-04-wave1"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -775,6 +775,15 @@ def _wake_spot(audio) -> None:
         return
     print("[wake] 听到：%s" % text[:40])
     if any(k in text for k in _WAKE_KEYWORDS):
+        # B4 声纹门禁（默认关闭）：开启且已注册模板时，
+        # 非主人声音说唤醒词不唤醒（防家人/电视误触发）
+        try:
+            import ears
+            if not ears.voice_gate_pass(audio):
+                print("[wake] 唤醒词命中但声纹不匹配，忽略。")
+                return
+        except Exception:
+            pass  # 门禁异常恒放行，绝不把主人锁在门外
         print("[wake] 唤醒词命中，通知前端。")
         with _wake_events_lock:
             _wake_events.append({"ts": time.time(), "kind": "wake"})

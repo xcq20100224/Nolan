@@ -1016,25 +1016,32 @@ def _find_window(title_substr: str) -> bool:
     return _find_window_hwnd(title_substr) is not None
 
 
-# 窗口等待参数：每 1 秒轮询一次；open_app 执行后自检默认最多等 8 秒
+# 窗口等待参数：原固定 1 秒轮询 → 0.25 秒起步、指数退避（封顶 1 秒）；
+# open_app 执行后自检默认最多等 8 秒（总上限不变）
 _WINDOW_VERIFY_TIMEOUT = 8.0
+_WINDOW_POLL_START = 0.25  # 起步轮询间隔：窗口常在 1 秒内出现，密查早走
+_WINDOW_POLL_MAX = 1.0     # 退避封顶：长时间等不到时回到原 1 秒节奏
 
 
 def _wait_for_window(term: str, timeout: float = _WINDOW_VERIFY_TIMEOUT) -> bool:
     """
-    窗口等待原语（全模块唯一）：每 1 秒轮询 _find_window(term)，
-    窗口出现立即返回 True；超时（默认 8 秒）返回 False。
-    open_app 的执行后自检与 gui_control 的自动开路前导都复用它。
+    窗口等待原语（全模块唯一）：轮询 _find_window(term)，窗口出现立即返回 True；
+    超时（默认 8 秒）返回 False。open_app 的执行后自检与 gui_control 的
+    自动开路前导都复用它。
+    轮询节奏：原固定 1 秒 → 0.25 秒起步、指数退避封顶 1 秒（总上限不变，
+    窗口早出现早走，晚出现不劣于原节奏）。
     """
     try:
         deadline = time.monotonic() + max(0.0, timeout)
+        interval = _WINDOW_POLL_START
         while True:
             if _find_window(term):
                 return True
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            time.sleep(min(1.0, remaining))
+            time.sleep(min(interval, remaining))
+            interval = min(_WINDOW_POLL_MAX, interval * 2)  # 指数退避
     except Exception:
         return False
 
@@ -1100,8 +1107,8 @@ def _extract_app_hint(task: str) -> str | None:
     return None
 
 
-# 前导等待参数：每 1 秒查一次窗口，最多等 16 秒（应用冷启动需要时间）
-_WINDOW_WAIT_INTERVAL = 1
+# 前导等待参数：轮询节奏由 _wait_for_window 统一控制（0.25 秒起步退避），
+# 总上限 16 秒不变（应用冷启动需要时间）
 _WINDOW_WAIT_MAX_SECONDS = 16
 
 
@@ -1205,7 +1212,15 @@ def _gui_control(task: str, confirmed: bool = False) -> str:
         if hit:
             r = _eyes.replay(task, hit[1], target_hint=hint)
             if isinstance(r, str) and r:
+                try:
+                    _skills_mod.record_outcome(task, True)   # H4：重放成功记账
+                except Exception:
+                    pass
                 return r
+            try:
+                _skills_mod.record_outcome(task, False)  # H4：重放失败记账
+            except Exception:
+                pass
             print("[hands] 技能重放未成功，回退正常视觉闭环")
 
         # 确认后委托眼睛模块执行（步数上限等安全参数用其默认值；
