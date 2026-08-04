@@ -1,8 +1,8 @@
 # Nolan
 
-**Local-first Chinese voice AI butler for Windows — 会听、会说、会动手操作电脑的本地 AI 管家。**
+**Local-first Chinese voice AI butler for Windows — 会听、会说、会动手、会主动、还能被打断的本地 AI 管家。**
 
-> Nolan is a local-first, Chinese-speaking voice assistant for Windows. It listens with faster-whisper, thinks with a GLM-5.2 agent loop driving 14 tools (including arbitrary sandboxed shell commands), sees your screen and automates the GUI, remembers you long-term, and talks back with a GLM-TTS male voice. It ships with both a desktop (tkinter) app and a NEGA-styled web UI (React + Vite). Everything runs on your own machine — your API key, memory, and files never leave the repo folder.
+> Nolan is a local-first, Chinese-speaking voice butler for Windows. It listens with faster-whisper (1.5× real-time on CPU), thinks with a GLM-5.2 agent loop driving 14 tools (including arbitrary sandboxed shell commands), sees your screen and automates the GUI, remembers you long-term, fires conditional triggers ("if it rains tomorrow, remind me to take an umbrella"), and talks back with a GLM-TTS male voice that **you can interrupt mid-sentence — just start talking** (full-duplex barge-in, no AEC needed). Everything runs on your own machine — your API key, memory, and files never leave the repo folder.
 
 > 🇨🇳 以下为中文详细版。
 
@@ -11,6 +11,19 @@
 *⬆️ 真机演示（无剪辑加速）：对 Nolan 说「打开网易云音乐，播放我喜欢列表里的第一首歌」，它自己调起软件、操作界面、开始播放。*
 
 ![Nolan 网页版界面](docs/screenshot.png)
+
+---
+
+## 📊 用数字说话（全部可复现的实测基准）
+
+| 能力 | 基准 | 成绩 |
+|---|---|---|
+| 单步任务 | `benchmark_p0.py` 300 题水库（10 类目） | ✅ 首轮全绿 |
+| 大目标分层规划 | `benchmark_p1.py` 10 题（LLM 拆步→逐步执行→汇总） | ✅ 20% → **100%** |
+| 技能固化与泛化 | `benchmark_p2.py` 8 题（一次学习，同类任务模板化重放） | ✅ **8/8** |
+| 全链路回归 | `selftest_gaokao.py` 57 题（动手+动嘴+记忆+提醒+技能） | ✅ **57/57**（每次提交必跑） |
+| ASR 延迟 | `bench_asr.py` 4 段标准语料（small/beam1，CPU int8） | ✅ **1.53× 实时**（换代前 medium 为 5.49×，提速 3.6 倍，准确率 92% 持平） |
+| 全双工打断 | `test_barge_in.py` / `test_bargein_echo.py` | ✅ 13/13（短促杂音不误触、回声双保险） |
 
 ---
 
@@ -26,18 +39,26 @@
 
 点一下界面上的 **🎤 麦克风按钮**（或按 **Alt 键**）开始说话，说完**再点一次 🎤**（或再按一次 Alt）停止录音，Nolan 会自动识别、思考并语音回复你。
 
+**全双工打断（P3）**：开启右上角「唤醒词」开关后——
+- 对麦克风说「**诺兰**」即可免点击唤醒；
+- **Nolan 播报时直接开口说话即可打断它**，它会立刻闭嘴、听懂你的新指令并执行。无需 AEC：自适应能量门（播报声成为基线）+ 回声文本过滤（它知道自己正在说什么）双保险。
+
 ---
 
 ## Nolan 是什么
 
-Nolan 是一个**本地优先的 Windows 中文语音 AI 管家**：对着麦克风说中文，它不仅能听懂、会回答，还能真的动手——执行 shell 命令、操作应用程序、控制媒体播放、看屏幕、记事情、定闹钟。它不是云端 SaaS，你的记忆、文件和 API Key 全部留在自己电脑上。
+Nolan 是一个**本地优先的 Windows 中文语音 AI 管家**：对着麦克风说中文，它不仅能听懂、会回答，还能真的动手——执行 shell 命令、操作应用程序、控制媒体播放、看屏幕、记事情、定闹钟、**按条件主动行动**。它不是云端 SaaS，你的记忆、文件和 API Key 全部留在自己电脑上。
 
 ## ✨ 特性
 
-- 🎙️ **语音对话**：faster-whisper 本地中文识别 + 自然语音播报，全程免键盘
+- 🎙️ **语音对话**：faster-whisper 本地中文识别（CPU 上 1.53× 实时）+ 自然语音播报，全程免键盘
+- ⏸️ **全双工打断**：播报中直接开口即可打断，无 AEC 双保险设计（CLI 与网页版同构）
 - 🧠 **长期记忆**：记住你的偏好与事实，跨会话回忆（`jarvis/memory/` 本地存储）
 - ⏰ **主动提醒与闹钟**：「1 分钟后叫醒我」「明天提醒我开会」——到点主动弹出并播报
+- 🎯 **条件触发（P4）**：「如果明天下雨就提醒我带伞」「每当有重大 AI 新闻就告诉我」「每隔 30 分钟提醒我喝水」——联网核实条件，成立即行动；执行型动作直接动手，不只嘴上提醒
 - 🤖 **Agent 多步工具循环**：GLM-5.2 驱动，一次请求可连续调用多个工具直至任务完成
+- 🪜 **分层规划（P1）**：大目标自动拆步、逐步执行、历史传递、汇总汇报
+- 📚 **技能固化（P2）**：做过的任务固化为参数化模板，同类任务一次学习终身重放
 - 🛠️ **14 个工具**：含沙盒化**任意 shell 命令**、文件读写、通用应用打开、系统信息等
 - 👁️ **屏幕感知与 GUI 自动化**：截屏 + GLM-4.5V 视觉理解 + pyautogui 键鼠操作
 - 🎵 **媒体控制**：播放 / 暂停 / 切歌 / 音量调节（Windows 媒体键）
@@ -134,10 +155,15 @@ Nolan 依赖[智谱开放平台](https://open.bigmodel.cn)的 GLM 系列模型�
 
 ```
 Nolan/
-├── jarvis/          # Python 后端：ears / brain / hands / eyes / memory / mouth + 自测
+├── jarvis/          # Python 后端：ears / brain / hands / eyes / memory / mouth
+│   │                  + triggers（条件触发）+ skills（技能固化）+ reminders
 │   ├── llm_config.json.example   # 配置模板（install.bat 会自动复制为 llm_config.json）
+│   ├── selftest_gaokao.py        # 57 题全链路回归（动手+动嘴，每次提交必跑）
+│   ├── benchmark_p0/p1/p2.py     # 300 题单步水库 / 分层规划 / 技能泛化基准
+│   ├── bench_asr.py              # ASR 模型换代基准（延迟×准确率实测）
 │   └── test_jarvis.py            # 免麦克风全链路自动测试
 ├── nolan-web/       # React + Vite 网页版（NEGA 风驾驶舱）+ Python 标准库后端
+├── docs/            # 演示 GIF / 自录自配演示视频 / 界面截图
 ├── Nolan.bat        # 桌面 GUI 启动器
 ├── Nolan-CLI.bat    # 命令行语音模式启动器
 └── Nolan-Web.bat    # 网页版一键启动器
