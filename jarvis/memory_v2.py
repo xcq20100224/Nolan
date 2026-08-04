@@ -40,6 +40,10 @@ Nolan 语音助手 · 结构化长期记忆模块（memory_v2.py）· Gap3 认�
         删除内容含 query 的记忆，返回删除条数。
     def stats() -> dict
         返回 {total, by_category, store_path} 统计。
+
+便捷查询（H2 加法，纯增量，不改既有行为）：
+    def habits() -> list[dict]
+        只读返回全部 habit 类记忆副本（供 proactive 模式识别佐证），不记账 recall。
 """
 
 import json
@@ -294,6 +298,21 @@ def stats() -> dict:
     for it in items:
         by_cat[it.get("category", "fact")] = by_cat.get(it.get("category", "fact"), 0) + 1
     return {"total": len(items), "by_category": by_cat, "store_path": _STORE}
+
+
+# == 便捷查询（H2 加法：只读，不改写任何记账字段）==
+
+def habits() -> list:
+    """返回全部 habit 类记忆的副本，按最近被想起排序。
+
+    第一性原理：模式识别（proactive.detect_patterns）需要的是「翻阅」习惯
+    来为统计模式做佐证，而不是「想起」它们——故本函数只读，
+    不刷新 last_recalled、不累加 recall_count，绝不污染 recall 的频率信号。
+    """
+    with _LOCK:
+        items = [dict(it) for it in _read() if it.get("category") == "habit"]
+    items.sort(key=lambda x: x.get("last_recalled", ""), reverse=True)
+    return items
 
 
 # == GLM 萃取（extract_from_turn 的默认实现，测试时经 llm_caller 注入 mock）==

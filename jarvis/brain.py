@@ -73,6 +73,11 @@ try:
 except ImportError:  # pragma: no cover - triggers 未就绪时大脑仍可降级运行
     triggers = None
 
+try:
+    import auth_policy  # H3 分级授权：白名单自主 / 黑名单必确认 / 默认保持现状
+except ImportError:  # pragma: no cover - auth_policy 未就绪时一律走现行确认流程
+    auth_policy = None
+
 # == 常量与配置 ==
 
 EXIT_SIGNAL = "__EXIT__"          # 退出约定字符串，主循环据此结束
@@ -547,14 +552,48 @@ def _handle_pending_shell(text: str) -> str | None:
     return None
 
 
+def _confirm_prompt(tool: str, args: dict) -> str:
+    """生成待确认请求文案（run_shell / gui_control 专用话术，其余工具通用）。"""
+    if tool == "run_shell":
+        cmd = str(args.get("cmd", ""))
+        return f"先生，这条命令有一定风险：「{cmd}」。您确认执行吗？"
+    if tool == "gui_control":
+        task = str(args.get("task", ""))
+        return (
+            f"先生，完成「{task}」需要我接管您的鼠标和键盘，"
+            "通过截屏观察界面后进行点击、输入等操作。"
+            "操作期间请尽量不要碰鼠标键盘，紧急中止可把鼠标甩到屏幕角落。"
+            "您确认执行吗？"
+        )
+    return f"先生，操作「{tool}」需要您亲口确认。您确认执行吗？"
+
+
 def _execute_tool(tool: str, args: dict) -> str:
     """
     统一工具执行入口（规则路径与 LLM 路径共用）。
     hands 返回以 '[[NEEDS_CONFIRM]]' 开头的文本时，将工具与参数存入待确认状态机，
     并向先生如实复述风险、请求确认；其余结果文本零包装直接返回。
+
+    H3 分级授权（auth_policy，防御式接入：模块缺失/判定异常一律走现行逻辑）：
+      "confirm"（黑名单）——执行前直接挂起待确认状态机，强制确认，
+        即使该工具原本不需要确认；
+      "auto"（白名单）——hands 请求确认时附加 confirmed=True 自动放行；
+      "default"——现行逻辑原样（缺省策略文件时所有调用都是这一档，
+        这是默认零回退死契约）。
+    安全边界：分级授权只管「确认流程」，绝不解除 hands/VLM 硬编码的安全禁令。
     """
     global _pending_shell
     args = args or {}
+    # H3 黑名单前置闸：已带 confirmed=True 的重放不再重复判定
+    if auth_policy is not None and not args.get("confirmed"):
+        try:
+            _pre = auth_policy.decide(tool, args)
+        except Exception:  # noqa: BLE001 - 策略故障降级为现行流程
+            _pre = "default"
+        if _pre == "confirm":
+            print(f"[brain] 分级授权：黑名单拦截「{tool}」，强制要求先生亲口确认。")
+            _pending_shell = {"tool": tool, "args": dict(args)}
+            return _confirm_prompt(tool, args)
     result = hands.execute(tool, args)
     # 失败自动换路（gui_control 专用）：眼睛报告「目标应用缺失」时，
     # 自动提取应用名 -> open_app 打开（其内置窗口等待）-> 原任务重放一次，
@@ -576,19 +615,19 @@ def _execute_tool(tool: str, args: dict) -> str:
             retry_args["confirmed"] = True
             return hands.execute("gui_control", retry_args)
     if isinstance(result, str) and result.startswith("[[NEEDS_CONFIRM]]"):
+        # H3 白名单放行：策略判定免确认，附加 confirmed=True 直接重放执行
+        if auth_policy is not None:
+            try:
+                _post = auth_policy.decide(tool, args)
+            except Exception:  # noqa: BLE001 - 策略故障降级为现行流程
+                _post = "default"
+            if _post == "auto":
+                print(f"[brain] 分级授权：白名单放行「{tool}」，免确认直接执行。")
+                auto_args = dict(args)
+                auto_args["confirmed"] = True
+                return hands.execute(tool, auto_args)
         _pending_shell = {"tool": tool, "args": dict(args)}
-        if tool == "run_shell":
-            cmd = str(args.get("cmd", ""))
-            return f"先生，这条命令有一定风险：「{cmd}」。您确认执行吗？"
-        if tool == "gui_control":
-            task = str(args.get("task", ""))
-            return (
-                f"先生，完成「{task}」需要我接管您的鼠标和键盘，"
-                "通过截屏观察界面后进行点击、输入等操作。"
-                "操作期间请尽量不要碰鼠标键盘，紧急中止可把鼠标甩到屏幕角落。"
-                "您确认执行吗？"
-            )
-        return result
+        return _confirm_prompt(tool, args) if tool in ("run_shell", "gui_control") else result
     return result
 
 

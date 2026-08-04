@@ -101,7 +101,7 @@ except ImportError:
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-04-wave1"
+_VERSION = "2026-08-04-wave2"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -1388,6 +1388,18 @@ def _trigger_loop() -> None:
                     "profile": memory_v2.profile_summary(),
                     "due_messages": list(_trigger_fired),
                 }
+                # H2 预判素材：统计模式识别（episodic 时间线 + habit 记忆）
+                # → 当日预判 → 高置信标记，注入 context 供生成与闸门使用
+                try:
+                    _patterns = proactive.detect_patterns()
+                    ctx["patterns"] = _patterns
+                    _ant = proactive.current_anticipation(ctx, _patterns)
+                    if _ant:
+                        ctx["anticipation"] = _ant
+                        ctx["high_confidence_anticipation"] = any(
+                            proactive.high_confidence(p) for p in _patterns)
+                except Exception as _e:
+                    print("[proactive] 模式识别异常（本轮跳过预判）：%s" % _e)
                 if proactive.should_initiate(ctx):
                     msg = proactive.generate_initiative(ctx, brain.glm_one_shot)
                     if msg:

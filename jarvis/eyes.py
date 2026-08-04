@@ -37,10 +37,22 @@ Gap2 可靠性增强：复核未生效不再「盲重试」——先经 reliabil
 应用未响应），按对策表结构化修复（每类独立重试预算 + 逐次加长退避，
 全局总预算封顶防死循环）；UIA 控件树能阳性确认的复核直接跳过截图 + VLM
 往返。reliability 缺失或处置异常时退回旧逻辑，默认路径行为不变。
+
+B2 断点续航：perform 每步结束把「进行到哪一步」落盘到 checkpoint 模块
+（毫秒级）；长任务中途崩溃（进程被杀 / VLM 抖动 / 中止）后可用
+resume_perform(task) 从断点续跑——前若干步的物理成果还在屏幕上，
+丢的只是状态，状态从这里接回。任务成功或彻底失败（fail_report）时
+清除检查点；检查点有效期 24 小时，过期按没有处理。
+
+B3 眼睛补盲：UIA 控件树对自绘界面（游戏 / 部分 Electron / Canvas 应用）
+枚举为空或过稀（<3 个控件）时，用 VLM-OCR 扫描屏幕可交互元素，伪装成
+与 UIA 同构的伪控件清单合并进下游（find_element / snap_to_element /
+prompt 控件清单段零改动受益）；坐标为像素级估计，点击仍由复核闭环兜底。
 """
 
 import base64
 import ctypes
+import hashlib
 import io
 import json
 import os
@@ -96,6 +108,13 @@ try:
 except Exception:
     _episodic = None
 
+# 断点续航（B2）：长任务每步落盘「进行到哪一步」，崩溃后从断点续跑。
+# 防御式导入：模块缺失时长任务退回「从头再来」的旧行为，功能不缺。
+try:
+    import checkpoint as _ckpt
+except Exception:
+    _ckpt = None
+
 
 def _log_epi(kind: str, summary: str) -> None:
     """情景记忆写入（失败静默，绝不阻断任务闭环）。"""
@@ -129,6 +148,39 @@ def _capture_screen_state(target_hint: str | None, shot_b64: str,
             (0, title or "?"), base64.b64decode(shot_b64), controls or [])
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# 断点续航助手（B2）：每步落盘 / 终结清理
+# ---------------------------------------------------------------------------
+
+def _ckpt_save(task: str, step: int, history: list, done_steps: list,
+               executed: int, target_hint: str | None) -> None:
+    """每步结束落盘断点状态（毫秒级；任何失败静默，绝不影响任务闭环）。"""
+    if _ckpt is None:
+        return
+    try:
+        _ckpt.save(task, {
+            "step": step,
+            "history": list(history),
+            "done_steps": list(done_steps),
+            "window_key": _wkey(target_hint),
+            "executed": executed,
+            "target_hint": target_hint or "",  # 续跑时恢复前台保障用
+            "ts": time.time(),
+        })
+    except Exception:
+        pass
+
+
+def _ckpt_clear(task: str) -> None:
+    """任务终结（成功 / 彻底失败）后清除检查点；失败静默。"""
+    if _ckpt is None:
+        return
+    try:
+        _ckpt.clear(task)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +921,153 @@ def _remedy_verify_failure(step: int, action: dict, expect: str, why: str,
 
 
 # ---------------------------------------------------------------------------
+# B3 眼睛补盲：UIA 盲区的 VLM-OCR 兜底
+#
+# 第一性原理：UIA 控件树对自绘界面（游戏 / 部分 Electron / Canvas 应用）
+# 枚举为空，但「屏幕上有哪些按钮、在哪里」VLM 本身就能读出来
+# （_parse_bbox 已证明其定位能力）。缺的只是把「VLM 看到的元素」伪装成
+# 与 UIA 同构的控件清单，喂给下游统一管线——find_element 按名吸附、
+# snap_to_element 坐标吸附、prompt 控件清单段零改动自动受益。
+#
+# 诚实边界：VLM-OCR 的坐标是像素级估计，精度低于 UIA 的真实控件矩形；
+# 因此伪控件只作为「按名吸附 / 坐标参照系」，点击落点仍由执行后的
+# 复核闭环（_verify + reliability 结构化处置）兜底——估错了会被复核
+# 抓到，不会静默错下去。
+# ---------------------------------------------------------------------------
+
+# UIA 枚举结果少于该阈值即判「自绘界面盲区」，启用 VLM-OCR 补盲
+_UIA_BLIND_THRESHOLD = 3
+
+# 扫描结果缓存：同一截图（按内容哈希）只扫一次，省 VLM 往返；
+# 容量封顶防长任务内存膨胀（FIFO 逐出最旧项）
+_SCAN_CACHE: dict = {}
+_SCAN_CACHE_MAX = 16
+
+_VLM_SCAN_SYSTEM = (
+    "你是 Nolan 的屏幕元素扫描模块。我会给你一张电脑屏幕截图，"
+    "你的任务是列出截图中所有可交互的界面元素（按钮、输入框、链接、"
+    "菜单项、列表项、标签页等）。\n"
+    "只返回一个 JSON 数组（不要任何多余文字、不要 markdown 代码块）：\n"
+    '[{"name": "元素上的可见文字", "x1": 左上角x, "y1": 左上角y, '
+    '"x2": 右下角x, "y2": 右下角y}, ...]\n'
+    "规则：\n"
+    "1. 坐标是这张截图的像素坐标（截图左上角为原点），边界框紧贴元素边缘。\n"
+    "2. name 填元素上实际可见的文字；没有文字的图标按钮用简短功能描述。\n"
+    "3. 最多列 30 个，按重要程度从大到小；纯装饰、正文段落不算可交互元素。"
+)
+
+
+def _vlm_scan_elements(shot_b64: str) -> list:
+    """
+    VLM-OCR 扫描：让 VLM 列出截图中的可交互元素（名称 + 边界框），
+    转换成与 uia.dump_window_controls 完全同构的字典形态：
+        {name, control_type: "文本", rect: (x, y, w, h), enabled: True}
+    坐标用 _vlm_to_screen 的同一比例关系从缩放截图换算回物理像素。
+    任何一步失败（VLM 不可达 / JSON 非法 / 单项残缺）只损失该项或
+    返回空清单，绝不抛异常——补盲是增强，不是新的故障点。
+    """
+    elements = []
+    if not shot_b64:
+        return elements
+    try:
+        raw = _ask_vlm(shot_b64,
+                       "请列出这张截图中所有可交互的界面元素，"
+                       "只返回 JSON 数组。",
+                       system=_VLM_SCAN_SYSTEM)
+    except Exception as exc:
+        print("[eyes] VLM-OCR 补盲扫描失败（按无补盲处理）：%s" % exc)
+        return elements
+    m = re.search(r"\[.*\]", raw.strip(), re.DOTALL)
+    if not m:
+        return elements
+    try:
+        arr = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return elements
+    if not isinstance(arr, list):
+        return elements
+    seen = set()
+    for item in arr[:30]:
+        try:
+            name = str(item.get("name", "")).strip()
+            x1, y1 = float(item["x1"]), float(item["y1"])
+            x2, y2 = float(item["x2"]), float(item["y2"])
+            if not name or x2 <= x1 or y2 <= y1:
+                continue  # 无名 / 零面积 / 反向框：残缺项剔除
+            if name in seen:  # 同名伪控件只留第一个，防 VLM 重复罗列
+                continue
+            seen.add(name)
+            px1, py1 = _vlm_to_screen(x1, y1)
+            px2, py2 = _vlm_to_screen(x2, y2)
+            rx, ry = min(px1, px2), min(py1, py2)
+            elements.append({
+                "name": name,
+                "control_type": "文本",
+                "rect": (rx, ry, abs(px2 - px1), abs(py2 - py1)),
+                "enabled": True,
+            })
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return elements
+
+
+def _vlm_scan_cached(shot_b64: str) -> list:
+    """按截图内容哈希缓存扫描结果：同一截图只扫一次，省 VLM 往返。"""
+    try:
+        key = hashlib.md5(shot_b64.encode("utf-8")).hexdigest()
+    except Exception:
+        return _vlm_scan_elements(shot_b64)
+    if key in _SCAN_CACHE:
+        print("[eyes] VLM-OCR 补盲命中缓存（同一截图不重复扫描）")
+        return _SCAN_CACHE[key]
+    result = _vlm_scan_elements(shot_b64)
+    if len(_SCAN_CACHE) >= _SCAN_CACHE_MAX:
+        try:
+            _SCAN_CACHE.pop(next(iter(_SCAN_CACHE)))  # FIFO 逐出最旧项
+        except Exception:
+            _SCAN_CACHE.clear()
+    _SCAN_CACHE[key] = result
+    return result
+
+
+def _merge_controls(uia_controls: list, ocr_controls: list) -> list:
+    """
+    伪控件与 UIA 控件同构合并，UIA 优先去重：
+    UIA 矩形是真实控件边界（精确），VLM-OCR 是像素估计（模糊）——
+    名称互相包含即视为同一元素，保留 UIA 项、丢弃伪控件。
+    """
+    merged = list(uia_controls or [])
+    uia_names = [str(c.get("name", "")).strip().lower()
+                 for c in merged if c.get("name")]
+    for c in ocr_controls or []:
+        oname = str(c.get("name", "")).strip().lower()
+        if not oname:
+            continue
+        if any(oname in un or un in oname for un in uia_names):
+            continue  # 与 UIA 已枚举的控件重复，UIA 优先
+        merged.append(c)
+    return merged
+
+
+def _controls_with_ocr_fallback(shot_b64: str, controls: list) -> list:
+    """
+    补盲触发链：UIA 枚举为空或少于阈值（自绘界面判据）时，
+    用 VLM-OCR 扫描补齐伪控件并与 UIA 结果合并（UIA 优先去重）；
+    达到阈值原样返回，一次 VLM 往返都不多花。
+    """
+    if controls is None:
+        controls = []
+    if len(controls) >= _UIA_BLIND_THRESHOLD:
+        return controls
+    ocr = _vlm_scan_cached(shot_b64)
+    if not ocr:
+        return controls
+    print("[eyes] UIA 盲区（仅 %d 个控件），VLM-OCR 补盲发现 %d 个伪控件"
+          % (len(controls), len(ocr)))
+    return _merge_controls(controls, ocr)
+
+
+# ---------------------------------------------------------------------------
 # 主闭环：perform
 # ---------------------------------------------------------------------------
 
@@ -890,12 +1089,61 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
       - VLM 不可达   -> 固定降级话术
     永不向调用方抛异常。
     """
+    return _perform_impl(task, max_steps, target_hint, resume_state=None)
+
+
+def resume_perform(task: str, max_steps: int = 12) -> str:
+    """
+    断点续跑（B2）：加载该任务的检查点，把 history / done_steps /
+    executed 恢复到现场，从断点步继续——前若干步的物理成果（已打开的
+    窗口、已输入的内容）本来就在屏幕上，续跑只是接回「进行到哪一步」
+    这个信息状态。无检查点（不存在 / 过期 / 损坏）时与 perform 完全
+    等价——续跑是捷径，不是另一条链路。
+    """
+    state = _ckpt.load(task) if _ckpt is not None else None
+    if not state:
+        print("[eyes] 无有效检查点，按全新任务执行：%s" % task)
+        return perform(task, max_steps)
+    print("[eyes] 发现检查点：从第 %d 步断点续跑（已完成 %d 个动作）"
+          % (int(state.get("step", 0)), int(state.get("executed", 0))))
+    _log_epi("task", "续跑任务「%s」（断点第%d步）"
+             % (task[:60], int(state.get("step", 0))))
+    return _perform_impl(task, max_steps,
+                         state.get("target_hint") or None,
+                         resume_state=state)
+
+
+def _perform_impl(task: str, max_steps: int = 12,
+                  target_hint: str | None = None,
+                  resume_state: dict | None = None) -> str:
+    """
+    perform 的实现体。resume_state 非空时从断点状态恢复续跑：
+    历史 / 结构化动作 / 动作计数原样接回，步号从断点下一步继续；
+    其余计数器（复核驳回、死循环检测等）重新起步——它们防的是
+    「本次连续运行」的抖动，跨崩溃延续反而可能误伤。
+    """
     print("[eyes] 任务开始：%s（步数上限 %d）" % (task, max_steps))
     _log_epi("task", "开始任务「%s」（上限%d步）" % (task[:60], max_steps))
 
     history: list[str] = []  # 已执行动作历史，每步带给 VLM 防止重复动作
     done_steps: list = []    # 结构化动作序列，任务成功后固化进技能库
     executed = 0             # 已执行的物理动作数（wait 不计）
+    start_step = 1           # 续跑时改为断点步 + 1
+    if resume_state:
+        try:
+            history = list(resume_state.get("history") or [])
+            done_steps = list(resume_state.get("done_steps") or [])
+            executed = int(resume_state.get("executed") or 0)
+            start_step = int(resume_state.get("step") or 0) + 1
+        except Exception:
+            history, done_steps, executed, start_step = [], [], 0, 1
+        if start_step > 1:
+            # 续跑提示写进历史（随既有 prompt 通道带给 VLM）：
+            # 当前屏幕是续跑现场，不是开局——绝不重复已完成的动作
+            history.insert(
+                0, "系统：这是断点续跑任务，前 %d 步已完成，当前屏幕就是"
+                "续跑现场；请只判断剩余步骤，绝不重复已完成的动作"
+                % (start_step - 1))
     repeat_sigs: list = []   # 动作签名序列，用于死循环检测（同一动作连续重复即介入）
     early_fail_retries = 0   # 「零动作早退 fail」的宽限次数
     verify_fails = 0         # 连续「复核未生效」次数（1 次换策略提示，2 次判失败）
@@ -908,7 +1156,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
     prev_state = None  # 屏幕状态流（Gap5）：上一步的界面指纹，diff 基准
 
     try:
-        for step in range(1, max_steps + 1):
+        for step in range(start_step, max_steps + 1):
             _t_sense0 = time.monotonic()  # 计时锚点：感知段起点
             # 0) 前台保障：目标窗口被遮挡时先置前，再截屏。
             # 失败静默（托盘/标题漂移），不阻断主闭环
@@ -943,6 +1191,13 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                     _wctx.record_controls(_wkey(target_hint), controls)
                 except Exception:
                     pass
+            # B3 眼睛补盲：UIA 枚举为空/过稀（自绘界面判据）时，用 VLM-OCR
+            # 扫描伪控件合并进清单（UIA 优先去重）；下游按名吸附 / 坐标
+            # 吸附 / prompt 控件清单段零改动受益；补盲自身失败静默
+            try:
+                controls = _controls_with_ocr_fallback(shot, controls)
+            except Exception:
+                pass
             _t_think0 = time.monotonic()  # 计时锚点：思考段起点（感知段结束）
 
             # 2) 思考：问 VLM 下一步动作；非法 JSON 原地重试一次
@@ -996,6 +1251,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                         print("[eyes] 降级模型重试请求失败：%s" % exc)
                 if action is None:
                     print("[eyes] 第 %d 步三次尝试均非法，按 fail 处理" % step)
+                    _ckpt_clear(task)  # 彻底失败（fail_report）：清除检查点
                     return _fail_report(step, "视觉模块连续多次未能给出有效指令",
                                         last_shot, executed)
 
@@ -1034,6 +1290,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                         _skills.record(task, done_steps)
                     except Exception:
                         pass
+                _ckpt_clear(task)  # 任务成功：清除检查点，断点已完成使命
                 return summary
             if action["action"] == "fail":
                 reason = thought or "视觉模块判断无法完成。"
@@ -1064,6 +1321,9 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                             continue
                     print("[eyes] 目标应用缺失：%s" % reason)
                     _print_timing(_t_sense0, _t_think0, _t_act0)
+                    # 补救路径是 open_app 而非断点续跑：清除检查点，
+                    # 避免 hands 误挂「可以续跑」信号
+                    _ckpt_clear(task)
                     return _join_zh(_MSG_FAIL_PREFIX, reason,
                                     "请先让我用 open_app 打开它")
                 # 零动作早退宽限：尚未执行任何物理动作时的 fail 没有副作用，
@@ -1083,6 +1343,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                 _log_epi("error", "任务「%s」失败（第%d步）：%s"
                          % (task[:40], step, reason[:50]))
                 _print_timing(_t_sense0, _t_think0, _t_act0)
+                _ckpt_clear(task)  # VLM 判定彻底失败（fail_report）：清除
                 return _fail_report(step, reason, last_shot, executed)
 
             # 4) 执行动作（FAILSAFE 抛异常即中止）
@@ -1115,6 +1376,7 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
             if len(repeat_sigs) >= 3 and len(set(repeat_sigs[-3:])) == 1:
                 if len(repeat_sigs) >= 4 and len(set(repeat_sigs[-4:])) == 1:
                     print("[eyes] 同一动作连续重复 4 次无效，判定失败")
+                    _ckpt_clear(task)  # 彻底失败（fail_report）：清除检查点
                     return _fail_report(
                         step,
                         "同一操作重复多次均无效（界面无变化），任务目标可能不存在或需要先登录",
@@ -1240,6 +1502,8 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                             handled = False
                     if not handled:
                         if verify_fails >= 2:
+                            # 彻底失败（fail_report）：清除检查点
+                            _ckpt_clear(task)
                             return _fail_report(
                                 step,
                                 "连续两次操作未产生预期效果（期望：%s），"
@@ -1261,6 +1525,13 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                                 "UIA按名吸附" if controls else "纯截图坐标")
                         except Exception:
                             pass
+
+            # 6) 断点续航（B2）：每步结束把「进行到哪一步」落盘——毫秒级，
+            # 相对本步秒级的 VLM 往返可忽略；崩溃时前若干步的物理成果
+            # 还在屏幕上，丢的只是这份状态，resume_perform 从这里接回。
+            # 注意：步数超限 / FAILSAFE / 未预期异常等「非判定性终结」
+            # 有意保留检查点——那正是续跑价值最大的现场
+            _ckpt_save(task, step, history, done_steps, executed, target_hint)
 
         # 步数耗尽仍未 done/fail：超限话术 + 最后判断 + 屏幕状态
         print("[eyes] 步数超出上限 %d，中止" % max_steps)

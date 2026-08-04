@@ -1225,7 +1225,25 @@ def _gui_control(task: str, confirmed: bool = False) -> str:
 
         # 确认后委托眼睛模块执行（步数上限等安全参数用其默认值；
         # 目标应用词一并传入，眼睛每步截屏前做前台保障）
-        return _eyes.perform(task, target_hint=hint)
+        result = _eyes.perform(task, target_hint=hint)
+        # B2 断点续航信号：任务失败 / 超限 / VLM 暂不可用且现场留有
+        # 检查点时，在给 brain 的话术里带上「可从断点续跑」——前若干步的
+        # 物理成果还在屏幕上，续跑比重来便宜得多；彻底失败（fail_report）
+        # 的检查点已被 eyes 清除，不会误挂信号
+        try:
+            import checkpoint as _ckpt_mod
+            _failed = (
+                result.startswith("先生，任务未能完成")
+                or "步数超出安全上限" in result
+                or "视觉模块暂时无法连接" in result
+            )
+            if _failed and _ckpt_mod.load(task):
+                result += ("\n另外先生，这项任务的进度我已保存，"
+                           "若您想继续，随时说「继续刚才的任务」，"
+                           "我可以从断点续跑，不必从头再来。")
+        except Exception:
+            pass
+        return result
     except Exception as e:
         return f"抱歉先生，进行界面操作时出了问题：{e}"
 
