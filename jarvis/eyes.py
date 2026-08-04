@@ -292,9 +292,12 @@ def _ask_vlm_once(image_b64: str, user_text: str, system: str | None,
     失败时抛出异常，由 _ask_vlm 决定降级或上抛。
     """
     cfg = _load_llm_config()
-    url = cfg["base_url"].rstrip("/") + "/chat/completions"
+    # 多引擎支持（A/B 实测）：vision_base_url / vision_api_key 存在时
+    # 视觉走独立引擎（如 Kimi），缺省与大脑同引擎，行为与旧版一致
+    url = str(cfg.get("vision_base_url") or cfg["base_url"]).rstrip("/") \
+        + "/chat/completions"
     headers = {
-        "Authorization": "Bearer " + cfg["api_key"],
+        "Authorization": "Bearer " + str(cfg.get("vision_api_key") or cfg["api_key"]),
         "Content-Type": "application/json",
     }
     payload = {

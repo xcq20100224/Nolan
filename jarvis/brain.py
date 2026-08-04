@@ -690,6 +690,21 @@ def _load_llm_config() -> dict:
         value = os.environ.get(env_name)
         if value:
             cfg[key] = value
+    # 多引擎支持（A/B 实测）：brain_api_key / brain_base_url / brain_model
+    # 存在时大脑走独立引擎（如 Kimi），缺省用主配置，行为与旧版一致；
+    # 视觉/语音引擎不受影响（eyes/mouth 各自读自己的覆盖键）
+    for alt_key, key in (
+        ("brain_api_key", "api_key"),
+        ("brain_base_url", "base_url"),
+        ("brain_model", "model"),
+    ):
+        if cfg.get(alt_key):
+            cfg[key] = cfg[alt_key]
+    # 引擎专属参数隔离：extra_body 是智谱系参数（thinking 开关），
+    # 大脑切到别家引擎时必须用 brain_extra_body 显式指定，否则清空——
+    # 把 GLM 的私有参数发给 Kimi/GPT 会直接 400
+    if cfg.get("brain_base_url"):
+        cfg["extra_body"] = cfg.get("brain_extra_body", "")
     return cfg
 
 
