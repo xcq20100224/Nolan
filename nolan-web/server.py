@@ -423,8 +423,11 @@ def _load_whisper() -> None:
             return
         try:
             from faster_whisper import WhisperModel
-            print("[server] 正在加载 faster-whisper medium 模型（CPU+int8，中文识别精度升级）……")
-            _whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
+            # P5 换代（bench_asr.py 实测数字）：small/beam1 = 1.53x 实时倍率、
+            # 准确率 92%，与 medium/beam5（5.49x/92%）持平但提速 3.6 倍，
+            # 冷启动加载 ~6s（medium 需 ~58s，此前「识别等数十秒」的主因）
+            print("[server] 正在加载 faster-whisper small 模型（CPU+int8，P5 换代：3.6x 提速）……")
+            _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
             _whisper_error = None
             print("[server] faster-whisper 模型加载完成，语音输入就绪。")
         except Exception as e:
@@ -473,7 +476,7 @@ def _transcribe_bytes(audio: bytes, content_type: str) -> str:
                 tmp_path,
                 language="zh",
                 initial_prompt="以下是主人对中文语音助手 Nolan 说的普通话指令。",
-                beam_size=5,
+                beam_size=1,  # P5：small 模型贪心解码实测准确率不降（92%），更快
                 vad_filter=True,  # 过滤静音段，无语音时自然得到空结果
             )
             text = "".join(seg.text for seg in segments).strip()
@@ -633,7 +636,7 @@ def _mic_stop() -> str:
                 audio,
                 language="zh",
                 initial_prompt="以下是主人对中文语音助手 Nolan 说的普通话指令。",
-                beam_size=5,
+                beam_size=1,  # P5：small 模型贪心解码实测准确率不降（92%），更快
                 vad_filter=True,  # 过滤静音段，无语音时自然得到空结果
             )
             text = "".join(seg.text for seg in segments).strip()
@@ -649,7 +652,8 @@ def _mic_stop() -> str:
 # 与指令录音同模型，唤醒时指令录音暂停耳蜗防抢麦）。
 # 自我触发防护：Nolan 自己播报的音频也含「诺兰」——每次回复/问候/闹钟后
 # 暂停耳蜗一个与播报时长匹配的窗口，绝不陷入「自己叫醒自己」的循环。
-_WAKE_KEYWORDS = ("诺兰", "nolan", "诺蓝", "挪兰", "脑兰")
+_WAKE_KEYWORDS = ("诺兰", "nolan", "诺蓝", "挪兰", "脑兰", "洛兰", "罗兰")
+                                    # 「洛兰/罗兰」：small 模型对唤醒词的同音误识（P5 实测）
 _WAKE_STATE_FILE = os.path.join(_JARVIS_DIR, "memory", "wake_state.json")
 _WAKE_ACK = "在的，先生，请讲。"
 _WAKE_RMS_GATE = 0.012          # 语音能量门（float32 RMS，低于视为静音）

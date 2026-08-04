@@ -29,7 +29,10 @@ import sounddevice as sd
 静音结束秒 = 1.0          # 语音后连续静音多久判定“说完了”
 最长句子秒 = 15.0         # 单句最长录音时长，防止无限录音
 
-模型名称 = "medium"        # faster-whisper small，本地已缓存
+模型名称 = "small"         # P5 换代：实测 small/beam1 = 1.53x 实时倍率、准确率 92%，
+                           # 与 medium/beam5（5.49x/92%）准确率持平、提速 3.6 倍；
+                           # 冷启动加载也从 ~58s 降到 ~6s。medium 的 CPU 延迟是
+                           # 语音链路最大瓶颈，benchmark 数字见 bench_asr.py
 模型设备 = "cpu"
 模型精度 = "int8"
 
@@ -219,7 +222,7 @@ def _转写(音频: np.ndarray) -> str | None:
             音频,
             language="zh",
             vad_filter=True,
-            beam_size=5,
+            beam_size=1,  # P5：small 模型贪心解码实测准确率不降（92%），更快
         )
         文本 = "".join(片段.text for 片段 in 片段们).strip()
         return 文本 if 文本 else None
