@@ -29,6 +29,27 @@ import ctypes
 import comtypes
 import comtypes.client
 
+# UIA 类型库（UIAutomationCore.dll 内嵌）：缓存丢失/损坏时用它再生 comtypes.gen
+_UIA_TYPELIB_GUID = "{944DE083-8FB8-45CF-BCB7-C477ACB2F897}"
+
+
+def _import_uia_module():
+    """导入 comtypes.gen.UIAutomationClient，失败时再生缓存后重试。
+
+    第一性原理：comtypes.gen 只是类型库的「编译缓存」，唯一事实是
+    UIAutomationCore.dll 本身——缓存没了就从 dll 重新生成，
+    不因环境层面的缓存损坏（Typelib different than module）而瘫痪。
+    """
+    try:
+        import comtypes.gen.UIAutomationClient as UIA
+        return UIA
+    except Exception:
+        pass
+    # 缓存缺失或损坏：直接从 dll 的类型库再生（幂等，已存在则跳过生成）
+    comtypes.client.GetModule((_UIA_TYPELIB_GUID, 1, 0))
+    import comtypes.gen.UIAutomationClient as UIA
+    return UIA
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
@@ -199,7 +220,7 @@ def dump_window_controls(hwnd_or_title=None, max_items: int = 40) -> list:
         return []
     comtypes.CoInitialize()  # 幂等：每次调用独立初始化，控件对象不跨调用缓存
     try:
-        import comtypes.gen.UIAutomationClient as UIA
+        UIA = _import_uia_module()
 
         if hwnd_or_title is None:
             hwnd = _foreground_hwnd()
