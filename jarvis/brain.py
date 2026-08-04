@@ -37,6 +37,7 @@ import os
 import re
 import json
 import random
+import threading
 import time
 import urllib.parse
 
@@ -51,6 +52,11 @@ try:
     import memory  # 阶段三「长期记忆」模块（由并行工程师编写，按契约调用）
 except ImportError:  # pragma: no cover - memory 未就绪时大脑仍可降级运行
     memory = None
+
+try:
+    import memory_v2  # Gap3 结构化长期记忆（画像注入 + 轮后萃取）
+except ImportError:  # pragma: no cover - 未就绪时降级，行为与旧版一致
+    memory_v2 = None
 
 try:
     import reminders  # 阶段四「主动提醒」模块（由并行工程师编写，按契约调用）
@@ -597,6 +603,14 @@ def _build_system_prompt() -> str:
             mem_text = ""
         if mem_text:
             prompt += "\n以下是你对主人的长期记忆：\n" + mem_text[:_MEMORY_LIMIT]
+    # Gap3 结构化画像注入：偏好/习惯/人物的浓缩摘要，与上面的逐行记忆互补
+    if memory_v2 is not None:
+        try:
+            profile = memory_v2.profile_summary().strip()
+        except Exception:  # pragma: no cover - 画像异常视为无画像
+            profile = ""
+        if profile:
+            prompt += "\n以下是你对主人的画像摘要（偏好与习惯）：\n" + profile
     if hands is None:
         return prompt
     tool_lines = "\n".join(
@@ -1067,9 +1081,34 @@ def _answer_from_search(query: str) -> str:
     return "先生，我查到以下内容（总结失败，给您原文要点）：" + result[:300]
 
 
-def think(user_text: str, history: list[dict]) -> str:
+def glm_one_shot(prompt: str) -> str | None:
     """
-    Nolan 大脑主入口。
+    单发 GLM 调用：prompt 进、文本出（无历史、无工具、无 Agent 循环）。
+    供记忆萃取（memory_v2）与主动性生成（proactive）等轻量场景复用；
+    任何失败返回 None，调用方自行降级。
+    """
+    cfg = _load_llm_config()
+    if not cfg.get("api_key"):
+        return None
+    base_url = cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
+    headers = {"Authorization": "Bearer " + cfg["api_key"],
+               "Content-Type": "application/json"}
+    payload = {
+        "model": cfg.get("model", "gpt-4o-mini"),
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    extra = cfg.get("extra_body")
+    if extra:
+        try:
+            payload.update(json.loads(extra))
+        except ValueError:
+            pass
+    return _request_llm(base_url + "/chat/completions", payload, headers)
+
+
+def _think_impl(user_text: str, history: list[dict]) -> str:
+    """
+    Nolan 大脑主入口（实现体；公开入口 think 在其外挂了记忆萃取钩子）。
 
     参数：
         user_text: 用户说的一句话（中文文本）。
@@ -1147,3 +1186,26 @@ def think(user_text: str, history: list[dict]) -> str:
 
     # 8. 规则闲聊兜底
     return random.choice(_FALLBACK_REPLIES).format(text=text)
+
+
+def think(user_text: str, history: list[dict]) -> str:
+    """
+    大脑公开入口（Gap3 记忆萃取钩子）。
+
+    第一性原理：萃取每轮要花一次 GLM 调用（秒级），绝不能加在
+    回复链路上——那是用户能感知的延迟税。因此萃取放守护线程
+    异步进行，回复延迟零增加；萃取失败只损失一条记忆，不影响对话。
+    """
+    reply = _think_impl(user_text, history)
+    if memory_v2 is not None and reply and reply != EXIT_SIGNAL:
+        u, a = user_text, reply
+
+        def _extract():
+            try:
+                for item in memory_v2.extract_from_turn(u, a, llm_caller=glm_one_shot):
+                    memory_v2.remember(**item)
+            except Exception as exc:  # pragma: no cover - 萃取失败静默降级
+                print("[brain] 记忆萃取异常（已跳过）：%s" % exc)
+
+        threading.Thread(target=_extract, daemon=True, name="memory-extract").start()
+    return reply

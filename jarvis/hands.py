@@ -1144,6 +1144,18 @@ def _ensure_app_ready(hint: str) -> None:
             f"[hands] 等待 {_WINDOW_WAIT_MAX_SECONDS} 秒后仍未看到「{hint}」的窗口，"
             "继续交给眼睛模块判断。"
         )
+        # 可靠性台账（Gap2，仅日志不阻断）：前导超时归类物理原因——
+        # 进程活着但窗口不出现是「应用未响应」型（可能卡在托盘/启动页），
+        # 进程都没有是「目标未出现」型（启动链整体失败）
+        try:
+            import reliability as _rel_mod
+            alive = any(_process_running(x)
+                        for x in _exe_candidates(_resolve_alias(hint), []))
+            cat = (_rel_mod.APP_NOT_RESPONDING if alive
+                   else _rel_mod.TARGET_MISSING)
+            print(f"[hands] 前导超时分类：{_rel_mod.CATEGORY_CN.get(cat, cat)}")
+        except Exception:
+            pass
     except Exception:
         pass
 

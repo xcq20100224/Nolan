@@ -25,6 +25,16 @@ API 契约（一字不差）：
     POST /api/chat       请求 {"text": "..."} → 响应 {"reply": str, "audio_url": str|null}
                          若 brain 返回 '__EXIT__' → {"reply": "道别语", "audio_url": str|null, "exit": true}
                          （audio_url 为 TTS 合成音频的 URL，合成失败为 null）
+    POST /api/chat/stream 请求 {"text": "..."} → SSE（text/event-stream，Connection: close 终止）
+                         句级流式对话：LLM 边产出 token、后端边切句边合成、合成好一句推一句。
+                         事件序列（每事件一行 'data: <json>\n\n'）：
+                           {"type":"delta","text":...}                LLM 增量文本（字幕逐字出现）
+                           {"type":"sentence","text":...,"audio_url":...}  一句合成完毕（audio_url 可空）
+                           {"type":"done","reply":...,"degraded"?:true} 全量收尾
+                           {"type":"fallback","reply","audio_url","exit"?} 回退整段
+                         回退契约：规则意图（提醒/记忆/工具/复合/退出/待确认）与流式
+                         早期失败一律回退到与 /api/chat 完全相同的整段路径（brain.think +
+                         synth_for），以 fallback 事件下发——对话绝不因流式化而挂掉。
     GET  /api/due        → {"messages": [{"text": str, "audio_url": str|null}]}（到点提醒，无则 []）
                          到点消息服务端音箱连续播报两遍（闹钟式，间隔 0.5 秒）
     GET  /api/sound_test → {"audio_url": str|null, "speaker": true}
@@ -56,6 +66,9 @@ import atexit
 import hashlib
 import json
 import os
+import queue
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -75,11 +88,20 @@ import brain       # noqa: E402  大脑：think(user_text, history) -> str
 import reminders   # noqa: E402  提醒：check_due / list_pending / add
 import memory      # noqa: E402  记忆：recall / load / remember / forget
 
+try:
+    import memory_v2  # noqa: E402  Gap3 结构化长期记忆（画像/萃取）
+except ImportError:
+    memory_v2 = None
+try:
+    import proactive  # noqa: E402  Gap4 主动性引擎（三重闸门 + 注入式生成）
+except ImportError:
+    proactive = None
+
 # == 后端代码版本标识 ==
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-02-j5"
+_VERSION = "2026-08-04-gap34"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -983,7 +1005,8 @@ def _chat(user_text: str) -> dict:
     audio_url 为 TTS 发声链合成的回复语音（缓存复用），合成失败为 None。
     回复语音只由浏览器播放（单通道），服务端音箱仅用于闹钟提醒。
     """
-    global _history
+    global _history, _last_user_activity
+    _last_user_activity = time.time()  # Gap4：主动性「刚交互过不打扰」闸门依据
     user_text = (user_text or "").strip()
     if not user_text:
         reply = "先生，您似乎还没有说话，请输入内容后再发送。"
@@ -1021,6 +1044,294 @@ def _chat(user_text: str) -> dict:
     return {"reply": reply, "audio_url": synth_for(reply)}
 
 
+# == 句级流式对话（/api/chat/stream · Gap1 流式化网页版）==
+#
+# 第一性原理：出声延迟 = 首个音符出现的时间。整段路径把「等 LLM 想完全文」
+# 和「等 TTS 合完全文」两笔税串行叠加（148 字长回复实测 5.8 秒才出声）。
+# 句级流水线把三件事重叠：LLM 边产出 token（stream=True），后端边按句尾
+# 标点切句，TTS 生产线程合成好一句立刻推给前端播放——长回复的出声延迟
+# 与全文长度解耦，只剩「首句 LLM 产出 + 首句合成」（2 秒级）。
+#
+# 零件复用（不重造轮子）：切句法则与 mouth._split_sentences 一致（句尾标点
+# 触发、<8 字碎片并入下句）；单句合成用 mouth._synthesize_sentence_to_file
+# （GLM-TTS→edge 两级链）；系统提示/历史/模型配置直接读 brain 的纯函数。
+#
+# 分流契约：只有「纯闲聊/问答」走流式。规则意图（提醒落库、记忆、条件触发、
+# 工具执行、复合任务、退出、待确认）在 brain.think 内有确定性行为，流式直答
+# 会绕过它们——预检命中一律回退整段（fallback 事件），行为与 /api/chat 一致。
+
+# 短句碎片阈值：与 mouth 保持一致（模块不可用时取默认 8）
+_STREAM_MIN_SENTENCE_CHARS = getattr(mouth, "_MIN_SENTENCE_CHARS", 8) if mouth else 8
+
+
+class _SentenceStreamer:
+    """增量切句器：与 mouth._split_sentences 同一刀法（句尾标点触发，<8字碎片并入下句）。
+
+    feed(piece) 喂入 LLM 增量文本，返回新凑齐的完整句列表（可空）；
+    flush() 取流尾残余（短回复在此凑成唯一一句），无残余返回 None。
+    第一性原理：句尾标点是「可以开口说」的最小信号——等整段是等全文最后一个
+    标点，等句级只等本句最后一个标点。
+    """
+
+    _ENDINGS = "。！？；!?;\n"  # 与 mouth._split_sentences 的切分字符一致
+
+    def __init__(self) -> None:
+        self._buf = ""    # 未成句的累积文本
+        self._carry = ""  # 过短碎片暂存（并入下一句，与 mouth 合并规则一致）
+
+    def feed(self, piece: str) -> list:
+        out = []
+        self._buf += piece
+        while True:
+            cut = -1
+            for i, ch in enumerate(self._buf):
+                if ch in self._ENDINGS:
+                    cut = i
+                    break
+            if cut < 0:
+                break
+            sentence = self._buf[:cut + 1]
+            self._buf = self._buf[cut + 1:]
+            merged = (self._carry + sentence).strip()
+            if len(merged) < _STREAM_MIN_SENTENCE_CHARS:
+                self._carry = merged  # 碎片继续暂存，等下一句并入（防启播断续感）
+            else:
+                out.append(merged)
+                self._carry = ""
+        return out
+
+    def flush(self):
+        tail = (self._carry + self._buf).strip()
+        self._carry = ""
+        self._buf = ""
+        return tail or None
+
+
+def _sse_encode(obj: dict) -> bytes:
+    """把事件对象编码为一行 SSE 帧（'data: <json>\\n\\n'，UTF-8）。"""
+    return ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
+
+
+def _stream_hit_rule_intent(text: str) -> bool:
+    """流式分流预检（只读 brain 的纯函数/常量，零副作用，不改 brain 一个字节）。
+
+    命中大脑规则层意图（退出/待确认/复合/记忆/提醒/触发/规则工具/搜写通道）
+    的输入必须走 brain.think 的确定性路径——流式直答会绕过提醒落库、工具执行
+    等行为。预检本身异常时保守返回 True（回退整段，绝不让对话挂掉）。
+    """
+    try:
+        if getattr(brain, "_pending_shell", None) is not None:
+            return True  # 有待确认事项：确认/取消必须进 brain 的状态机
+        if any(p in text for p in getattr(brain, "_EXIT_PATTERNS", ())):
+            return True  # 退出意图：走 _chat 的道别语 + exit 契约
+        if brain._is_composite(text):
+            return True  # 复合任务：分层规划器/Agent 循环，不可流式直答
+        # 记忆意图（与 _handle_memory_intent 同触发词，只判不执行）
+        if ("记住" in text
+                or any(k in text for k in getattr(brain, "_RECALL_KEYS", ()))
+                or any(k in text for k in getattr(brain, "_FORGET_KEYS", ()))):
+            return True
+        # 提醒意图（提醒我 / 设…提醒 / 闹钟叫醒 / 提醒查询）
+        if "提醒我" in text or any(k in text for k in getattr(brain, "_REMIND_LIST_KEYS", ())):
+            return True
+        if re.search(r"设(?:一个|个|置|一下)?.+?的?提醒", text):
+            return True
+        if brain._extract_alarm_raw(text) is not None:
+            return True
+        # 条件触发意图（触发词+动作词双闸门，与 brain 同一判定）
+        if any(k in text for k in getattr(brain, "_TRIGGER_LIST_KEYS", ())):
+            return True
+        if (any(k in text for k in getattr(brain, "_TRIGGER_KEYS", ()))
+                and any(k in text for k in getattr(brain, "_TRIGGER_ACTION_KEYS", ()))):
+            return True
+        # 规则工具意图（时间/媒体/打开/搜索/文件/命令，只解析不执行）
+        if brain._parse_intent(text) is not None:
+            return True
+        # 「搜 X 写到 F」快速通道
+        if brain._parse_search_write(text) is not None:
+            return True
+        return False
+    except Exception as e:
+        print(f"[server] 流式预检异常（保守回退整段）：{e}")
+        return True
+
+
+def _stream_llm_ready() -> bool:
+    """流式所需的大模型配置是否齐备（有 api_key 即可）；异常按不可用处理。"""
+    try:
+        cfg = brain._load_llm_config()
+        return bool(cfg.get("api_key"))
+    except Exception:
+        return False
+
+
+def _synth_sentence_url(text: str):
+    """单句合成 → 可服务 URL（'/api/tts/<sha1>.wav|.mp3'）；全链失败返回 None。
+
+    三级保障：
+      ① sha1 缓存命中零合成（毫秒级）；
+      ② mouth._synthesize_sentence_to_file（GLM-TTS→edge 两级链），产物从系统
+         临时目录搬进 TTS 缓存目录并按 sha1 命名——与既有缓存契约一致，
+         _serve_tts 可直接服务，同文本下次直接命中；
+      ③ 两级全失败回退 synth_for（追加 SAPI 离线兜底）——单句失声可能性压到最低。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    hit = _tts_cached_url(text)
+    if hit:
+        return hit
+    tmp = None
+    if mouth is not None and hasattr(mouth, "_synthesize_sentence_to_file"):
+        try:
+            tmp = mouth._synthesize_sentence_to_file(text)
+        except Exception as e:
+            print(f"[server] 句级合成异常（回退 synth_for）：{e}")
+            tmp = None
+    if tmp:
+        ext = os.path.splitext(tmp)[1].lower()
+        if ext in (".wav", ".mp3"):
+            name = hashlib.sha1(text.encode("utf-8")).hexdigest() + ext
+            dest = os.path.join(_TTS_CACHE_DIR, name)
+            try:
+                os.makedirs(_TTS_CACHE_DIR, exist_ok=True)
+                if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                    os.remove(tmp)  # 并发下已有同文本产物：用现成的，丢弃重复品
+                else:
+                    shutil.move(tmp, dest)
+                return "/api/tts/" + name
+            except OSError as e:
+                print(f"[server] 句级产物入库失败（回退 synth_for）：{e}")
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        else:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    # 兜底：synth_for 自带 GLM→edge→SAPI 三级链（声音必达底线不破）
+    return synth_for(text)
+
+
+def _llm_stream_worker(user_text: str, history: list, splitter: _SentenceStreamer,
+                       sentence_q: "queue.Queue", event_q: "queue.Queue",
+                       cancel: threading.Event) -> None:
+    """LLM 流式消费线程：GLM stream=True 边收 token 边推 delta、边切句边投合成队列。
+
+    回退契约：
+      - 回复以 '{' 开头（系统提示约束下的工具 JSON）→ 发 abort，整段回退
+        brain.think（此时无任何 delta 出场，回退不会重复发声）；
+      - 网络/格式异常：未产出任何内容 → abort 整段回退；已有产出 → 按现有内容
+        收尾（done 事件由收尾逻辑发），绝不把对话挂掉；
+      - 消息构造与 brain._think_via_llm 同配方（系统提示 + 近 10 轮历史 +
+        extra_body 透传），只读 brain 纯函数，不改 brain。
+    """
+    full = ""
+    emitted = False  # 是否已有 delta 出场（决定失败时能否安全整段回退）
+    try:
+        cfg = brain._load_llm_config()
+        base_url = (cfg.get("base_url") or "").rstrip("/")
+        model = cfg.get("model") or "glm-5.2"
+        messages = [{"role": "system", "content": brain._build_system_prompt()}]
+        for turn in (history or [])[-getattr(brain, "_HISTORY_TURNS", 10):]:
+            role = turn.get("role")
+            content = turn.get("content")
+            if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": user_text})
+        payload = {"model": model, "messages": messages, "temperature": 0.7, "stream": True}
+        # extra_body 透传（与 brain 同一扩展点，如关闭思考型推理加速）
+        extra_body = cfg.get("extra_body")
+        if extra_body:
+            try:
+                extra = json.loads(extra_body)
+                if isinstance(extra, dict):
+                    payload.update(extra)
+            except ValueError:
+                pass  # 配置写错时静默忽略，不阻断对话（与 brain 一致）
+        headers = {"Authorization": f"Bearer {cfg['api_key']}",
+                   "Content-Type": "application/json"}
+        import httpx  # 既有依赖，局部导入与模块风格一致
+        with httpx.stream("POST", base_url + "/chat/completions",
+                          json=payload, headers=headers,
+                          timeout=getattr(brain, "_API_TIMEOUT", 60.0)) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if cancel.is_set():
+                    return  # 前端已打断/断开：即刻止损，不再烧 token
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    delta = chunk["choices"][0].get("delta") or {}
+                except (ValueError, KeyError, IndexError):
+                    continue  # 心跳/畸形分片跳过，不中断整流
+                piece = delta.get("content") or ""
+                if not piece:
+                    continue  # reasoning_content 等思考分片：不上字幕、不出声
+                full += piece
+                # 工具 JSON 侦测：回复以 '{' 开头必是执行指令，流式无法执行工具——
+                # 立即中止，整段回退 brain.think 走 Agent 循环
+                if full.lstrip().startswith("{"):
+                    print("[server] 流式检出工具 JSON，中止流式并整段回退。")
+                    event_q.put(("abort", "tool-json"))
+                    return
+                emitted = True
+                event_q.put(("delta", piece))
+                for s in splitter.feed(piece):
+                    sentence_q.put(s)
+    except Exception as e:
+        print(f"[server] LLM 流式异常：{type(e).__name__}: {e}")
+        if not emitted:
+            event_q.put(("abort", "stream-failed"))
+            return
+        print("[server] 已有部分内容出场，按现有内容收尾（degraded）。")
+    finally:
+        # 流尾残余作为最后一句投递（闲聊短回复在此凑成唯一一句，零额外延迟）
+        try:
+            tail = splitter.flush()
+            if tail and not cancel.is_set():
+                sentence_q.put(tail)
+        except Exception:
+            pass
+        sentence_q.put(None)  # 生产结束哨兵（任何退出路径都送达，防生产线程干等）
+        if full:
+            event_q.put(("llm_done", full))
+        else:
+            # 空回复（流正常结束却无一字）：等同失败，整段回退
+            event_q.put(("abort", "empty"))
+
+
+def _tts_stream_producer(sentence_q: "queue.Queue", event_q: "queue.Queue",
+                         cancel: threading.Event) -> None:
+    """TTS 生产线程（单线程保序）：逐句合成，合成好一句立刻推 sentence 事件。
+
+    为什么单线程：句子的出声顺序必须等于语序——多生产者并发合成会让
+    完成顺序乱掉（短句后来先出），前端队列播放就会倒序。GLM-TTS 实测
+    ~26ms/字，单句合成远快于单句播放，单生产者始终跑在播放前面。
+    """
+    while True:
+        sentence = sentence_q.get()
+        if sentence is None:
+            break  # 哨兵：LLM 侧已投完全部句子
+        if cancel.is_set():
+            continue  # 已取消：排空队列直至哨兵，不再合成
+        url = _synth_sentence_url(sentence)
+        # 回声登记：打断侦测以「正在播什么」为判定依据（与 /api/chat 登记语义一致）
+        try:
+            _note_speaking(sentence)
+            _wake_pause_for(2 + len(sentence) * 0.3)
+        except Exception:
+            pass
+        event_q.put(("sentence", (sentence, url)))
+    event_q.put(("tts_done", None))
+
+
 # == 条件触发后台检查（P4 · 主动性进阶）==
 # 为什么独立线程：条件评估要走 LLM 联网搜索（秒级），放进 /api/due 会挂住
 # 15 秒轮询、占满浏览器连接池（此前 TTS 同步合成挂死全链路的教训）。
@@ -1028,6 +1339,11 @@ def _chat(user_text: str) -> dict:
 # 音箱通道同步播报两遍（闹钟语义：必被听见）。
 _trigger_fired = _collections.deque(maxlen=20)
 _trigger_fired_lock = threading.Lock()
+
+# Gap4 主动性：用户最近活动时刻（epoch 秒），供 should_initiate 的
+# 「用户刚交互过不打扰」闸门判定；_chat 与流式入口每轮对话更新
+_last_user_activity = 0.0
+_last_initiative = 0.0
 
 
 def _trigger_loop() -> None:
@@ -1050,6 +1366,28 @@ def _trigger_loop() -> None:
                 # 此处不单独播报（否则与 /api/due 的播报叠音）
         except Exception as e:
             print("[triggers] 检查异常（下轮继续）：%s" % e)
+        # Gap4 主动性：触发器之外，Nolan 也会基于记忆主动开口。
+        # 与触发器共用同一条出队通道（/api/due），不新增投递路径；
+        # 三重闸门（速率/安静时段/用户刚交互）在 proactive 内部把关，
+        # 这里只负责「该不该开口 → 生成 → 入队」，生成失败沉默不打扰。
+        if proactive is not None and memory_v2 is not None:
+            try:
+                ctx = {
+                    "now": time.time(),
+                    "last_user_activity": _last_user_activity,
+                    "last_initiative": _last_initiative,
+                    "profile": memory_v2.profile_summary(),
+                    "due_messages": list(_trigger_fired),
+                }
+                if proactive.should_initiate(ctx):
+                    msg = proactive.generate_initiative(ctx, brain.glm_one_shot)
+                    if msg:
+                        with _trigger_fired_lock:
+                            _trigger_fired.append(msg)
+                        _last_initiative = time.time()
+                        print("[proactive] 主动开口：%s" % msg[:40])
+            except Exception as e:
+                print("[proactive] 主动性评估异常（下轮继续）：%s" % e)
         time.sleep(60)
 
 
@@ -1196,6 +1534,115 @@ class NolanHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    # -- 句级流式对话（SSE）--
+
+    def _sse_send(self, obj: dict) -> None:
+        """写一条 SSE 事件。wfile 无缓冲（wbufsize=0）直达 socket，写完即出场。
+        客户端断开时抛 BrokenPipeError/ConnectionResetError，由调用方取消流水线。"""
+        self.wfile.write(_sse_encode(obj))
+
+    def _handle_chat_stream(self) -> None:
+        """POST /api/chat/stream：句级流式对话（事件契约见文件头 API 契约段）。
+
+        线程分工（单一写者原则：只有本处理器线程碰 wfile，杜绝交错写帧）：
+          LLM 线程   —— 边收 token 边把 delta/abort/llm_done 投进 event_q，
+                        凑齐的句子投进 sentence_q；
+          TTS 线程   —— 单线程保序合成，sentence/tts_done 投进 event_q；
+          本线程     —— 从 event_q 取事件逐条写 SSE，两个 done 齐后写 done 收尾。
+        任何写失败（客户端断开）→ 置 cancel，两线程各自止损退出（守护线程）。
+        """
+        global _history, _last_user_activity  # 历史落账在方法尾部；方法前部仅读快照
+        _last_user_activity = time.time()  # Gap4：主动性「刚交互过不打扰」闸门依据
+        try:
+            data = self._read_json_body()
+        except ValueError as e:
+            self._send_error_json(400, str(e))
+            return
+        user_text = str(data.get("text", "") or "").strip()
+
+        # SSE 响应头：无 Content-Length，Connection: close 让「关闭即 EOF」，
+        # 绕开标准库不支持 chunked 的短板；ThreadingHTTPServer 每连接一线程，关闭无碍
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        cancel = threading.Event()
+        try:
+            # 分流：空文本 / 规则意图 / 无大模型配置 → 与 /api/chat 完全相同的整段路径，
+            # 以 fallback 事件下发（前端按普通回复处理，行为一字不差）
+            if (not user_text or _stream_hit_rule_intent(user_text)
+                    or not _stream_llm_ready()):
+                self._sse_send({"type": "fallback", **_chat(user_text)})
+                return
+
+            # 新消息进场先打断音箱正在进行的播报（与 _chat 同一语义）
+            if mouth is not None:
+                try:
+                    mouth.interrupt()
+                except Exception:
+                    pass
+
+            sentence_q: "queue.Queue" = queue.Queue()
+            event_q: "queue.Queue" = queue.Queue()
+            splitter = _SentenceStreamer()
+            threading.Thread(
+                target=_llm_stream_worker,
+                args=(user_text, list(_history), splitter, sentence_q, event_q, cancel),
+                daemon=True, name="chat-stream-llm",
+            ).start()
+            threading.Thread(
+                target=_tts_stream_producer,
+                args=(sentence_q, event_q, cancel),
+                daemon=True, name="chat-stream-tts",
+            ).start()
+
+            reply = ""
+            llm_done = False
+            tts_done = False
+            while not (llm_done and tts_done):
+                kind, payload = event_q.get()
+                if kind == "delta":
+                    self._sse_send({"type": "delta", "text": payload})
+                elif kind == "sentence":
+                    self._sse_send({"type": "sentence", "text": payload[0],
+                                    "audio_url": payload[1]})
+                elif kind == "abort":
+                    # 流式早期失败/工具 JSON/空回复：整段回退（此刻无任何内容出场，
+                    # _chat 重走 brain.think + synth_for，不会重复发声）
+                    cancel.set()
+                    self._sse_send({"type": "fallback", **_chat(user_text)})
+                    return
+                elif kind == "llm_done":
+                    reply = payload
+                    llm_done = True
+                elif kind == "tts_done":
+                    tts_done = True
+
+            # 历史落账：与 /api/chat 同一把锁串行化、同一裁剪规则
+            with _brain_lock:
+                _history.append({"role": "user", "content": user_text})
+                _history.append({"role": "assistant", "content": reply})
+                if len(_history) > _HISTORY_MAX_TURNS * 2:
+                    _history = _history[-_HISTORY_MAX_TURNS * 2:]
+            self._sse_send({"type": "done", "reply": reply})
+        except (BrokenPipeError, ConnectionResetError):
+            cancel.set()  # 客户端断开：止损，LLM/TTS 线程各自退出
+        except Exception as e:
+            cancel.set()
+            print(f"[server] 流式对话处理异常：{type(e).__name__}: {e}")
+            # 响应头已发，只能尽力补一条 error 事件，前端按失败提示处理
+            try:
+                self._sse_send({"type": "error",
+                                "message": f"流式对话出错了：{e}"})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
     # -- 方法分发 --
 
     def do_OPTIONS(self):
@@ -1307,7 +1754,10 @@ class NolanHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
-            if path == "/api/chat":
+            if path == "/api/chat/stream":
+                # 句级流式对话（SSE）：LLM 边想、TTS 边产、前端边播
+                self._handle_chat_stream()
+            elif path == "/api/chat":
                 try:
                     data = self._read_json_body()
                 except ValueError as e:

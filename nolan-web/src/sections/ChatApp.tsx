@@ -8,7 +8,7 @@ import HistoryOverlay from '@/sections/HistoryOverlay'
 import NegaInput from '@/sections/NegaInput'
 import type { WaveMode } from '@/sections/WaveCanvas'
 import type { Message } from '@/types/message'
-import { checkHealth, sendChat, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, stopAllAudio, stopSpeak, soundTest, getBackground, clientLog } from '@/lib/api'
+import { checkHealth, sendChatStream, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, enqueueAudio, stopAllAudio, stopSpeak, soundTest, getBackground, clientLog } from '@/lib/api'
 
 /** 当前时间，格式 HH:MM（24 小时制） */
 function nowHHMM(): string {
@@ -71,15 +71,23 @@ export default function ChatApp() {
   // 会话结束后不再追加任何消息
   const exitedRef = useRef(false)
 
+  /** 当前流式请求的中止器：新消息进场时中止未完成的上一轮 */
+  const streamAbortRef = useRef<AbortController | null>(null)
+
   /** 追加一条 Nolan 消息 */
   const pushNolan = useCallback((text: string) => {
     if (exitedRef.current) return
     setMessages((prev) => [...prev, { id: nextId(), role: 'nolan', text, time: nowHHMM() }])
   }, [])
 
-  /** 发送用户消息并请求 brain 回复 */
+  /** 发送用户消息并请求 brain 回复（句级流式：LLM 边想、TTS 边产、喇叭边播） */
   const handleSend = useCallback(async (text: string) => {
     if (exitedRef.current) return
+
+    // 0. 新一轮开口即打断上一轮：中止未完成的流式请求 + 清空浏览器播报队列 + 服务端音箱
+    streamAbortRef.current?.abort()
+    stopAllAudio()
+    stopSpeak()
 
     // 1. 插入用户消息
     setMessages((prev) => [...prev, { id: nextId(), role: 'user', text, time: nowHHMM() }])
@@ -92,31 +100,56 @@ export default function ChatApp() {
     ])
     setBusy(true)
 
-    // 3. 请求后端，用真实回复替换占位
+    // 3. 流式请求：delta 逐字上字幕，sentence 逐句排队播，fallback 按整段处理
+    let acc = ''
+    const ctrl = new AbortController()
+    streamAbortRef.current = ctrl
+    const patchReply = (replyText: string) =>
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === placeholderId ? { ...m, text: replyText, time: nowHHMM(), pending: false } : m,
+        ),
+      )
     try {
-      const data = await sendChat(text)
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === placeholderId ? { ...m, text: data.reply, time: nowHHMM(), pending: false } : m,
-        ),
+      await sendChatStream(
+        text,
+        {
+          // LLM 增量文本：字幕逐字出现（不等任何音频，感知延迟的第一刀）
+          onDelta: (piece) => {
+            acc += piece
+            patchReply(acc)
+          },
+          // 一句合成好即入队播放（playInSequence 的边收边播动态队列版）
+          onSentence: (s) => {
+            if (s.audio_url) enqueueAudio(s.audio_url)
+          },
+          // 全量收尾：以服务端权威全量文本为准
+          onDone: (d) => {
+            if (d.reply) {
+              acc = d.reply
+              patchReply(d.reply)
+            }
+          },
+          // 回退整段：规则意图/工具调用/流式失败——行为与旧 /api/chat 完全一致
+          onFallback: (d) => {
+            acc = d.reply
+            patchReply(d.reply)
+            if (d.audio_url) playAudio(d.audio_url)
+            if (d.exit) {
+              exitedRef.current = true
+              setExited(true)
+            }
+          },
+        },
+        ctrl.signal,
       )
-      // 4. 回复语音：audio_url 非空立即播放（edge-tts 合成，失败被拦截时静默）
-      if (data.audio_url) playAudio(data.audio_url)
-      // 5. 退出意图：展示道别语后禁用输入
-      if (data.exit) {
-        exitedRef.current = true
-        setExited(true)
-      }
     } catch {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === placeholderId
-            ? { ...m, text: '先生，后端暂时无响应，请稍后再试。', time: nowHHMM(), pending: false }
-            : m,
-        ),
-      )
+      // 被自己打断（新一轮已接管）：静默，不覆盖新消息
+      if (ctrl.signal.aborted) return
+      patchReply('先生，后端暂时无响应，请稍后再试。')
     } finally {
-      setBusy(false)
+      // 只有当前这一轮仍是最新轮时才收尾 busy（防老轮 finally 抢掉新轮的律动）
+      if (streamAbortRef.current === ctrl) setBusy(false)
     }
   }, [])
 
@@ -125,7 +158,7 @@ export default function ChatApp() {
     if (bootedRef.current) return
     bootedRef.current = true
 
-    clientLog('页面加载 build 0803-1')
+    clientLog('页面加载 build 0804-1')
     checkHealth().then((ok) => {
       clientLog(`健康检查: ${ok}`)
       setOnline(ok)
@@ -344,7 +377,7 @@ export default function ChatApp() {
 
         {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
         <span className="pointer-events-none absolute bottom-2 right-3 text-[10px] font-light tracking-widest text-[#3a3a40]">
-          build 0803-1
+          build 0804-1
         </span>
       </div>
     </div>

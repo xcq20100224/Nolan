@@ -95,6 +95,86 @@ export async function sendChat(
   })
 }
 
+/** 句级流式对话的事件回调（/api/chat/stream，SSE） */
+export interface StreamChatHandlers {
+  /** LLM 增量文本：字幕逐字出现，不等音频 */
+  onDelta?: (piece: string) => void
+  /** 一句合成完毕：audio_url 非空即可 enqueueAudio 排队播放 */
+  onSentence?: (sentence: { text: string; audio_url: string | null }) => void
+  /** 全量收尾：reply 为完整回复（degraded 表示流中断按部分内容收尾） */
+  onDone?: (d: { reply: string; degraded?: boolean }) => void
+  /** 回退整段：与 /api/chat 响应完全同形（规则意图/工具调用/流式早期失败） */
+  onFallback?: (d: { reply: string; audio_url: string | null; exit?: boolean }) => void
+}
+
+/**
+ * 句级流式聊天：POST /api/chat/stream（SSE，fetch + ReadableStream 手解分帧）。
+ * LLM 边产出边推 delta，后端句级流水线合成好一句推一句，前端边收边播。
+ * 回退契约：旧后端无端点（404）时自动改走 sendChat 整段并以 onFallback 上交——
+ * 对话绝不因流式化而挂掉。signal 用于新消息进场时中止未完成的上一轮。
+ */
+export async function sendChatStream(
+  text: string,
+  handlers: StreamChatHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch('/api/chat/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+    signal,
+  })
+  if (res.status === 404) {
+    // 陈旧后端（无流式端点）：整段回退，行为与旧版完全一致
+    handlers.onFallback?.(await sendChat(text))
+    return
+  }
+  if (!res.ok || !res.body) {
+    throw new Error(`请求失败：/api/chat/stream，状态码 ${res.status}`)
+  }
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buf = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    // SSE 分帧：事件之间以空行（\n\n）分隔，逐行取 data: 负载
+    let sep = buf.indexOf('\n\n')
+    while (sep >= 0) {
+      const rawEvent = buf.slice(0, sep)
+      buf = buf.slice(sep + 2)
+      for (const line of rawEvent.split('\n')) {
+        if (!line.startsWith('data:')) continue
+        try {
+          const ev = JSON.parse(line.slice(5).trim()) as Record<string, unknown> & {
+            type?: string
+          }
+          if (ev.type === 'delta') {
+            handlers.onDelta?.(String(ev.text ?? ''))
+          } else if (ev.type === 'sentence') {
+            handlers.onSentence?.({
+              text: String(ev.text ?? ''),
+              audio_url: typeof ev.audio_url === 'string' ? ev.audio_url : null,
+            })
+          } else if (ev.type === 'done') {
+            handlers.onDone?.({ reply: String(ev.reply ?? ''), degraded: ev.degraded === true })
+          } else if (ev.type === 'fallback') {
+            handlers.onFallback?.({
+              reply: String(ev.reply ?? ''),
+              audio_url: typeof ev.audio_url === 'string' ? ev.audio_url : null,
+              exit: ev.exit === true,
+            })
+          }
+        } catch {
+          // 单条事件解析失败：跳过该帧，不中断整流
+        }
+      }
+      sep = buf.indexOf('\n\n')
+    }
+  }
+}
+
 /** 到点提醒单条消息结构：文本 + 可选的合成语音地址 */
 export interface DueMessage {
   text: string
@@ -115,10 +195,15 @@ export async function getDueMessages(): Promise<DueMessage[]> {
 let currentAudio: HTMLAudioElement | null = null
 
 /**
- * 立即停止浏览器通道的全部播报（手动/语音打断共用）。
- * pause + 摘掉 src 双保险：部分内嵌 webview 对单独 pause 响应迟缓。
+ * 句级流式播放队列（Gap1 流式化）：/api/chat/stream 合成好一句推一句，
+ * 前端 enqueueAudio 按序连播——playInSequence 的「边收边播」动态队列版。
+ * stopAllAudio 一并清空队列：手动/语音打断时，未播的句子不再出声。
  */
-export function stopAllAudio(): void {
+let audioQueue: string[] = []
+let audioQueueBusy = false
+
+/** 停掉当前正在播放的 Audio（不动播放队列；playAudio 开播前的内部清理点） */
+function stopCurrentAudio(): void {
   if (currentAudio) {
     try {
       currentAudio.pause()
@@ -132,14 +217,60 @@ export function stopAllAudio(): void {
 }
 
 /**
+ * 立即停止浏览器通道的全部播报（手动/语音打断共用）。
+ * 清空句级队列 + pause 当前 + 摘掉 src 双保险：部分内嵌 webview 对单独 pause 响应迟缓。
+ */
+export function stopAllAudio(): void {
+  audioQueue = []
+  audioQueueBusy = false
+  stopCurrentAudio()
+}
+
+/** 把一句合成好的音频地址追加进流式播放队列；队列空闲时立即开播 */
+export function enqueueAudio(url: string): void {
+  if (!url) return
+  audioQueue.push(url)
+  pumpAudioQueue()
+}
+
+/** 队列泵：串行播放，ended/error 推进下一条；某条失败跳过，保证队列不死锁 */
+function pumpAudioQueue(): void {
+  if (audioQueueBusy) return
+  const url = audioQueue.shift()
+  if (!url) return
+  audioQueueBusy = true
+  const audio = playAudio(url)
+  if (!audio) {
+    audioQueueBusy = false
+    pumpAudioQueue()
+    return
+  }
+  let advanced = false
+  const advance = () => {
+    if (advanced) return
+    advanced = true
+    audioQueueBusy = false
+    pumpAudioQueue()
+  }
+  audio.addEventListener('ended', advance, { once: true })
+  audio.addEventListener('error', advance, { once: true })
+  // 兜底：自动播放被浏览器拒绝时 ended/error 都不触发，
+  // 1.5 秒后若仍 paused 且未开始过，视为未出声，直接推进队列（与 playInSequence 同思路）
+  window.setTimeout(() => {
+    if (audioQueueBusy && audio.paused && audio.currentTime === 0) advance()
+  }, 1500)
+}
+
+/**
  * 播放一段音频：url 非空时创建 Audio 并尝试播放。
  * play() 返回的 promise 被浏览器自动播放策略拒绝时静默吞掉（用户交互过页面后通常允许），
  * 返回 Audio 实例，方便调用方用 ended 事件串联多段音频。
- * 开播前自动停掉上一条（注册表语义），播完自动出清注册表。
+ * 开播前自动停掉上一条（注册表语义；不清流式队列——队列泵正是靠它逐条开播），
+ * 播完自动出清注册表。
  */
 export function playAudio(url: string | null): HTMLAudioElement | null {
   if (!url) return null
-  stopAllAudio()
+  stopCurrentAudio()
   const audio = new Audio(url)
   currentAudio = audio
   audio.addEventListener('ended', () => {

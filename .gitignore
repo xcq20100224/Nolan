@@ -29,3 +29,8 @@ voice-test.mp3
 jarvis/_selftest_*
 wb-req-*.json
 .venv/
+
+# ===== 运行时数据（用户记忆等，不入库） =====
+jarvis/data/
+# 延迟基准语料（本地音频）
+jarvis/bench_corpus/

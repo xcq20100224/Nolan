@@ -30,6 +30,12 @@ eyes.py —— Nolan 的「眼睛」与「手」的延伸（阶段五：屏幕�
     perform(task: str, max_steps: int = 12) -> str  # 口语化结果
     screenshot_b64() -> str                         # JPEG base64（宽 <= 1280）
     locate_and_crop(description: str) -> str | None # 通用截屏元素：定位 + 裁剪保存
+
+Gap2 可靠性增强：复核未生效不再「盲重试」——先经 reliability 模块把失败
+归约为有限几类物理原因（焦点丢失/目标未出现/坐标漂移/文本校验不符/超时/
+应用未响应），按对策表结构化修复（每类独立重试预算 + 逐次加长退避，
+全局总预算封顶防死循环）；UIA 控件树能阳性确认的复核直接跳过截图 + VLM
+往返。reliability 缺失或处置异常时退回旧逻辑，默认路径行为不变。
 """
 
 import base64
@@ -58,6 +64,14 @@ try:
     import skills as _skills
 except Exception:
     _skills = None
+
+# 可靠性增强（Gap2）：失败分类 + 结构化重试 + UIA 廉价复核。
+# 防御式导入：模块缺失时复核失败处置退回旧的「提示换策略、连续 2 次判
+# 失败」逻辑，默认路径行为与旧版一字不差。
+try:
+    import reliability as _rel
+except Exception:
+    _rel = None
 
 # ---------------------------------------------------------------------------
 # 初始化与常量
@@ -504,6 +518,136 @@ def _over_limit_report(max_steps: int, last_thought: str,
 
 
 # ---------------------------------------------------------------------------
+# Gap2 结构化处置：复核未生效 -> 收集证据 -> 分类 -> 按对策表修复
+#
+# 第一性原理：失败不是随机噪声，是可分类的物理原因；盲重试没有分类，
+# 所以修不好。这里只做三件事——把现场证据收集齐（UIA 可用时）、
+# 交给 reliability 纯函数分类与决策、执行决策中的物理对策。
+# 任何环节异常都向上抛（由调用方捕获退回旧逻辑），绝不把增强路径
+# 变成新的故障点。
+# ---------------------------------------------------------------------------
+
+def _collect_failure_evidence(action: dict, expect: str, why: str,
+                              controls_before: list,
+                              target_hint: str | None) -> dict:
+    """
+    收集「复核未生效」的现场证据，供 reliability.classify 分类。
+    UIA 不可用时只填动作本身的信息（分类器会按保守类别处置）；
+    单项证据采集失败只缺该项，不影响其他证据。
+    """
+    ev = {
+        "action": action.get("action", ""),
+        "text": str(action.get("text", "") or ""),
+        "expect": expect,
+        "verify_reason": why or "",
+        "controls_before": len(controls_before or []),
+    }
+    if action.get("keys"):
+        ev["keys"] = action.get("keys")
+    # 目标窗口前台状态（焦点丢失判据；无 hint 或 UIA 不可用时缺省）
+    if target_hint and _uia is not None:
+        try:
+            ev["hint_in_foreground"] = (
+                target_hint.lower() in _uia.foreground_title().lower())
+        except Exception:
+            pass
+    # 复核时刻重新枚举控件树：看目标是没出现、挪了位置，还是整树消失
+    if _uia is not None:
+        try:
+            after = _uia.dump_window_controls() or []
+            ev["controls_after"] = len(after)
+            text = ev["text"].strip()
+            if text:
+                xy = _uia.find_element(after, text)
+                ev["named_found_after"] = xy is not None
+                if xy:
+                    ev["named_xy_after"] = xy
+        except Exception:
+            pass
+    # 实际点击落点（物理像素，供坐标漂移比对）
+    if action.get("action") in ("left_click", "double_click") \
+            and "x" in action and "y" in action:
+        try:
+            ev["clicked_xy"] = _vlm_to_screen(float(action.get("x", 0)),
+                                              float(action.get("y", 0)))
+        except Exception:
+            pass
+    return ev
+
+
+def _execute_countermeasure(decision: dict, action: dict,
+                            target_hint: str | None) -> None:
+    """
+    执行 reliability.decide 给出的物理对策。每条对策对应一个物理原因：
+      refocus       把目标窗口重新置前（焦点丢失——动作才有落点）；
+      wait_recheck  退避等待（目标未加载完 / 应用短暂无响应——等待即解药）；
+      relocate      不直接动手，hint 已指引下一步按名定位（名称是 invariant）；
+      retype        全选重输（文本没进去——幂等：误报时重输同文结果不变）；
+      backoff_retry 退避等待（界面响应慢——给渲染留时间）。
+    """
+    strategy = decision.get("action")
+    backoff = float(decision.get("backoff", 0.0) or 0.0)
+    if strategy == "refocus":
+        if target_hint and _uia is not None:
+            try:
+                if _uia.bring_to_front(target_hint):
+                    print("[eyes] 对策：目标窗口「%s」已重新置前" % target_hint)
+            except Exception:
+                pass
+        time.sleep(max(backoff, 0.5))  # 等窗口切换动画完成
+    elif strategy in ("wait_recheck", "backoff_retry"):
+        print("[eyes] 对策：退避等待 %.1f 秒后重查" % backoff)
+        time.sleep(backoff)
+    elif strategy == "relocate":
+        # 不直接点击：点击决策权留给 VLM，hint 已给出按名定位指引；
+        # 短退避等界面稳定后进入下一步（控件清单会重新枚举）
+        time.sleep(max(backoff, 0.5))
+    elif strategy == "retype":
+        # 复核已两次确认文字未生效；即使属复核误报，全选后重输同文
+        # 结果不变（幂等），不会产生双倍文本
+        try:
+            pyautogui.hotkey("ctrl", "a")
+            time.sleep(0.1)
+            pyperclip.copy(str(action.get("text", "")))
+            time.sleep(0.1)
+            pyautogui.hotkey("ctrl", "v")
+            print("[eyes] 对策：已全选并重新输入「%s」"
+                  % str(action.get("text", ""))[:30])
+        except Exception as exc:
+            print("[eyes] 全选重输执行失败（%s），交由下一步观察" % exc)
+        time.sleep(max(backoff, 0.5))
+
+
+def _remedy_verify_failure(step: int, action: dict, expect: str, why: str,
+                           controls_before: list, target_hint: str | None,
+                           ledger, history: list) -> bool:
+    """
+    复核未生效的结构化处置（增强路径）：
+    收集证据 -> reliability.classify 归类物理原因 -> decide 选对策 ->
+    预算内执行修复并把处置说明写入历史（带给下一步 VLM）。
+    返回 True 表示已按对策处置（任务继续）；False 表示无可用对策
+    （未知类别或预算耗尽），由调用方走旧的判失败逻辑。
+    """
+    ev = _collect_failure_evidence(action, expect, why, controls_before,
+                                   target_hint)
+    category = _rel.classify(ev)
+    decision = _rel.decide(category, ledger, ev)
+    cat_cn = _rel.CATEGORY_CN.get(category, category)
+    if decision["action"] == "give_up":
+        print("[eyes] 第 %d 步失败分类：%s -> 放弃自愈（%s）"
+              % (step, cat_cn, decision.get("reason", "")))
+        return False
+    print("[eyes] 第 %d 步失败分类：%s -> 对策 %s（退避 %.1f 秒，账本：%s）"
+          % (step, cat_cn, decision["action"], decision["backoff"],
+             ledger.summary()))
+    ledger.note(category)
+    _execute_countermeasure(decision, action, target_hint)
+    if decision.get("hint"):
+        history.append("第%d步 系统处置：%s" % (step, decision["hint"]))
+    return True
+
+
+# ---------------------------------------------------------------------------
 # 主闭环：perform
 # ---------------------------------------------------------------------------
 
@@ -536,6 +680,9 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
     done_rejects = 0         # done 复核驳回次数（最多 2 次，防复核侧死循环）
     last_shot = ""           # 最近一次截屏，失败时用于补问屏幕状态
     last_thought = ""        # 最后一步 VLM 的决策理由，失败报告要带出来
+    # 结构化重试账本（Gap2）：每类失败独立预算 + 全局总预算封顶；
+    # reliability 缺失时为 None，复核失败处置走旧逻辑
+    ledger = _rel.RetryLedger() if _rel is not None else None
 
     try:
         for step in range(1, max_steps + 1):
@@ -723,21 +870,36 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
             # 5) 等界面响应，进入下一步
             time.sleep(_STEP_INTERVAL)
 
-            # 5.5) 执行复核（闭环核心）：物理动作携带 expect 时重新截屏，
-            # 核对预期效果是否真实出现；未生效则记入历史强制换策略，
-            # 连续 2 次未生效判定失败；复核不可用（None）静默放行
+            # 5.5) 执行复核（闭环核心）：物理动作携带 expect 时，
+            # 先用 UIA 控件树做廉价复核（阳性确认即视为生效，省一次截图 +
+            # VLM 往返）；UIA 答不了再重新截屏复核。未生效则先经 reliability
+            # 分类物理原因、按对策表结构化修复（增强路径）；模块缺失或处置
+            # 异常时退回旧逻辑：记入历史强制换策略，连续 2 次未生效判定失败；
+            # 复核不可用（None）静默放行
             expect = str(action.get("expect", "")).strip()
             if action["action"] != "wait" and expect:
                 check_shot = ""
-                try:
-                    check_shot = screenshot_b64()
-                    ok, why = _verify(
-                        check_shot,
-                        "刚执行的动作是「%s」，预期屏幕上会出现：%s。"
-                        "请看这张截图判断：预期的效果是否已经出现？"
-                        % (desc, expect))
-                except Exception:
-                    ok, why = None, ""
+                ok, why = None, ""
+                # 廉价复核优先：控件树能确认预期元素已出现时，
+                # 不必动截图 + VLM（一次本地枚举 vs 一次模型往返）
+                if _rel is not None and _uia is not None:
+                    try:
+                        if _rel.uia_verify(
+                                action, expect,
+                                lambda: _uia.dump_window_controls() or []):
+                            ok, why = True, "控件树确认预期元素已出现"
+                    except Exception:
+                        ok, why = None, ""
+                if ok is not True:
+                    try:
+                        check_shot = screenshot_b64()
+                        ok, why = _verify(
+                            check_shot,
+                            "刚执行的动作是「%s」，预期屏幕上会出现：%s。"
+                            "请看这张截图判断：预期的效果是否已经出现？"
+                            % (desc, expect))
+                    except Exception:
+                        ok, why = None, ""
                 if ok is False:
                     # 界面加载宽限：动作可能已生效但页面尚未渲染完，
                     # 等 1.5 秒换一张截图复核第二次，仍不符才计未生效
@@ -759,16 +921,29 @@ def perform(task: str, max_steps: int = 12, target_hint: str | None = None) -> s
                     print("[eyes] 第 %d 步复核未生效（期望：%s；实际：%s）（连续 %d 次）"
                           % (step, expect[:30], (why or "未出现")[:30],
                              verify_fails))
-                    if verify_fails >= 2:
-                        return _fail_report(
-                            step,
-                            "连续两次操作未产生预期效果（期望：%s），"
-                            "界面可能未响应或目标不存在" % expect[:40],
-                            check_shot or last_shot, executed)
-                    history.append(
-                        "警告：第%d步操作未生效（期望「%s」未出现，实际：%s），"
-                        "下一步必须换完全不同的做法"
-                        % (step, expect[:30], (why or "未出现")[:30]))
+                    # 结构化处置（增强路径）：分类 -> 对策 -> 预算内修复，
+                    # 已处置则带着处置说明进入下一步；未处置（未知类别 /
+                    # 预算耗尽 / 模块缺失 / 处置异常）走旧判失败逻辑
+                    handled = False
+                    if _rel is not None and ledger is not None:
+                        try:
+                            handled = _remedy_verify_failure(
+                                step, action, expect, why, controls,
+                                target_hint, ledger, history)
+                        except Exception as exc:
+                            print("[eyes] 可靠性处置异常（退回旧逻辑）：%s" % exc)
+                            handled = False
+                    if not handled:
+                        if verify_fails >= 2:
+                            return _fail_report(
+                                step,
+                                "连续两次操作未产生预期效果（期望：%s），"
+                                "界面可能未响应或目标不存在" % expect[:40],
+                                check_shot or last_shot, executed)
+                        history.append(
+                            "警告：第%d步操作未生效（期望「%s」未出现，实际：%s），"
+                            "下一步必须换完全不同的做法"
+                            % (step, expect[:30], (why or "未出现")[:30]))
                 else:
                     verify_fails = 0
 
