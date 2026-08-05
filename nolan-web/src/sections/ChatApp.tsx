@@ -6,9 +6,26 @@ import WaveCanvas from '@/sections/WaveCanvas'
 import SubtitleBar from '@/sections/SubtitleBar'
 import HistoryOverlay from '@/sections/HistoryOverlay'
 import NegaInput from '@/sections/NegaInput'
+import FileCabinet from '@/sections/FileCabinet'
 import type { WaveMode } from '@/sections/WaveCanvas'
 import type { Message } from '@/types/message'
-import { checkHealth, sendChatStream, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, enqueueAudio, stopAllAudio, stopSpeak, soundTest, getBackground, clientLog } from '@/lib/api'
+import { checkHealth, sendChatStream, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, enqueueAudio, stopAllAudio, stopSpeak, soundTest, getBackground, clientLog, uploadFile } from '@/lib/api'
+
+/** 待发送附件（芯片展示 + 发送时拼 payload 的全量文本） */
+interface StagedAttachment {
+  id: string
+  /** 存储文件名（时间戳前缀 + 净化名） */
+  name: string
+  /** 抽取文本总字数 */
+  chars: number
+  /** 全量抽取文本（发送时按 8000 字截断拼进 payload） */
+  text: string
+}
+
+/** 单附件正文拼进 payload 的截断上限（字） */
+const ATTACHMENT_PAYLOAD_MAX = 8000
+/** 一次最多携带的附件数 */
+const ATTACHMENT_MAX = 3
 
 /** 当前时间，格式 HH:MM（24 小时制） */
 function nowHHMM(): string {
@@ -63,6 +80,12 @@ export default function ChatApp() {
   const [recording, setRecording] = useState(false)
   /** 历史浮层开关 */
   const [historyOpen, setHistoryOpen] = useState(false)
+  /** 文件柜面板开关 */
+  const [cabinetOpen, setCabinetOpen] = useState(false)
+  /** 待发送附件（拖拽上传成功后暂存，发送时拼进 payload，最多 3 个） */
+  const [attachments, setAttachments] = useState<StagedAttachment[]>([])
+  /** 文件拖入聊天区的视觉高亮 */
+  const [dragActive, setDragActive] = useState(false)
   /** 网页背景图地址（/api/background 轮询结果，null 时保持纯黑底） */
   const [bgUrl, setBgUrl] = useState<string | null>(null)
 
@@ -70,6 +93,11 @@ export default function ChatApp() {
   const bootedRef = useRef(false)
   // 会话结束后不再追加任何消息
   const exitedRef = useRef(false)
+  // 发送时读取最新附件列表（异步回调里取到的永远是最新闭包）
+  const attachmentsRef = useRef(attachments)
+  attachmentsRef.current = attachments
+  // 拖拽进出计数：子元素间移动不闪高亮
+  const dragDepthRef = useRef(0)
 
   /** 当前流式请求的中止器：新消息进场时中止未完成的上一轮 */
   const streamAbortRef = useRef<AbortController | null>(null)
@@ -80,17 +108,84 @@ export default function ChatApp() {
     setMessages((prev) => [...prev, { id: nextId(), role: 'nolan', text, time: nowHHMM() }])
   }, [])
 
+  /** 拖入文件 → 上传 → 暂存为待发送附件（最多 3 个；失败如实播报原因） */
+  const handleAddFiles = useCallback(
+    (files: FileList | File[]) => {
+      if (exitedRef.current) return
+      for (const file of Array.from(files)) {
+        if (attachmentsRef.current.length >= ATTACHMENT_MAX) {
+          pushNolan(`先生，一次最多带 ${ATTACHMENT_MAX} 个附件，请先发送或移除现有的。`)
+          break
+        }
+        // 占座再上传：并发拖入多个文件时数量闸门立即生效
+        const seatId = nextId()
+        attachmentsRef.current = [
+          ...attachmentsRef.current,
+          { id: seatId, name: file.name, chars: 0, text: '' },
+        ]
+        setAttachments(attachmentsRef.current)
+        uploadFile(file)
+          .then((r) => {
+            attachmentsRef.current = attachmentsRef.current.map((a) =>
+              a.id === seatId ? { id: seatId, name: r.name, chars: r.chars, text: r.text } : a,
+            )
+            setAttachments(attachmentsRef.current)
+            pushNolan(`先生，文件「${file.name}」已收到，抽取了 ${r.chars} 字。发送时我会一起读。`)
+          })
+          .catch((e) => {
+            attachmentsRef.current = attachmentsRef.current.filter((a) => a.id !== seatId)
+            setAttachments(attachmentsRef.current)
+            pushNolan(
+              `先生，「${file.name}」上传失败了：${e instanceof Error ? e.message : String(e)}`,
+            )
+          })
+      }
+    },
+    [pushNolan],
+  )
+
+  /** 移除一个待发送附件 */
+  const handleRemoveAttachment = useCallback((id: string) => {
+    attachmentsRef.current = attachmentsRef.current.filter((a) => a.id !== id)
+    setAttachments(attachmentsRef.current)
+  }, [])
+
   /** 发送用户消息并请求 brain 回复（句级流式：LLM 边想、TTS 边产、喇叭边播） */
   const handleSend = useCallback(async (text: string) => {
     if (exitedRef.current) return
+
+    // 附件正文拼进 payload（前缀只进 payload，不进气泡显示文本；单附件 ≤8000 字）
+    const atts = attachmentsRef.current.filter((a) => a.chars > 0)
+    let payload = text
+    if (atts.length > 0) {
+      const prefix = atts
+        .map(
+          (a) =>
+            `[附件《${a.name}》内容开始]\n${a.text.slice(0, ATTACHMENT_PAYLOAD_MAX)}\n[附件内容结束，请基于以上内容回答]\n`,
+        )
+        .join('')
+      payload = prefix + (text || '请阅读以上附件内容。')
+      setAttachments([]) // 发送即交付，附件芯片挂到消息上
+      attachmentsRef.current = []
+    }
+    const displayText = text || atts.map((a) => `📎 ${a.name}`).join('　')
 
     // 0. 新一轮开口即打断上一轮：中止未完成的流式请求 + 清空浏览器播报队列 + 服务端音箱
     streamAbortRef.current?.abort()
     stopAllAudio()
     stopSpeak()
 
-    // 1. 插入用户消息
-    setMessages((prev) => [...prev, { id: nextId(), role: 'user', text, time: nowHHMM() }])
+    // 1. 插入用户消息（附件芯片随消息展示：文件名 + 字数）
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: nextId(),
+        role: 'user',
+        text: displayText,
+        time: nowHHMM(),
+        attachments: atts.length > 0 ? atts.map((a) => ({ name: a.name, chars: a.chars })) : undefined,
+      },
+    ])
 
     // 2. 插入「请稍候」占位，声波进入快速律动
     const placeholderId = nextId()
@@ -112,7 +207,7 @@ export default function ChatApp() {
       )
     try {
       await sendChatStream(
-        text,
+        payload,
         {
           // LLM 增量文本：字幕逐字出现（不等任何音频，感知延迟的第一刀）
           onDelta: (piece) => {
@@ -158,7 +253,7 @@ export default function ChatApp() {
     if (bootedRef.current) return
     bootedRef.current = true
 
-    clientLog('页面加载 build 0804-1')
+    clientLog('页面加载 build 0804-2')
     checkHealth().then((ok) => {
       clientLog(`健康检查: ${ok}`)
       setOnline(ok)
@@ -317,7 +412,39 @@ export default function ChatApp() {
   return (
     // 根容器改为相对定位的三层结构：背景图层（z-0）→ 深色遮罩（z-0）→ 前景内容（z-10）
     // bgUrl 为 null 时两层背景均以 opacity-0 隐藏，页面回到纯黑底，切换由 0.5s 过渡完成
-    <div className="relative h-screen overflow-hidden bg-[#0b0b0d] text-[#e8e0d0]">
+    <div
+      className="relative h-screen overflow-hidden bg-[#0b0b0d] text-[#e8e0d0]"
+      onDragEnter={(e) => {
+        if (!e.dataTransfer.types.includes('Files')) return
+        e.preventDefault()
+        dragDepthRef.current += 1
+        setDragActive(true)
+      }}
+      onDragOver={(e) => {
+        // 必须 preventDefault，浏览器才允许 drop 触发
+        if (e.dataTransfer.types.includes('Files')) e.preventDefault()
+      }}
+      onDragLeave={(e) => {
+        if (!e.dataTransfer.types.includes('Files')) return
+        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+        if (dragDepthRef.current === 0) setDragActive(false)
+      }}
+      onDrop={(e) => {
+        if (!e.dataTransfer.types.includes('Files')) return
+        e.preventDefault()
+        dragDepthRef.current = 0
+        setDragActive(false)
+        handleAddFiles(e.dataTransfer.files)
+      }}
+    >
+      {/* 拖入文件的全屏高亮：松开即交给 Nolan 阅读 */}
+      {dragActive && (
+        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-[#8a8578] bg-black/60">
+          <p className="text-sm font-light tracking-[0.3em] text-[#e8e0d0]">
+            松开，把文件交给 Nolan 阅读
+          </p>
+        </div>
+      )}
       {/* 背景图层：cover center 铺满，0.5s 淡入淡出 */}
       <div
         aria-hidden
@@ -371,13 +498,18 @@ export default function ChatApp() {
           onSend={handleSend}
           onRecordingChange={setRecording}
           onStatus={pushNolan}
+          attachments={attachments.map((a) => ({ id: a.id, name: a.name, chars: a.chars }))}
+          onRemoveAttachment={handleRemoveAttachment}
+          onOpenCabinet={() => setCabinetOpen(true)}
         />
 
         {historyOpen && <HistoryOverlay messages={messages} onClose={() => setHistoryOpen(false)} />}
 
+        {cabinetOpen && <FileCabinet onClose={() => setCabinetOpen(false)} />}
+
         {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
         <span className="pointer-events-none absolute bottom-2 right-3 text-[10px] font-light tracking-widest text-[#3a3a40]">
-          build 0804-1
+          build 0804-2
         </span>
       </div>
     </div>

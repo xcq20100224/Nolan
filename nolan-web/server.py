@@ -47,8 +47,25 @@ API 契约（一字不差）：
     GET  /api/background → {"image_url": str|null}（聊天网页背景；
                          状态文件 jarvis/files/web_background.json 内容为 {"image": "文件名"}，
                          存在则返回 "/api/files/<文件名>"，无状态文件/内容无效返回 null）
-    GET  /api/files/<文件名> → image/jpeg|png|webp（图片目录 jarvis/files/，
-                         只允许安全相对路径，路径穿越一律 404）
+    GET  /api/files/<文件名> → 图片（jpg/jpeg/png/webp）内联返回 image/*；
+                         下载白名单（pdf/docx/pptx/txt/md/csv 及文本类后缀）以
+                         Content-Disposition: attachment 下载（对应 MIME）；
+                         只允许安全相对路径（含 uploads/ 等子目录），路径穿越一律 404
+    POST /api/upload     请求 {"name": "原始文件名", "data_base64": "..."}
+                         （base64 JSON 契约：标准库无 multipart 解析器，此契约最简单；
+                         请求体上限 30MB，解码后文件上限 20MB）
+                         → {"ok": true, "name": 存储文件名, "chars": 抽取字数,
+                            "excerpt": 前 2000 字, "text": 全量抽取文本,
+                            "truncated": bool, "file_url": "/api/files/uploads/<存储名>"}
+                         落盘 jarvis/files/uploads/（目录自动创建，时间戳前缀防覆盖，
+                         文件名净化只留安全字符 + commonpath 双重防护）；
+                         文本类（txt/md/py/js/ts/json/csv/log/ini/yaml）直读前 100KB，
+                         PDF 抽前 20 页（pypdf），DOCX 抽段落（python-docx）；
+                         不支持类型返回 400 明确错误（不乱猜）
+    GET  /api/files_list → {"files": [{"name","size","mtime","kind"}]}
+                         递归列出 jarvis/files/（含 uploads/ 子目录；排除 tts_cache、
+                         pidfile、日志等后端内部文件），按 mtime 倒序，
+                         kind ∈ 文档/图片/表格/音频/其他
     POST /api/asr        请求体为原始音频字节（audio/webm|ogg|wav）
                          → {"text": "识别文本"}；无语音 {"text": ""}
     POST /api/mic/start  → {"ok": true}（服务端直接开麦录音，绕开浏览器权限）
@@ -63,6 +80,7 @@ API 契约（一字不差）：
 
 import asyncio
 import atexit
+import base64
 import hashlib
 import json
 import os
@@ -76,7 +94,7 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 # == 把 ../jarvis 加入 sys.path（用 __file__ 定位，与启动目录无关）==
 _JARVIS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "jarvis")
@@ -96,12 +114,16 @@ try:
     import proactive  # noqa: E402  Gap4 主动性引擎（三重闸门 + 注入式生成）
 except ImportError:
     proactive = None
+try:
+    import speak_filter as _speak_filter  # noqa: E402  Gap8 说话卫生（剥离代码/JSON）
+except ImportError:
+    _speak_filter = None
 
 # == 后端代码版本标识 ==
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-04-wave2"
+_VERSION = "2026-08-05-speakfilter"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -127,6 +149,241 @@ _IMAGE_MIME = {
     ".png": "image/png",
     ".webp": "image/webp",
 }
+
+# == 文件通道（入口：拖拽上传阅读；出口：文件柜列表/下载）==
+# 第一性原理：Nolan 的 write_file 工具与网页上传共用同一个『文件柜』——
+# jarvis/files/（上传落在其 uploads/ 子目录）。入口把文件抽成文本喂给对话，
+# 出口把柜子里的文件列出来供查看/下载；两侧都只认白名单、都过路径穿越防护。
+_UPLOADS_DIR = os.path.normpath(os.path.join(_FILES_DIR, "uploads"))
+_UPLOAD_MAX_BYTES = 20 * 1024 * 1024       # 上传文件大小上限 20MB
+_UPLOAD_MAX_BODY_BYTES = 30 * 1024 * 1024  # base64 请求体上限（20MB 膨胀约 1/3 再加余量）
+_TEXT_READ_LIMIT = 100 * 1024              # 文本类文件只读前 100KB（超出截断）
+_PDF_MAX_PAGES = 20                        # PDF 只抽前 20 页
+_EXCERPT_CHARS = 2000                      # 响应 excerpt 只带前 2000 字
+
+# 直接按文本读取的后缀（UTF-8，errors=replace 容错解码）
+_TEXT_EXTS = {
+    ".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".ini",
+    ".yaml", ".yml",
+}
+# 需要专用解析器的后缀
+_DOC_EXTS = {".pdf", ".docx"}
+# 上传支持的类型 = 文本直读 + 专用解析（其余一律明确拒绝，不乱猜）
+_SUPPORTED_UPLOAD_EXTS = _TEXT_EXTS | _DOC_EXTS
+
+# /api/files 下载白名单（图片之外的扩展；下载统一带 Content-Disposition: attachment）
+_DOWNLOAD_MIME = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    # 文本直读类其余后缀统一下载为纯文本
+    ".py": "text/plain; charset=utf-8",
+    ".js": "text/plain; charset=utf-8",
+    ".ts": "text/plain; charset=utf-8",
+    ".log": "text/plain; charset=utf-8",
+    ".ini": "text/plain; charset=utf-8",
+    ".yaml": "text/plain; charset=utf-8",
+    ".yml": "text/plain; charset=utf-8",
+}
+
+# 文件柜列表的内部排除项：TTS 缓存目录、pidfile、背景状态文件、诊断/录音日志
+# ——它们是后端运行机制的产物，不属于『Nolan 生成 / 先生上传的文件』
+_LIST_EXCLUDE_DIRS = {"tts_cache"}
+_LIST_EXCLUDE_FILES = {"server.pid", "web_background.json"}
+_LIST_EXCLUDE_EXTS = {".log"}
+
+# 文件柜 kind 分类（按后缀）
+_KIND_EXTS = {
+    "图片": {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"},
+    "表格": {".csv", ".xls", ".xlsx"},
+    "音频": {".mp3", ".wav", ".ogg", ".m4a"},
+    "文档": {".pdf", ".doc", ".docx", ".txt", ".md", ".ppt", ".pptx"},
+}
+
+
+def _classify_kind(ext: str) -> str:
+    """按后缀把文件归为 文档/图片/表格/音频/其他。"""
+    for kind, exts in _KIND_EXTS.items():
+        if ext in exts:
+            return kind
+    return "其他"
+
+
+def _sanitize_filename(name: str) -> str:
+    """
+    文件名净化：先剥掉一切路径成分，再只保留安全字符
+    （英数、点、短横、下划线、常用汉字），其余一律替换为 '_'；
+    去掉前导点（防隐藏文件与 '..' 残留），空名兜底为 'file'。
+    """
+    base = os.path.basename((name or "").replace("\\", "/"))
+    out = []
+    for ch in base:
+        if ch.isascii() and (ch.isalnum() or ch in "._-"):
+            out.append(ch)
+        elif "一" <= ch <= "鿿":
+            out.append(ch)  # 常用汉字放行（先生的文件大多是中文名）
+        else:
+            out.append("_")
+    cleaned = "".join(out).lstrip(".").strip()
+    return cleaned or "file"
+
+
+def _extract_text(path: str, ext: str):
+    """
+    按类型抽取文件文本，返回 (文本, 是否截断)。
+    文本类：只读前 100KB，UTF-8 容错解码；
+    PDF：pypdf 抽前 20 页；DOCX：python-docx 抽段落。
+    解析失败抛 ValueError（中文说明），由调用方转成错误响应。
+    """
+    if ext in _TEXT_EXTS:
+        try:
+            with open(path, "rb") as f:
+                raw = f.read(_TEXT_READ_LIMIT + 1)
+        except OSError as e:
+            raise ValueError(f"读取文件失败了：{e}")
+        truncated = len(raw) > _TEXT_READ_LIMIT
+        if truncated:
+            raw = raw[:_TEXT_READ_LIMIT]
+        return raw.decode("utf-8", errors="replace"), truncated
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(path)
+            parts = []
+            for page in reader.pages[:_PDF_MAX_PAGES]:
+                parts.append(page.extract_text() or "")
+            text = "\n".join(p for p in parts if p).strip()
+            return text, len(reader.pages) > _PDF_MAX_PAGES
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"PDF 解析失败了（文件可能损坏或已加密）：{e}")
+    if ext == ".docx":
+        try:
+            import docx
+            document = docx.Document(path)
+            text = "\n".join(p.text for p in document.paragraphs if p.text).strip()
+            return text, False
+        except Exception as e:
+            raise ValueError(f"DOCX 解析失败了（文件可能损坏）：{e}")
+    raise ValueError(
+        f"不支持的文件类型：{ext or '（无扩展名）'}。"
+        f"目前支持：{'、'.join(sorted(_SUPPORTED_UPLOAD_EXTS))}")
+
+
+def _save_upload(name: str, data: bytes,
+                 uploads_dir: str = _UPLOADS_DIR, files_dir: str = _FILES_DIR):
+    """
+    上传落盘 + 文本抽取（纯逻辑，可单测；不起服务）。
+    返回 (存储文件名, 抽取文本, 是否截断)；任何失败抛 ValueError（中文说明）。
+
+    安全闸门（与 _serve_file 同一套思路）：
+      大小上限 20MB；类型白名单；文件名净化只留安全字符；时间戳前缀防覆盖；
+      落盘目录必须仍在 files 目录内（commonpath 双重保险）。
+    解析失败的文件不留柜（删掉半成品），原因如实上报。
+    """
+    if not data:
+        raise ValueError("文件内容为空。")
+    if len(data) > _UPLOAD_MAX_BYTES:
+        raise ValueError(
+            f"文件超过大小上限（20MB），本文件约 {len(data) / 1024 / 1024:.1f}MB。")
+    ext = os.path.splitext(name or "")[1].lower()
+    if ext not in _SUPPORTED_UPLOAD_EXTS:
+        raise ValueError(
+            f"不支持的文件类型：{ext or '（无扩展名）'}。"
+            f"目前支持：{'、'.join(sorted(_SUPPORTED_UPLOAD_EXTS))}")
+    # 双重保险：上传目录必须仍在 files 目录内（配置被改动时宁可拒绝写入）
+    try:
+        inside = os.path.commonpath(
+            [os.path.abspath(uploads_dir), os.path.abspath(files_dir)]
+        ) == os.path.abspath(files_dir)
+    except ValueError:
+        inside = False  # 不同盘符等异常，一律视为不合法
+    if not inside:
+        raise ValueError("上传目录配置异常（不在文件柜内），已拒绝写入。")
+    try:
+        os.makedirs(uploads_dir, exist_ok=True)
+    except OSError as e:
+        raise ValueError(f"上传目录创建失败：{e}")
+    safe = _sanitize_filename(name)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    stored = f"{stamp}_{safe}"
+    full = os.path.join(uploads_dir, stored)
+    n = 2
+    while os.path.exists(full):
+        # 同一秒同名上传：追加序号防覆盖
+        stored = f"{stamp}-{n}_{safe}"
+        full = os.path.join(uploads_dir, stored)
+        n += 1
+    try:
+        with open(full, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        raise ValueError(f"文件写入失败：{e}")
+    try:
+        text, truncated = _extract_text(full, ext)
+    except ValueError:
+        try:
+            os.remove(full)  # 解析失败：文件不留柜，避免柜子里躺着读不了的文件
+        except OSError:
+            pass
+        raise
+    return stored, text, truncated
+
+
+def _resolve_files_path(name: str):
+    """
+    /api/files 路径解析（纯逻辑，可单测）：合法返回绝对路径，非法/路径穿越返回 None。
+    拒绝 '..'、绝对路径、盘符（':'）；解析后的绝对路径必须落在 files 目录内（含子目录）。
+    """
+    if not name or ".." in name or os.path.isabs(name) or ":" in name:
+        return None
+    full = os.path.normpath(os.path.join(_FILES_DIR, name))
+    try:
+        inside = os.path.commonpath(
+            [os.path.abspath(full), os.path.abspath(_FILES_DIR)]
+        ) == os.path.abspath(_FILES_DIR)
+    except ValueError:
+        return None  # 不同盘符等异常，一律视为不合法
+    return full if inside else None
+
+
+def _files_list_payload() -> dict:
+    """
+    文件柜列表：递归扫描 jarvis/files/（含 uploads/ 子目录），按 mtime 倒序。
+    排除后端内部文件（TTS 缓存、pidfile、背景状态、日志）——它们不属于
+    『Nolan 生成 / 先生上传的文件』。name 为相对 files 目录的正斜杠路径。
+    """
+    items = []
+    try:
+        for root, dirs, files in os.walk(_FILES_DIR):
+            dirs[:] = [d for d in dirs if d not in _LIST_EXCLUDE_DIRS]
+            for fname in files:
+                if fname in _LIST_EXCLUDE_FILES:
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in _LIST_EXCLUDE_EXTS:
+                    continue
+                full = os.path.join(root, fname)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                rel = os.path.relpath(full, _FILES_DIR).replace(os.sep, "/")
+                items.append({
+                    "name": rel,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "kind": _classify_kind(ext),
+                })
+    except OSError:
+        pass  # 目录不可读时返回空列表，不报错
+    items.sort(key=lambda x: x["mtime"], reverse=True)
+    return {"files": items}
 
 
 def _pid_alive(pid: int) -> bool:
@@ -357,6 +614,14 @@ def synth_for(text: str):
     text = (text or "").strip()
     if not text:
         return None
+    # 说话卫生（Gap8）：代码/JSON/路径/URL 是思考不是台词——
+    # 进发声链前剥离；剥完没剩人话就用通用兜底话术，绝不念代码
+    if _speak_filter is not None:
+        try:
+            text = _speak_filter.speakable(text, max_chars=None) \
+                or "先生，详细内容我放在屏幕上了。"
+        except Exception:
+            pass  # 过滤器异常原样放行，绝不阻断发声
     base = hashlib.sha1(text.encode("utf-8")).hexdigest()
     wav_name = base + ".wav"
     mp3_name = base + ".mp3"
@@ -1441,11 +1706,17 @@ class NolanHandler(BaseHTTPRequestHandler):
         """统一的 JSON 错误响应。"""
         self._send_json(status, {"error": message})
 
-    def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
-        """发送二进制响应（用于 mp3 音频），带 CORS 头。"""
+    def _send_bytes(self, status: int, body: bytes, content_type: str,
+                    download_name: str = None) -> None:
+        """发送二进制响应（用于 mp3 音频 / 图片 / 文件下载），带 CORS 头。
+        download_name 非空时按附件下载（RFC 5987 编码文件名，兼容中文名）。"""
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Access-Control-Allow-Origin", "*")
+        if download_name:
+            self.send_header(
+                "Content-Disposition",
+                "attachment; filename*=UTF-8''" + quote(download_name))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         try:
@@ -1483,39 +1754,37 @@ class NolanHandler(BaseHTTPRequestHandler):
 
     def _serve_file(self, raw_name: str) -> None:
         """
-        从 jarvis/files/ 目录返回图片（image/jpeg|png|webp）。
+        从 jarvis/files/ 目录返回文件：图片（jpg/jpeg/png/webp）内联展示；
+        下载白名单（pdf/docx/pptx/txt/md/csv 及文本类后缀）以附件形式下载。
         防路径穿越：拒绝 '..'、绝对路径、盘符（':'）；解析后的绝对路径必须落在
-        files 目录内；只允许白名单图片后缀。不合规一律 404，绝不泄露任意文件。
+        files 目录内；只允许白名单后缀。不合规一律 404，绝不泄露任意文件。
         """
         name = unquote(raw_name)
-        if (not name or ".." in name or os.path.isabs(name) or ":" in name):
+        full = _resolve_files_path(name)
+        if full is None:
             self._send_error_json(404, f"未知路径：/api/files/{raw_name}")
             return
-        full = os.path.normpath(os.path.join(_FILES_DIR, name))
-        try:
-            # 双重保险：解析后的绝对路径必须仍在 files 目录内（含子目录）
-            inside = os.path.commonpath(
-                [os.path.abspath(full), os.path.abspath(_FILES_DIR)]
-            ) == os.path.abspath(_FILES_DIR)
-        except ValueError:
-            inside = False  # 不同盘符等异常，一律视为不合法
-        if not inside:
-            self._send_error_json(404, f"未知路径：/api/files/{raw_name}")
-            return
-        mime = _IMAGE_MIME.get(os.path.splitext(name)[1].lower())
-        if mime is None:
-            self._send_error_json(404, f"不支持的图片类型：{name}")
+        ext = os.path.splitext(name)[1].lower()
+        inline_mime = _IMAGE_MIME.get(ext)
+        download_mime = _DOWNLOAD_MIME.get(ext)
+        if inline_mime is None and download_mime is None:
+            self._send_error_json(404, f"不支持的文件类型：{name}")
             return
         if not os.path.isfile(full):
-            self._send_error_json(404, f"图片不存在：{name}")
+            self._send_error_json(404, f"文件不存在：{name}")
             return
         try:
             with open(full, "rb") as f:
                 data = f.read()
         except OSError as e:
-            self._send_error_json(500, f"读取图片失败了：{e}")
+            self._send_error_json(500, f"读取文件失败了：{e}")
             return
-        self._send_bytes(200, data, mime)
+        if inline_mime is not None:
+            self._send_bytes(200, data, inline_mime)
+        else:
+            # 下载：附件形式下发，文件名带原始 basename（RFC 5987 兼容中文名）
+            self._send_bytes(200, data, download_mime,
+                             download_name=os.path.basename(name))
 
     def _read_json_body(self) -> dict:
         """读取并解析请求体 JSON；失败抛 ValueError。"""
@@ -1550,6 +1819,54 @@ class NolanHandler(BaseHTTPRequestHandler):
             if not chunk:
                 break
             remaining -= len(chunk)
+
+    # -- 文件入口（拖拽上传阅读）--
+
+    def _handle_upload(self) -> None:
+        """POST /api/upload：base64 JSON 上传（契约见文件头 API 契约段）。
+        落盘 jarvis/files/uploads/ 并抽取文本返回；安全闸门在 _save_upload。"""
+        # 粗闸门：请求体超限直接拒，并断开连接避免残留字节污染 keep-alive
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._send_error_json(400, "请求体为空。")
+            return
+        if length > _UPLOAD_MAX_BODY_BYTES:
+            self.close_connection = True
+            self._send_error_json(413, "文件超过大小上限（20MB）。")
+            return
+        try:
+            data = self._read_json_body()
+        except ValueError as e:
+            self._send_error_json(400, str(e))
+            return
+        name = str(data.get("name", "") or "")
+        b64 = str(data.get("data_base64", "") or "")
+        if not name or not b64:
+            self._send_error_json(400, "请求缺少 name 或 data_base64 字段。")
+            return
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception:
+            self._send_error_json(400, "data_base64 不是合法的 base64 数据。")
+            return
+        try:
+            stored, text, truncated = _save_upload(name, raw)
+        except ValueError as e:
+            self._send_error_json(400, str(e))
+            return
+        self._send_json(200, {
+            "ok": True,
+            "name": stored,
+            "chars": len(text),
+            "excerpt": text[:_EXCERPT_CHARS],
+            # 全量抽取文本：发送时拼进对话 payload 用（前端按 8000 字截断）
+            "text": text,
+            "truncated": truncated,
+            "file_url": "/api/files/" + quote("uploads/" + stored, safe="/"),
+        })
 
     # -- 静默访问日志（保持控制台干净，可按需打开）--
     def log_message(self, fmt, *args):
@@ -1765,6 +2082,9 @@ class NolanHandler(BaseHTTPRequestHandler):
             elif path == "/api/background":
                 # 网页背景：无状态文件/内容无效时 image_url 为 None
                 self._send_json(200, {"image_url": _read_background_url()})
+            elif path == "/api/files_list":
+                # 文件柜：递归列出 jarvis/files/（含 uploads/），mtime 倒序
+                self._send_json(200, _files_list_payload())
             elif path.startswith("/api/files/"):
                 self._serve_file(path[len("/api/files/"):])
             else:
@@ -1778,6 +2098,9 @@ class NolanHandler(BaseHTTPRequestHandler):
             if path == "/api/chat/stream":
                 # 句级流式对话（SSE）：LLM 边想、TTS 边产、前端边播
                 self._handle_chat_stream()
+            elif path == "/api/upload":
+                # 文件入口：base64 JSON 上传 → 落盘 uploads/ + 抽取文本
+                self._handle_upload()
             elif path == "/api/chat":
                 try:
                     data = self._read_json_body()

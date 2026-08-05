@@ -5,11 +5,18 @@
 // 录音状态通过 onRecordingChange 上报给父组件，中央声波以模拟律动呈现（无真实波形流）
 import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
-import { Mic, SendHorizontal, Square } from 'lucide-react'
+import { FolderOpen, Mic, Paperclip, SendHorizontal, Square, X } from 'lucide-react'
 import { micStart, micStop, micState, clientLog, stopSpeak, stopAllAudio } from '@/lib/api'
 
 /** 「没听清」等占位提示的显示时长（毫秒） */
 const HINT_MS = 3000
+
+/** 待发送附件芯片的展示结构（正文存在父组件，发送时拼进 payload） */
+export interface AttachmentChip {
+  id: string
+  name: string
+  chars: number
+}
 
 interface NegaInputProps {
   /** 会话是否已结束（结束后禁用全部输入） */
@@ -20,9 +27,15 @@ interface NegaInputProps {
   onRecordingChange: (recording: boolean) => void
   /** 语音状态播报（以 Nolan 身份插入对话，让每一步都看得见） */
   onStatus?: (text: string) => void
+  /** 待发送的附件芯片（拖拽上传成功后由父组件维护，最多 3 个） */
+  attachments?: AttachmentChip[]
+  /** 移除一个待发送附件 */
+  onRemoveAttachment?: (id: string) => void
+  /** 打开文件柜面板 */
+  onOpenCabinet?: () => void
 }
 
-export default function NegaInput({ disabled, onSend, onRecordingChange, onStatus }: NegaInputProps) {
+export default function NegaInput({ disabled, onSend, onRecordingChange, onStatus, attachments = [], onRemoveAttachment, onOpenCabinet }: NegaInputProps) {
   // 全局错误浮层：任何未捕获的 JS 错误都显示在屏幕上（调试期 instrumentation）
   const [jsError, setJsError] = useState('')
   useEffect(() => {
@@ -217,11 +230,11 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
     }
   }, [])
 
-  // 发送并清空输入框
+  // 发送并清空输入框（有待发送附件时允许空文本——附件正文由父组件拼进 payload）
+  const canSend = text.trim().length > 0 || attachments.length > 0
   const submit = () => {
-    const trimmed = text.trim()
-    if (!trimmed || disabled) return
-    onSend(trimmed)
+    if (!canSend || disabled) return
+    onSend(text.trim())
     setText('')
   }
 
@@ -239,15 +252,46 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
           {jsError}
         </div>
       )}
+      {/* 待发送附件芯片：拖拽上传成功后出现，发送时随消息一起交付（最多 3 个） */}
+      {attachments.length > 0 && (
+        <div className="mx-auto mb-2 flex max-w-2xl flex-wrap gap-2">
+          {attachments.map((a) => (
+            <span
+              key={a.id}
+              className="flex items-center gap-2 rounded-full border border-[#2e2e33] px-3 py-1 text-xs font-light text-[#8a8578]"
+            >
+              <Paperclip className="h-3 w-3" />
+              {a.name} · {a.chars} 字
+              <button
+                type="button"
+                onClick={() => onRemoveAttachment?.(a.id)}
+                className="text-[#4a4a50] transition-colors hover:text-[#c05b4d]"
+                title="移除附件"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
       <div className="mx-auto flex max-w-2xl items-center gap-4">
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}
           disabled={disabled}
-          placeholder={placeholderHint || (disabled ? '会话已结束' : '请讲，先生…')}
+          placeholder={placeholderHint || (disabled ? '会话已结束' : '请讲，先生…（可直接拖文件进来）')}
           className="flex-1 border-b border-[#2e2e33] bg-transparent py-2 text-sm font-light text-[#e8e0d0] outline-none transition-colors placeholder:text-[#4a4a50] focus:border-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-50"
         />
+        <button
+          type="button"
+          onClick={onOpenCabinet}
+          disabled={disabled}
+          title="文件柜（Nolan 生成的文件在这里查看/下载）"
+          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#2e2e33] text-[#8a8578] transition-colors hover:border-[#5a5a60] hover:text-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-30"
+        >
+          <FolderOpen className="h-4 w-4" />
+        </button>
         <button
           type="button"
           onClick={handleMic}
@@ -269,7 +313,7 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
         <button
           type="button"
           onClick={submit}
-          disabled={disabled || !text.trim()}
+          disabled={disabled || !canSend}
           title="发送"
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#2e2e33] text-[#8a8578] transition-colors hover:border-[#5a5a60] hover:text-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-30"
         >

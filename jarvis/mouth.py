@@ -211,6 +211,14 @@ def _synthesize_sentence_to_file(text: str) -> str | None:
     只含可文件化的两级（GLM-TTS / edge-tts）；SAPI 是阻塞直播报，
     无法纳入文件队列，由流水线外层在「全军覆没」时整体兜底。
     """
+    # 说话卫生（Gap8）：单句也别念代码/JSON；剥完无人话返回 None 跳过此句
+    try:
+        import speak_filter
+        text = speak_filter.speakable(text, max_chars=None)
+        if not text:
+            return None
+    except Exception:
+        pass
     # 第一级：GLM-TTS
     try:
         audio = _synthesize_glm_tts(text)
@@ -298,6 +306,15 @@ def speak(text: str) -> None:
     if not text or not text.strip():
         print("🔇 嘴巴：收到空文本，跳过播报。")
         return
+
+    # 说话卫生（Gap8）：代码/JSON/路径/URL 是思考不是台词——
+    # 进合成前剥离；剥完没剩人话就用通用兜底话术，绝不念代码
+    try:
+        import speak_filter
+        text = speak_filter.speakable(text, max_chars=None) \
+            or "先生，详细内容我放在屏幕上了。"
+    except Exception:
+        pass  # 过滤器异常原样放行，绝不阻断发声
 
     # 新一轮播报开始，清除上一轮可能残留的打断标志
     _interrupt.clear()

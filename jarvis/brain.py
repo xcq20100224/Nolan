@@ -16,6 +16,9 @@ Nolan 语音助手 · 大脑模块（brain.py）· 阶段五
 工具协议新增任务前导（gui_control 之前先确认目标应用已打开，未打开先用 open_app + 等待加载）；
 阶段十起前导内置：gui_control 自己确保目标应用已打开并置前（检测窗口 → 缺失自动打开 → 等待出现），
 工具协议不再要求 LLM 先用 open_app 开路（「先打开应用」刻在代码里，而非只写在 prompt 里建议）。
+阶段十一起说话卫生：工具 JSON 提取器三段强化（拆围栏 / 混合 raw_decode / 平衡扫描+修复），
+泄漏兜底死契约——解析失败的工具 JSON 剥离后只留口语部分返回；
+think 出口闸统一过 speak_filter，代码/JSON/命令行是思考不是台词，永远不许成为返回值。
 
 决策流程（按序）：
   1. 空输入 -> 提示重说；2. 退出意图 -> '__EXIT__'；
@@ -77,6 +80,11 @@ try:
     import auth_policy  # H3 分级授权：白名单自主 / 黑名单必确认 / 默认保持现状
 except ImportError:  # pragma: no cover - auth_policy 未就绪时一律走现行确认流程
     auth_policy = None
+
+try:
+    import speak_filter  # 说话卫生：可念性过滤（代码/JSON 是思考，不是台词）
+except ImportError:  # pragma: no cover - 模块缺失时降级，出口闸自动失效
+    speak_filter = None
 
 # == 常量与配置 ==
 
@@ -789,37 +797,150 @@ def _request_llm(url: str, payload: dict, headers: dict) -> str | None:
     return reply or None
 
 
+# == 工具 JSON 提取与泄漏兜底 ==
+#
+# 事故现场（真实截图）：LLM 回复「先生，我将用PowerPoint…{一大串工具JSON}」，
+# JSON 没被解析执行，整段（含 PowerShell）成了回复文本被 TTS 念出。
+# 两道闸门：①提取器尽可能把混合/围栏/瑕疵 JSON 救回来执行；
+# ②救不回来时，泄漏兜底死契约——剥离 JSON 只还口语部分，
+# 原始 JSON/代码永远不许成为 think() 的返回值。
+
+_FENCE_UNWRAP_RE = re.compile(r"```(?:json|JSON)?\s*\n?(.*?)```", re.DOTALL)
+
+# 泄漏检测：形似工具调用的残影（"tool": 键，容忍单引号/花括号间空白）
+_TOOL_JSON_HINT_RE = re.compile(r"[\{\"']\s*tool[\"']\s*:", re.IGNORECASE)
+
+# 泄漏兜底通用话术（口语部分为空时使用）
+_LEAK_FALLBACK = "先生，我在处理这个任务，请稍候看结果。"
+
+
+def _unwrap_fences(text: str) -> str:
+    """拆掉 markdown 代码围栏、保留内容——LLM 常把工具 JSON 包在
+    ```json ... ``` 里，围栏本身不是 JSON，不拆会挡住院括号扫描。"""
+    text = _FENCE_UNWRAP_RE.sub(lambda m: m.group(1), text)
+    # 残余孤立围栏标记行（未闭合围栏的开头，如一行 ```json）直接删行
+    return re.sub(r"^```[^\n]*$", "", text, flags=re.MULTILINE)
+
+
+def _repair_json(candidate: str) -> str:
+    """轻量修复 LLM 常见 JSON 瑕疵：对象/数组收尾前的多余逗号。"""
+    return re.sub(r",(\s*[}\]])", r"\1", candidate)
+
+
+def _balanced_json_candidates(text: str):
+    """从每个 { 位置做花括号平衡扫描（字符串内转义感知），产出候选子串。
+    raw_decode 搞不定的场景（JSON 后紧跟文本、轻微瑕疵）靠它截出候选再修复。"""
+    for start, ch in enumerate(text):
+        if ch != "{":
+            continue
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    yield text[start:i + 1]
+                    break
+
+
+def _as_tool_call(obj) -> dict | None:
+    """解析结果若是含 tool 键的 dict 则返回，否则 None。"""
+    return obj if isinstance(obj, dict) and "tool" in obj else None
+
+
 def _parse_tool_call(reply: str) -> dict | None:
     """
-    工具 JSON 检测：优先整段解析；若回复是「文本 + JSON」混合
-    （如『我来写入文件。{"tool": ...}』），扫描每个 { 位置尝试 raw_decode，
-    取第一个含 'tool' 键的 JSON 对象；都没有返回 None（视为普通文本）。
-    解码器用 strict=False：容忍大模型在 JSON 字符串值里写未转义的
-    控制字符（最常见的是正文里直接换行），避免把可执行的指令误判成普通文本。
+    工具 JSON 检测：返回含 'tool' 键的调用 dict；不是工具调用返回 None。
+    强化后的三段策略：
+      1. 拆 markdown 围栏后整段解析（纯 JSON 回复，含围栏包裹情形）；
+      2. 混合回复（前置口语文本 + 跨行 JSON）：逐个 { 位置 raw_decode，
+         解码器 strict=False，容忍字符串值里的未转义换行；
+      3. 平衡扫描兜底：花括号配对截出候选，原文与轻量修复（去尾逗号）
+         各试一次 json.loads——对付 JSON 后紧跟文本、尾逗号等瑕疵。
     """
     if hands is None or not reply:
         return None
-    text = reply.strip()
+    text = _unwrap_fences(reply.strip())
     decoder = json.JSONDecoder(strict=False)
-    if not text.startswith("{"):
-        # 混合回复：逐个 { 位置尝试解码，寻找内嵌的工具调用
-        for idx, ch in enumerate(text):
-            if ch != "{":
-                continue
+    stripped = text.strip()
+    # 1. 整段解析
+    if stripped.startswith("{"):
+        try:
+            call = _as_tool_call(json.loads(stripped, strict=False))
+            if call is not None:
+                return call
+        except ValueError:
+            pass
+    # 2. 逐个 { 位置 raw_decode（含第 1 步失败的整段，raw_decode 容忍尾部杂散）
+    for idx, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            call = _as_tool_call(decoder.raw_decode(text[idx:])[0])
+            if call is not None:
+                return call
+        except ValueError:
+            continue
+    # 3. 平衡扫描 + 修复解析（跨行、转义引号、尾逗号等瑕疵场景）
+    for cand in _balanced_json_candidates(text):
+        for variant in (cand, _repair_json(cand)):
             try:
-                call, _end = decoder.raw_decode(text[idx:])
+                call = _as_tool_call(json.loads(variant, strict=False))
             except ValueError:
                 continue
-            if isinstance(call, dict) and "tool" in call:
+            if call is not None:
                 return call
-        return None
-    try:
-        call = json.loads(text, strict=False)
-    except ValueError:
-        return None
-    if isinstance(call, dict) and "tool" in call:
-        return call
     return None
+
+
+def _looks_like_tool_json(reply: str) -> bool:
+    """检测回复是否形似工具调用（含 "tool": 残影）却没能解析执行。
+    比旧实现 '"tool"' in reply and '"args"' in reply 更宽：容忍单引号、
+    键前无引号、args 缺失等残缺形态——残缺的执行指令绝不能当普通文本播报。"""
+    return bool(_TOOL_JSON_HINT_RE.search(reply or ""))
+
+
+def _colloquial_or_generic(reply: str) -> str:
+    """
+    泄漏兜底（死契约）：检测到工具 JSON 但解析/执行失败时，
+    最终对先生返回的文本必须剥离 JSON 和代码，只留口语部分
+    （如「先生，我将用PowerPoint为您制作…」）；口语部分为空时
+    返回通用话术。原始 JSON/代码永远不许成为 think() 的返回值。
+    """
+    if speak_filter is not None:
+        clean = speak_filter.speakable(reply, max_chars=None)
+        if clean:
+            return clean
+    return _LEAK_FALLBACK
+
+
+def _speak_guard(reply: str) -> str:
+    """
+    出口闸：think() 的任何返回值在交给先生（可见与可念）之前，
+    统一过一道「不可念内容」检查——代码、JSON、命令行、路径一律剥离；
+    剥完为空用泄漏兜底话术。可见与可念同一标准（max_chars=None，
+    不截断全文，只剥不可念内容）。__EXIT__ 信号原样放行。
+    """
+    if not reply or reply == EXIT_SIGNAL or speak_filter is None:
+        return reply
+    clean = speak_filter.speakable(reply, max_chars=None)
+    if clean == reply.strip():
+        return reply  # 纯口语，原样通过（零改写零风险）
+    return clean or _LEAK_FALLBACK
 
 
 def _think_via_llm(user_text: str, history: list[dict]) -> str | None:
@@ -871,11 +992,11 @@ def _think_via_llm(user_text: str, history: list[dict]) -> str | None:
             return None  # 大模型链路故障：整体降级，交给规则兜底
         call = _parse_tool_call(reply)
         if call is None:
-            # 防泄漏 + 自愈：回复形似工具调用（含 "tool"/"args"）却解析失败时，
+            # 防泄漏 + 自愈：回复形似工具调用（含 "tool": 残影）却解析失败时，
             # 那是格式残缺的执行指令——绝不能当普通文本播报给先生；
             # 轮次预算内回灌一条格式纠正指令让大模型重发（畸形是瞬态非确定性），
-            # 预算耗尽才如实汇报失败
-            if '"tool"' in reply and '"args"' in reply:
+            # 预算耗尽走泄漏兜底：剥离 JSON 只留口语部分，原始代码绝不上屏上嘴
+            if _looks_like_tool_json(reply):
                 print("[brain] 大模型返回了无法解析的工具 JSON（格式残缺），要求其重发。")
                 if round_no < _MAX_TOOL_ROUNDS:
                     messages.append({
@@ -888,11 +1009,10 @@ def _think_via_llm(user_text: str, history: list[dict]) -> str | None:
                         ),
                     })
                     continue
-                return (
-                    "抱歉先生，我在组织执行指令时格式出了点问题，这一步没能完成；"
-                    "请您再说一遍，我重新组织一次。"
-                )
-            return reply  # 普通文本：Agent 循环结束，作为最终回复
+                return _colloquial_or_generic(reply)
+            # 普通文本：Agent 循环结束，作为最终回复
+            # （think() 出口闸会统一再过一遍不可念内容检查，此处原样返回）
+            return reply
         result = _execute_tool(call["tool"], call.get("args") or {})
         if not isinstance(result, str):
             result = str(result)
@@ -1262,8 +1382,12 @@ def think(user_text: str, history: list[dict]) -> str:
     第一性原理：萃取每轮要花一次 GLM 调用（秒级），绝不能加在
     回复链路上——那是用户能感知的延迟税。因此萃取放守护线程
     异步进行，回复延迟零增加；萃取失败只损失一条记忆，不影响对话。
+
+    说话卫生（死契约）：任何返回值先过 _speak_guard 出口闸——
+    代码、工具 JSON、命令行、路径是 Nolan 的思考不是台词，
+    原始 JSON/代码永远不许成为 think() 的返回值（可见与可念同一标准）。
     """
-    reply = _think_impl(user_text, history)
+    reply = _speak_guard(_think_impl(user_text, history))
     if episodic is not None and reply and reply != EXIT_SIGNAL:
         try:
             episodic.log_event(

@@ -71,6 +71,19 @@ export default function HistoryOverlay({ messages, onClose }: HistoryOverlayProp
                     >
                       {msg.text}
                     </p>
+                    {/* 附件芯片：随消息发送的文件（文件名 + 抽取字数，正文已拼入 payload） */}
+                    {msg.attachments && msg.attachments.length > 0 && (
+                      <div className={`mt-1 flex flex-wrap gap-1 ${isUser ? 'justify-end' : ''}`}>
+                        {msg.attachments.map((a, i) => (
+                          <span
+                            key={`${msg.id}-att-${i}`}
+                            className="rounded-full border border-[#2e2e33] px-2 py-0.5 text-[10px] font-light text-[#6b6b70]"
+                          >
+                            📎 {a.name} · {a.chars} 字
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               )

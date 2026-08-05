@@ -441,3 +441,67 @@ export async function getBackground(): Promise<string | null> {
   if (typeof url !== 'string' || url === '') return null
   return url.startsWith('/') ? url : `/api/files/${url}`
 }
+
+/** 上传结果（POST /api/upload 响应，契约见 server.py 文件头） */
+export interface UploadResult {
+  ok: boolean
+  /** 存储文件名（时间戳前缀 + 净化后的原名） */
+  name: string
+  /** 抽取文本总字数 */
+  chars: number
+  /** 前 2000 字摘要 */
+  excerpt: string
+  /** 全量抽取文本（发送时拼进对话 payload 用，前端按 8000 字截断） */
+  text: string
+  truncated?: boolean
+  /** 文件柜下载地址（/api/files/uploads/<存储名>） */
+  file_url: string
+}
+
+/**
+ * 文件上传：POST /api/upload（base64 JSON 契约——标准库后端无 multipart 解析器）。
+ * FileReader 读成 dataURL，取逗号后的 base64 段上送；失败抛带后端说明的错误。
+ */
+export async function uploadFile(file: File): Promise<UploadResult> {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(new Error('文件读取失败'))
+    reader.readAsDataURL(file)
+  })
+  const comma = dataUrl.indexOf(',')
+  const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl
+  const res = await fetch('/api/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: file.name, data_base64: base64 }),
+  })
+  const data = (await res.json()) as UploadResult & { error?: string }
+  if (!res.ok || !data.ok) {
+    throw new Error(data.error || `上传失败：状态码 ${res.status}`)
+  }
+  return data
+}
+
+/** 文件柜条目（GET /api/files_list） */
+export interface CabinetFile {
+  /** 相对 files 目录的正斜杠路径（如 uploads/20260804-120000_报告.pdf） */
+  name: string
+  /** 字节数 */
+  size: number
+  /** 修改时间（epoch 秒） */
+  mtime: number
+  /** 分类：文档 / 图片 / 表格 / 音频 / 其他 */
+  kind: string
+}
+
+/** 文件柜列表：GET /api/files_list（每次打开面板时刷新） */
+export async function getFilesList(): Promise<CabinetFile[]> {
+  const data = await fetchJson<{ files: CabinetFile[] }>('/api/files_list')
+  return Array.isArray(data.files) ? data.files : []
+}
+
+/** 文件柜条目的查看/下载地址（name 为相对 files 的路径，逐段编码防中文/空格） */
+export function cabinetFileUrl(name: string): string {
+  return '/api/files/' + name.split('/').map(encodeURIComponent).join('/')
+}
