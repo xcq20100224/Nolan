@@ -129,7 +129,7 @@ except ImportError:
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-05-filereader"
+_VERSION = "2026-08-06-audioclean"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -521,8 +521,16 @@ def _glm_tts_to_file(text: str, path: str) -> bool:
             timeout=12,  # 硬上界：主通道最多 12 秒，超时即放弃换备用通道
         )
         if resp.status_code == 200 and resp.content:
+            payload = resp.content
+            # Gap8 说话卫生：GLM-TTS 的 wav 自带 ~1.8 秒「滴答」接通提示音，
+            # 落盘前裁掉前奏+淡入（净化异常原样落盘，绝不弄坏音频）
+            try:
+                import audio_clean
+                payload = audio_clean.clean_wav_bytes(payload)
+            except Exception:
+                pass
             with open(path, "wb") as f:
-                f.write(resp.content)
+                f.write(payload)
             return os.path.getsize(path) > 0
         print(f"[server] GLM-TTS 返回异常：status={resp.status_code} body={resp.text[:200]}")
     except Exception as e:

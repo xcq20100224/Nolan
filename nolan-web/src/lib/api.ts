@@ -188,103 +188,12 @@ export async function getDueMessages(): Promise<DueMessage[]> {
 }
 
 /**
- * 当前正在播放的 Audio 实例（全局唯一注册点）。
- * playAudio 每次开播前停掉上一个——同一时刻只应有一个 Nolan 在出声，
- * 这也是「打断」的物理执行点：stopAllAudio() 一调，浏览器通道立即静音。
+ * 播放链路已收编到 Web Audio 引擎（@/lib/audioEngine）：
+ * GainNode 包络消句首/接缝/停播爆音，失败自动回退 <audio> 元素。
+ * 此处仅做转发导出，对外契约（playAudio/enqueueAudio/stopAllAudio）不变。
  */
-let currentAudio: HTMLAudioElement | null = null
-
-/**
- * 句级流式播放队列（Gap1 流式化）：/api/chat/stream 合成好一句推一句，
- * 前端 enqueueAudio 按序连播——playInSequence 的「边收边播」动态队列版。
- * stopAllAudio 一并清空队列：手动/语音打断时，未播的句子不再出声。
- */
-let audioQueue: string[] = []
-let audioQueueBusy = false
-
-/** 停掉当前正在播放的 Audio（不动播放队列；playAudio 开播前的内部清理点） */
-function stopCurrentAudio(): void {
-  if (currentAudio) {
-    try {
-      currentAudio.pause()
-      currentAudio.removeAttribute('src')
-      currentAudio.load()
-    } catch {
-      /* 忽略 */
-    }
-    currentAudio = null
-  }
-}
-
-/**
- * 立即停止浏览器通道的全部播报（手动/语音打断共用）。
- * 清空句级队列 + pause 当前 + 摘掉 src 双保险：部分内嵌 webview 对单独 pause 响应迟缓。
- */
-export function stopAllAudio(): void {
-  audioQueue = []
-  audioQueueBusy = false
-  stopCurrentAudio()
-}
-
-/** 把一句合成好的音频地址追加进流式播放队列；队列空闲时立即开播 */
-export function enqueueAudio(url: string): void {
-  if (!url) return
-  audioQueue.push(url)
-  pumpAudioQueue()
-}
-
-/** 队列泵：串行播放，ended/error 推进下一条；某条失败跳过，保证队列不死锁 */
-function pumpAudioQueue(): void {
-  if (audioQueueBusy) return
-  const url = audioQueue.shift()
-  if (!url) return
-  audioQueueBusy = true
-  const audio = playAudio(url)
-  if (!audio) {
-    audioQueueBusy = false
-    pumpAudioQueue()
-    return
-  }
-  let advanced = false
-  const advance = () => {
-    if (advanced) return
-    advanced = true
-    audioQueueBusy = false
-    pumpAudioQueue()
-  }
-  audio.addEventListener('ended', advance, { once: true })
-  audio.addEventListener('error', advance, { once: true })
-  // 兜底：自动播放被浏览器拒绝时 ended/error 都不触发，
-  // 1.5 秒后若仍 paused 且未开始过，视为未出声，直接推进队列（与 playInSequence 同思路）
-  window.setTimeout(() => {
-    if (audioQueueBusy && audio.paused && audio.currentTime === 0) advance()
-  }, 1500)
-}
-
-/**
- * 播放一段音频：url 非空时创建 Audio 并尝试播放。
- * play() 返回的 promise 被浏览器自动播放策略拒绝时静默吞掉（用户交互过页面后通常允许），
- * 返回 Audio 实例，方便调用方用 ended 事件串联多段音频。
- * 开播前自动停掉上一条（注册表语义；不清流式队列——队列泵正是靠它逐条开播），
- * 播完自动出清注册表。
- */
-export function playAudio(url: string | null): HTMLAudioElement | null {
-  if (!url) return null
-  stopCurrentAudio()
-  const audio = new Audio(url)
-  currentAudio = audio
-  audio.addEventListener('ended', () => {
-    if (currentAudio === audio) currentAudio = null
-  })
-  audio.addEventListener('error', () => {
-    if (currentAudio === audio) currentAudio = null
-  })
-  audio.play().catch(() => {
-    // 自动播放被拦截：静默失败，字幕已展示文本，不影响主流程
-    if (currentAudio === audio) currentAudio = null
-  })
-  return audio
-}
+export { playAudio, enqueueAudio, stopAllAudio } from './audioEngine'
+export type { PlaybackHandle } from './audioEngine'
 
 /** 主动晨报：GET /api/greeting → {greeted, text, audio_url}（每天首次有问候语） */
 export async function getGreeting(): Promise<{ greeted: boolean; text: string | null; audio_url: string | null }> {

@@ -45,6 +45,14 @@ _MIN_SENTENCE_CHARS = 8      # 过短碎片并入下一句，避免频繁启播�
 
 import queue as _queue       # 流水线生产者→消费者队列（模块内专用）
 
+# 音频净化（Gap：消灭 GLM-TTS wav 开头固定的 ~1.8s「滴答」提示音前奏）。
+# 净化是纯函数、任何异常原样返回；模块缺失时退化为直通，绝不阻断发声。
+try:
+    from audio_clean import clean_wav_bytes as _clean_wav_bytes
+except Exception:
+    def _clean_wav_bytes(data: bytes) -> bytes:  # type: ignore
+        return data
+
 # 可打断标志：外部线程（如网页端 /api/stop）置位，正在播放的语音立即停止。
 # 每次 speak() 开头清位，保证打断只作用于「当前这一句」。
 _interrupt = threading.Event()
@@ -221,7 +229,7 @@ def _synthesize_sentence_to_file(text: str) -> str | None:
         pass
     # 第一级：GLM-TTS
     try:
-        audio = _synthesize_glm_tts(text)
+        audio = _clean_wav_bytes(_synthesize_glm_tts(text))  # 裁掉开头滴答前奏
         return _write_temp_file(audio, ".wav")
     except Exception as glm_exc:
         print(f"⚠️ 嘴巴：句级 GLM-TTS 失败（{glm_exc}），本句降级 edge-tts。")
@@ -339,7 +347,7 @@ def speak(text: str) -> None:
         # 2. 第一级：GLM-TTS 主通道（wav）
         try:
             print("🗣️ 嘴巴：正在用 GLM-TTS 主通道合成语音（男声）...")
-            audio = _synthesize_glm_tts(text)
+            audio = _clean_wav_bytes(_synthesize_glm_tts(text))  # 裁掉开头滴答前奏
             tmp_path = _write_temp_file(audio, ".wav")
             print(f"✅ 嘴巴：GLM-TTS 合成成功，文件大小 {os.path.getsize(tmp_path)} 字节。")
             _play_file(tmp_path)

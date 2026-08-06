@@ -261,7 +261,7 @@ export default function ChatApp() {
     if (bootedRef.current) return
     bootedRef.current = true
 
-    clientLog('页面加载 build 0804-2')
+    clientLog('页面加载 build 0805-2')
     checkHealth().then((ok) => {
       clientLog(`健康检查: ${ok}`)
       setOnline(ok)
@@ -517,7 +517,7 @@ export default function ChatApp() {
 
         {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
         <span className="pointer-events-none absolute bottom-2 right-3 text-[10px] font-light tracking-widest text-[#3a3a40]">
-          build 0805-1
+          build 0805-2
         </span>
       </div>
     </div>
