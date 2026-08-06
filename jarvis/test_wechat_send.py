@@ -30,7 +30,8 @@ class WechatSendTest(unittest.TestCase):
 
         # 替换模块级依赖（防御式导入的全局名），测试后还原
         self._orig = (wechat_send._FILES_DIR, wechat_send._eyes,
-                      wechat_send._skills, wechat_send._hands)
+                      wechat_send._skills, wechat_send._hands,
+                      wechat_send._wechat_kbd)
         self.addCleanup(self._restore)
 
         wechat_send._FILES_DIR = self.files_dir
@@ -40,6 +41,12 @@ class WechatSendTest(unittest.TestCase):
         wechat_send._eyes = self.eyes
         wechat_send._skills = self.skills
         wechat_send._hands = self.hands
+        # L1.6 键盘流打桩：默认诚实失败降级（不碰真键盘/剪贴板/VLM），
+        # 各层路由与话术断言维持原样
+        self.kbd = mock.Mock()
+        self.kbd.send_file_via_keyboard.return_value = {
+            "ok": False, "stage": "打桩", "detail": ""}
+        wechat_send._wechat_kbd = self.kbd
 
         # 剪贴板登台打桩：默认成功（不碰真剪贴板）
         stage = mock.patch.object(wechat_send, "_stage_file_to_clipboard",
@@ -52,7 +59,8 @@ class WechatSendTest(unittest.TestCase):
 
     def _restore(self):
         (wechat_send._FILES_DIR, wechat_send._eyes,
-         wechat_send._skills, wechat_send._hands) = self._orig
+         wechat_send._skills, wechat_send._hands,
+         wechat_send._wechat_kbd) = self._orig
 
     # ---- L0：文件校验 ----
 

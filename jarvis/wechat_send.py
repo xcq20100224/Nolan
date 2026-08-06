@@ -10,6 +10,12 @@ wechat_send.py —— Nolan 的「发文件到微信」通道
        且必须在 jarvis/files/ 真实存在，否则直接人话报错；
     L1 技能快路：skills.find("在微信里把文件发给「target」") 命中
        → eyes.replay 按名重放（replay 自带终态复核，失败返回 None 降级）；
+    L1.5 UIA 通道：uia_wechat.send_file_via_uia 用 Windows UI Automation
+       直接操作微信控件树——不看屏幕、不猜坐标，成功判定基于 UIA 证据
+       （消息区出现文件卡片），模块缺席时静默跳过；
+    L1.6 键盘流通道：wechat_kbd.send_file_via_keyboard 走确定性键盘事件
+       （唤起 → Ctrl+F 搜索 → 粘贴 → Enter 发送），零坐标点击，
+       发送前后各有一道 VLM 是非题安全闸验收，否决即诚实降级；
     L2 视觉闭环：先把文件复制进系统剪贴板（PowerShell Set-Clipboard），
        hands.open_app 确保微信在屏幕上，再 eyes.perform 逐步闭环
        （点输入框 → Ctrl+V 粘贴文件 → 出现文件卡片 → 发送）；
@@ -48,6 +54,16 @@ try:
     import hands as _hands
 except Exception:  # noqa: BLE001
     _hands = None
+# L1.5 UIA 通道：模块缺席时静默跳到 L1.6（防御式，与上同款）
+try:
+    import uia_wechat as _uia_wechat
+except Exception:  # noqa: BLE001
+    _uia_wechat = None
+# L1.6 键盘流通道：模块缺席时静默跳到 L2（防御式，与上同款）
+try:
+    import wechat_kbd as _wechat_kbd
+except Exception:  # noqa: BLE001
+    _wechat_kbd = None
 
 _JARVIS_DIR = os.path.dirname(os.path.abspath(__file__))
 # 文件柜：jarvis/files/（与 hands.SANDBOX_DIR 同一物理位置；独立计算，
@@ -240,13 +256,70 @@ def send_file(file_name: str, target: str = _DEFAULT_TARGET) -> str:
                     # replay 自带终态复核，返回字符串即复核通过
                     return ("好的先生，文件「%s」已经通过微信发给%s了。"
                             % (name, target))
-                # None：重放放不进现实，降级 L2 视觉闭环
+                # None：重放放不进现实，降级 L1.5 UIA 通道
+
+        # ---- L1.5：UIA 通道（不看屏幕、不猜坐标，直接操作控件树） ----
+        if _uia_wechat is not None:
+            try:
+                uia = _uia_wechat.send_file_via_uia(abs_path, target)
+            except Exception:  # noqa: BLE001
+                uia = None
+            if isinstance(uia, dict):
+                print("[wechat_send] L1.5 UIA 通道：ok=%s stage=%s detail=%s"
+                      % (uia.get("ok"), uia.get("stage"), uia.get("detail")))
+                if uia.get("ok"):
+                    # 成功固化：与 L2 成功同款沉淀，下次走 L1 快路
+                    if _skills is not None:
+                        try:
+                            _skills.record(_skill_task(target),
+                                           _canonical_steps(target))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return ("好的先生，文件「%s」已经通过微信发给%s了。"
+                            % (name, target))
+                # ok=False：诚实降级 L2 视觉闭环（话术留作 L3 现场补充）
+                _l15_detail = uia.get("detail") or ""
+            else:
+                _l15_detail = ""
+        else:
+            _l15_detail = ""
+
+        # ---- L1.6：键盘流通道（确定性键盘事件 + VLM 两道安全闸验收） ----
+        if _wechat_kbd is not None:
+            try:
+                kbd = _wechat_kbd.send_file_via_keyboard(abs_path, target)
+            except Exception:  # noqa: BLE001
+                kbd = None
+            if isinstance(kbd, dict):
+                print("[wechat_send] L1.6 键盘流通道：ok=%s stage=%s detail=%s"
+                      % (kbd.get("ok"), kbd.get("stage"), kbd.get("detail")))
+                if kbd.get("ok"):
+                    # 成功固化：与 L1.5/L2 成功同款沉淀，下次走 L1 快路
+                    if _skills is not None:
+                        try:
+                            _skills.record(_skill_task(target),
+                                           _canonical_steps(target))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return ("好的先生，文件「%s」已经通过微信发给%s了。"
+                            % (name, target))
+                # ok=False：诚实降级 L2 视觉闭环（话术留作 L3 现场补充）
+                _l16_detail = kbd.get("detail") or ""
+            else:
+                _l16_detail = ""
+        else:
+            _l16_detail = ""
 
         # ---- L2：视觉闭环 ----
         if _eyes is None:
-            return ("先生，我的视觉模块现在帮不上忙，微信发送这步没能自动"
-                    "完成，文件在文件柜里（%s），您可以手动把它拖进微信。"
-                    % name)
+            msg = ("先生，我的视觉模块现在帮不上忙，微信发送这步没能自动"
+                   "完成，文件在文件柜里（%s），您可以手动把它拖进微信。"
+                   % name)
+            if _l15_detail:
+                msg += "（UIA 通道的情况：%s）" % _l15_detail
+            if _l16_detail:
+                msg += "（键盘流通道的情况：%s）" % _l16_detail
+            return msg
         staged = _stage_file_to_clipboard(abs_path)
         _open_wechat()
         try:
@@ -265,6 +338,10 @@ def send_file(file_name: str, target: str = _DEFAULT_TARGET) -> str:
             # ---- L3：诚实话术，绝不谎称已发送 ----
             msg = ("先生，微信发送这步没能自动完成，文件在文件柜里（%s），"
                    "您可以手动把它拖进微信。" % name)
+            if _l15_detail:
+                msg += "（UIA 通道的情况：%s）" % _l15_detail
+            if _l16_detail:
+                msg += "（键盘流通道的情况：%s）" % _l16_detail
             if result:
                 msg += "当时的情况：%s" % result
             return msg

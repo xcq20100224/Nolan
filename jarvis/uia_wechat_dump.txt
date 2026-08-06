@@ -1,0 +1,7 @@
+微信 4.1.12.26 主窗口 UIA 控件树（屏幕阅读器标志=开、窗口可见）
+采集时间：真机验收当刻；结论：内容控件未暴露，树为秃树
+
+WindowControl name='微信' class='Qt51514QWindowIcon' rect=(235,144,2597,1637)
+  WindowControl name='Weixin' class='Qt51514QWindowIcon' rect=(676,316,2152,1448)
+  PaneControl name='Weixin' class='Qt51514QWindowIcon' rect=(2582,1622,2584,1624)
+  PaneControl name='MMUIRenderSubWindowHW' class='MMUIRenderSubWindowHW' rect=(248,144,2584,1624)
