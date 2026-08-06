@@ -10,6 +10,6 @@ export interface Message {
   time: string
   /** 是否为「Nolan 思考中…」占位消息 */
   pending?: boolean
-  /** 随消息发送的附件芯片（仅展示：文件名 + 抽取字数；正文已拼入发给后端的 payload） */
-  attachments?: { name: string; chars: number }[]
+  /** 随消息发送的附件芯片（仅展示：文件名 + 类别 + 抽取字数；正文已拼入发给后端的 payload） */
+  attachments?: { name: string; chars: number; kind?: string; note?: string }[]
 }

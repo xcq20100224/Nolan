@@ -16,8 +16,12 @@ interface StagedAttachment {
   id: string
   /** 存储文件名（时间戳前缀 + 净化名） */
   name: string
-  /** 抽取文本总字数 */
+  /** 抽取文本总字数（0 = 上传中占位或无文本产物） */
   chars: number
+  /** 类别：文本/表格/文档/演示文稿/图片/音频/视频/压缩包/二进制 */
+  kind: string
+  /** 诚实说明（如「扫描版PDF，无文本层」），空串表示通道正常 */
+  note: string
   /** 全量抽取文本（发送时按 8000 字截断拼进 payload） */
   text: string
 }
@@ -121,16 +125,20 @@ export default function ChatApp() {
         const seatId = nextId()
         attachmentsRef.current = [
           ...attachmentsRef.current,
-          { id: seatId, name: file.name, chars: 0, text: '' },
+          { id: seatId, name: file.name, chars: 0, kind: '', note: '', text: '' },
         ]
         setAttachments(attachmentsRef.current)
         uploadFile(file)
           .then((r) => {
             attachmentsRef.current = attachmentsRef.current.map((a) =>
-              a.id === seatId ? { id: seatId, name: r.name, chars: r.chars, text: r.text } : a,
+              a.id === seatId
+                ? { id: seatId, name: r.name, chars: r.chars, kind: r.kind, note: r.note, text: r.text }
+                : a,
             )
             setAttachments(attachmentsRef.current)
-            pushNolan(`先生，文件「${file.name}」已收到，抽取了 ${r.chars} 字。发送时我会一起读。`)
+            // 通道说明（note）如实播报：扫描版 PDF、无转写通道等不让先生蒙在鼓里
+            const notePart = r.note ? ` ${r.note}` : ''
+            pushNolan(`先生，文件「${file.name}」已收到（${r.kind}），抽取了 ${r.chars} 字。${notePart}发送时我会一起读。`)
           })
           .catch((e) => {
             attachmentsRef.current = attachmentsRef.current.filter((a) => a.id !== seatId)
@@ -183,7 +191,7 @@ export default function ChatApp() {
         role: 'user',
         text: displayText,
         time: nowHHMM(),
-        attachments: atts.length > 0 ? atts.map((a) => ({ name: a.name, chars: a.chars })) : undefined,
+        attachments: atts.length > 0 ? atts.map((a) => ({ name: a.name, chars: a.chars, kind: a.kind, note: a.note })) : undefined,
       },
     ])
 
@@ -498,7 +506,7 @@ export default function ChatApp() {
           onSend={handleSend}
           onRecordingChange={setRecording}
           onStatus={pushNolan}
-          attachments={attachments.map((a) => ({ id: a.id, name: a.name, chars: a.chars }))}
+          attachments={attachments.map((a) => ({ id: a.id, name: a.name, chars: a.chars, kind: a.kind, note: a.note }))}
           onRemoveAttachment={handleRemoveAttachment}
           onOpenCabinet={() => setCabinetOpen(true)}
         />
@@ -509,7 +517,7 @@ export default function ChatApp() {
 
         {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
         <span className="pointer-events-none absolute bottom-2 right-3 text-[10px] font-light tracking-widest text-[#3a3a40]">
-          build 0804-2
+          build 0805-1
         </span>
       </div>
     </div>

@@ -53,15 +53,20 @@ API 契约（一字不差）：
                          只允许安全相对路径（含 uploads/ 等子目录），路径穿越一律 404
     POST /api/upload     请求 {"name": "原始文件名", "data_base64": "..."}
                          （base64 JSON 契约：标准库无 multipart 解析器，此契约最简单；
-                         请求体上限 30MB，解码后文件上限 20MB）
-                         → {"ok": true, "name": 存储文件名, "chars": 抽取字数,
-                            "excerpt": 前 2000 字, "text": 全量抽取文本,
+                         请求体上限 65MB，解码后文件上限 50MB）
+                         → {"ok": true, "name": 存储文件名, "kind": 类别,
+                            "chars": 抽取字数, "excerpt": 前 8000 字, "text": 全量抽取文本,
+                            "meta": {辅助信息}, "note": 诚实说明,
                             "truncated": bool, "file_url": "/api/files/uploads/<存储名>"}
                          落盘 jarvis/files/uploads/（目录自动创建，时间戳前缀防覆盖，
                          文件名净化只留安全字符 + commonpath 双重防护）；
-                         文本类（txt/md/py/js/ts/json/csv/log/ini/yaml）直读前 100KB，
-                         PDF 抽前 20 页（pypdf），DOCX 抽段落（python-docx）；
-                         不支持类型返回 400 明确错误（不乱猜）
+                         全类型支持：抽取逻辑在 jarvis/file_reader.py 类型路由器
+                         （文本直读 / csv·xlsx pandas 分析 / docx 段落+表格 /
+                         pptx XML 解析 / pdf pypdf 文字层 / 图片 VLM 解读 /
+                         音视频 whisper 转写 / zip 清单+就地抽取 / 二进制魔数+strings）；
+                         任何单类失败只降级 note，绝不报错拒收；
+                         非图片/二进制类的抽取全文落盘 <存储名>.extracted.txt，
+                         供深度追问时回读
     GET  /api/files_list → {"files": [{"name","size","mtime","kind"}]}
                          递归列出 jarvis/files/（含 uploads/ 子目录；排除 tts_cache、
                          pidfile、日志等后端内部文件），按 mtime 倒序，
@@ -105,6 +110,7 @@ if _JARVIS_DIR not in sys.path:
 import brain       # noqa: E402  大脑：think(user_text, history) -> str
 import reminders   # noqa: E402  提醒：check_due / list_pending / add
 import memory      # noqa: E402  记忆：recall / load / remember / forget
+import file_reader  # noqa: E402  全类型文件阅读引擎：read_upload 类型路由器
 
 try:
     import memory_v2  # noqa: E402  Gap3 结构化长期记忆（画像/萃取）
@@ -123,7 +129,7 @@ except ImportError:
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-05-speakfilter"
+_VERSION = "2026-08-05-filereader"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -155,21 +161,12 @@ _IMAGE_MIME = {
 # jarvis/files/（上传落在其 uploads/ 子目录）。入口把文件抽成文本喂给对话，
 # 出口把柜子里的文件列出来供查看/下载；两侧都只认白名单、都过路径穿越防护。
 _UPLOADS_DIR = os.path.normpath(os.path.join(_FILES_DIR, "uploads"))
-_UPLOAD_MAX_BYTES = 20 * 1024 * 1024       # 上传文件大小上限 20MB
-_UPLOAD_MAX_BODY_BYTES = 30 * 1024 * 1024  # base64 请求体上限（20MB 膨胀约 1/3 再加余量）
-_TEXT_READ_LIMIT = 100 * 1024              # 文本类文件只读前 100KB（超出截断）
-_PDF_MAX_PAGES = 20                        # PDF 只抽前 20 页
-_EXCERPT_CHARS = 2000                      # 响应 excerpt 只带前 2000 字
-
-# 直接按文本读取的后缀（UTF-8，errors=replace 容错解码）
-_TEXT_EXTS = {
-    ".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".log", ".ini",
-    ".yaml", ".yml",
-}
-# 需要专用解析器的后缀
-_DOC_EXTS = {".pdf", ".docx"}
-# 上传支持的类型 = 文本直读 + 专用解析（其余一律明确拒绝，不乱猜）
-_SUPPORTED_UPLOAD_EXTS = _TEXT_EXTS | _DOC_EXTS
+_UPLOAD_MAX_BYTES = 50 * 1024 * 1024       # 上传文件大小上限 50MB
+_UPLOAD_MAX_BODY_BYTES = 65 * 1024 * 1024  # base64 请求体粗闸门上限（50MB 膨胀约 1/3 再加余量）
+_EXCERPT_CHARS = 8000                      # 响应 excerpt 带上前 8000 字
+                                           # （与前端附件拼接上限一致：read_file 工具
+                                           #  按 basename 解析，读不到 uploads/ 子目录的
+                                           #  .extracted.txt 全文，故 excerpt 尽量多带）
 
 # /api/files 下载白名单（图片之外的扩展；下载统一带 Content-Disposition: attachment）
 _DOWNLOAD_MIME = {
@@ -232,70 +229,47 @@ def _sanitize_filename(name: str) -> str:
     return cleaned or "file"
 
 
-def _extract_text(path: str, ext: str):
+def _whisper_transcribe_file(path: str):
     """
-    按类型抽取文件文本，返回 (文本, 是否截断)。
-    文本类：只读前 100KB，UTF-8 容错解码；
-    PDF：pypdf 抽前 20 页；DOCX：python-docx 抽段落。
-    解析失败抛 ValueError（中文说明），由调用方转成错误响应。
+    音视频转写通道（注入给 file_reader 用）：复用常驻 whisper 单例按路径转写，
+    返回 (文本, 时长秒)。模型不可用抛 RuntimeError；PyAV 解码失败的格式
+    异常原样上抛——file_reader 统一降级为诚实 note，绝不 500。
     """
-    if ext in _TEXT_EXTS:
-        try:
-            with open(path, "rb") as f:
-                raw = f.read(_TEXT_READ_LIMIT + 1)
-        except OSError as e:
-            raise ValueError(f"读取文件失败了：{e}")
-        truncated = len(raw) > _TEXT_READ_LIMIT
-        if truncated:
-            raw = raw[:_TEXT_READ_LIMIT]
-        return raw.decode("utf-8", errors="replace"), truncated
-    if ext == ".pdf":
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(path)
-            parts = []
-            for page in reader.pages[:_PDF_MAX_PAGES]:
-                parts.append(page.extract_text() or "")
-            text = "\n".join(p for p in parts if p).strip()
-            return text, len(reader.pages) > _PDF_MAX_PAGES
-        except ValueError:
-            raise
-        except Exception as e:
-            raise ValueError(f"PDF 解析失败了（文件可能损坏或已加密）：{e}")
-    if ext == ".docx":
-        try:
-            import docx
-            document = docx.Document(path)
-            text = "\n".join(p.text for p in document.paragraphs if p.text).strip()
-            return text, False
-        except Exception as e:
-            raise ValueError(f"DOCX 解析失败了（文件可能损坏）：{e}")
-    raise ValueError(
-        f"不支持的文件类型：{ext or '（无扩展名）'}。"
-        f"目前支持：{'、'.join(sorted(_SUPPORTED_UPLOAD_EXTS))}")
+    _load_whisper()
+    if _whisper_model is None:
+        raise RuntimeError(_whisper_error or "语音模型不可用。")
+    with _whisper_lock:
+        segments, info = _whisper_model.transcribe(
+            path,
+            language="zh",
+            initial_prompt="以下是用户上传的音频/视频文件内容，多为中文。",
+            beam_size=1,      # 与 ASR 端点同策略：small 模型贪心解码够用且快
+            vad_filter=True,  # 过滤静音段，纯音乐/静音自然得到空结果
+        )
+        text = "".join(seg.text for seg in segments).strip()
+    return text, float(getattr(info, "duration", 0.0) or 0.0)
 
 
 def _save_upload(name: str, data: bytes,
                  uploads_dir: str = _UPLOADS_DIR, files_dir: str = _FILES_DIR):
     """
-    上传落盘 + 文本抽取（纯逻辑，可单测；不起服务）。
-    返回 (存储文件名, 抽取文本, 是否截断)；任何失败抛 ValueError（中文说明）。
+    上传落盘 + 全类型抽取（纯逻辑，可单测；不起服务）。
+    返回 (存储文件名, 抽取结果 dict)；dict 契约见 file_reader.read_upload
+    （kind/text/meta/note，任何单类失败只降级 note，绝不抛异常）。
+    只有硬性闸门失败抛 ValueError（中文说明）：空文件、超 50MB、目录越界。
 
     安全闸门（与 _serve_file 同一套思路）：
-      大小上限 20MB；类型白名单；文件名净化只留安全字符；时间戳前缀防覆盖；
+      大小上限 50MB；文件名净化只留安全字符；时间戳前缀防覆盖；
       落盘目录必须仍在 files 目录内（commonpath 双重保险）。
-    解析失败的文件不留柜（删掉半成品），原因如实上报。
+    非图片/二进制类的抽取全文落盘 <存储名>.extracted.txt（深度追问回读用；
+    read_file 工具按 basename 解析读不到 uploads/ 子目录，故响应 excerpt
+    已尽量多带，落盘主要服务于文件柜留痕与后续排查）。
     """
     if not data:
         raise ValueError("文件内容为空。")
     if len(data) > _UPLOAD_MAX_BYTES:
         raise ValueError(
-            f"文件超过大小上限（20MB），本文件约 {len(data) / 1024 / 1024:.1f}MB。")
-    ext = os.path.splitext(name or "")[1].lower()
-    if ext not in _SUPPORTED_UPLOAD_EXTS:
-        raise ValueError(
-            f"不支持的文件类型：{ext or '（无扩展名）'}。"
-            f"目前支持：{'、'.join(sorted(_SUPPORTED_UPLOAD_EXTS))}")
+            f"文件超过大小上限（50MB），本文件约 {len(data) / 1024 / 1024:.1f}MB。")
     # 双重保险：上传目录必须仍在 files 目录内（配置被改动时宁可拒绝写入）
     try:
         inside = os.path.commonpath(
@@ -324,15 +298,17 @@ def _save_upload(name: str, data: bytes,
             f.write(data)
     except OSError as e:
         raise ValueError(f"文件写入失败：{e}")
-    try:
-        text, truncated = _extract_text(full, ext)
-    except ValueError:
+    # 全类型路由：任何格式都有通道，任何单类失败只降级 note，文件一律留柜
+    result = file_reader.read_upload(full, name,
+                                     transcribe_fn=_whisper_transcribe_file)
+    # 抽取全文落盘（图片/二进制类没有长文本产物，不落）
+    if result.get("text") and result.get("kind") not in ("图片", "二进制"):
         try:
-            os.remove(full)  # 解析失败：文件不留柜，避免柜子里躺着读不了的文件
-        except OSError:
-            pass
-        raise
-    return stored, text, truncated
+            with open(full + ".extracted.txt", "w", encoding="utf-8") as f:
+                f.write(result["text"])
+        except OSError as e:
+            print(f"[server] 抽取全文落盘失败（不影响上传）：{e}")
+    return stored, result
 
 
 def _resolve_files_path(name: str):
@@ -1835,7 +1811,7 @@ class NolanHandler(BaseHTTPRequestHandler):
             return
         if length > _UPLOAD_MAX_BODY_BYTES:
             self.close_connection = True
-            self._send_error_json(413, "文件超过大小上限（20MB）。")
+            self._send_error_json(413, "文件超过大小上限（50MB）。")
             return
         try:
             data = self._read_json_body()
@@ -1853,18 +1829,22 @@ class NolanHandler(BaseHTTPRequestHandler):
             self._send_error_json(400, "data_base64 不是合法的 base64 数据。")
             return
         try:
-            stored, text, truncated = _save_upload(name, raw)
+            stored, result = _save_upload(name, raw)
         except ValueError as e:
             self._send_error_json(400, str(e))
             return
+        text = result.get("text", "")
         self._send_json(200, {
             "ok": True,
             "name": stored,
+            "kind": result.get("kind", "二进制"),
             "chars": len(text),
             "excerpt": text[:_EXCERPT_CHARS],
             # 全量抽取文本：发送时拼进对话 payload 用（前端按 8000 字截断）
             "text": text,
-            "truncated": truncated,
+            "meta": result.get("meta", {}),
+            "note": result.get("note", ""),
+            "truncated": bool(result.get("meta", {}).get("truncated")),
             "file_url": "/api/files/" + quote("uploads/" + stored, safe="/"),
         })
 

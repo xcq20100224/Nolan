@@ -138,7 +138,9 @@ CMD_FORBIDDEN_CHARS = ["&", "|", ";", ">", "<", "`"]
 # 各类输出的截断长度
 SEARCH_MAX_CHARS = 1500  # search_web 搜索结果列表
 FETCH_MAX_CHARS = 800    # 网页正文摘要
-FILE_MAX_CHARS = 1000    # 文件内容
+FILE_MAX_CHARS = 6000    # 文件内容读取上限（深度分析需要足够上下文：拖进来的
+                         # 文件抽取全文经 uploads/*.extracted.txt 回读，1000 字
+                         # 只够摘要不够分析；6000 字覆盖大多数文档单次可消化量）
 CMD_MAX_CHARS = 1000     # 旧 run_command 输出
 SHELL_MAX_CHARS = 2000   # run_shell 输出（stdout+stderr 合并后）
 
@@ -587,10 +589,20 @@ def _fetch_url(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _sandbox_path(name: str) -> str:
-    """把用户给的文件名安全地落到沙盒目录里，杜绝路径穿越。"""
+    """把用户给的文件名安全地落到沙盒目录里，杜绝路径穿越。
+
+    特许「uploads/文件名」一层子目录（拖拽上传的抽取全文 .extracted.txt
+    存放在那里——深度分析的物理基础：大脑能回读全文，而不是只靠摘要）。
+    其余任何形式的目录成分一律剥掉。
+    """
     os.makedirs(SANDBOX_DIR, exist_ok=True)
+    clean = (name or "").strip().replace("\\", "/")
+    if clean.startswith("uploads/"):
+        # 只允许 uploads/ 正下一层，更深的层级与 .. 一律剥掉
+        sub = os.path.basename(clean[len("uploads/"):])
+        return os.path.join(SANDBOX_DIR, "uploads", sub)
     # 只取文件名部分，任何 ../ 、绝对路径都会被剥掉
-    safe_name = os.path.basename(name.strip())
+    safe_name = os.path.basename(clean)
     return os.path.join(SANDBOX_DIR, safe_name)
 
 

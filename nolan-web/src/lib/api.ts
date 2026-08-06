@@ -447,12 +447,18 @@ export interface UploadResult {
   ok: boolean
   /** 存储文件名（时间戳前缀 + 净化后的原名） */
   name: string
+  /** 类别：文本/表格/文档/演示文稿/图片/音频/视频/压缩包/二进制 */
+  kind: string
   /** 抽取文本总字数 */
   chars: number
-  /** 前 2000 字摘要 */
+  /** 前 8000 字摘要 */
   excerpt: string
   /** 全量抽取文本（发送时拼进对话 payload 用，前端按 8000 字截断） */
   text: string
+  /** 辅助信息（sheet 名单/页数/图片尺寸/音视频时长/魔数识别等） */
+  meta: Record<string, unknown>
+  /** 诚实说明（如「扫描版PDF，无文本层」），空串表示通道完全正常 */
+  note: string
   truncated?: boolean
   /** 文件柜下载地址（/api/files/uploads/<存储名>） */
   file_url: string

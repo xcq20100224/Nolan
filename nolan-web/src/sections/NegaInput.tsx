@@ -5,7 +5,7 @@
 // 录音状态通过 onRecordingChange 上报给父组件，中央声波以模拟律动呈现（无真实波形流）
 import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
-import { FolderOpen, Mic, Paperclip, SendHorizontal, Square, X } from 'lucide-react'
+import { FolderOpen, Mic, Paperclip, SendHorizontal, Square, X, FileText, FileSpreadsheet, FileAudio, FileVideo, FileArchive, File, Image as ImageIcon, Presentation } from 'lucide-react'
 import { micStart, micStop, micState, clientLog, stopSpeak, stopAllAudio } from '@/lib/api'
 
 /** 「没听清」等占位提示的显示时长（毫秒） */
@@ -16,6 +16,35 @@ export interface AttachmentChip {
   id: string
   name: string
   chars: number
+  /** 类别：文本/表格/文档/演示文稿/图片/音频/视频/压缩包/二进制 */
+  kind?: string
+  /** 诚实说明（如「扫描版PDF，无文本层」），空串表示通道正常 */
+  note?: string
+}
+
+/** 附件类别 → 芯片图标（lucide 细线风格，与输入区其余图标一致） */
+function kindIcon(kind: string | undefined) {
+  switch (kind) {
+    case '文本':
+    case '文档':
+      return FileText
+    case '表格':
+      return FileSpreadsheet
+    case '演示文稿':
+      return Presentation
+    case '图片':
+      return ImageIcon
+    case '音频':
+      return FileAudio
+    case '视频':
+      return FileVideo
+    case '压缩包':
+      return FileArchive
+    case '二进制':
+      return File
+    default:
+      return Paperclip
+  }
 }
 
 interface NegaInputProps {
@@ -255,23 +284,29 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
       {/* 待发送附件芯片：拖拽上传成功后出现，发送时随消息一起交付（最多 3 个） */}
       {attachments.length > 0 && (
         <div className="mx-auto mb-2 flex max-w-2xl flex-wrap gap-2">
-          {attachments.map((a) => (
-            <span
-              key={a.id}
-              className="flex items-center gap-2 rounded-full border border-[#2e2e33] px-3 py-1 text-xs font-light text-[#8a8578]"
-            >
-              <Paperclip className="h-3 w-3" />
-              {a.name} · {a.chars} 字
-              <button
-                type="button"
-                onClick={() => onRemoveAttachment?.(a.id)}
-                className="text-[#4a4a50] transition-colors hover:text-[#c05b4d]"
-                title="移除附件"
+          {attachments.map((a) => {
+            const Icon = kindIcon(a.kind)
+            return (
+              <span
+                key={a.id}
+                title={a.note || undefined}
+                className="flex items-center gap-2 rounded-full border border-[#2e2e33] px-3 py-1 text-xs font-light text-[#8a8578]"
               >
-                <X className="h-3 w-3" />
-              </button>
-            </span>
-          ))}
+                <Icon className="h-3 w-3" />
+                {a.name} · {a.chars} 字{a.kind ? ` · ${a.kind}` : ''}
+                {/* 通道说明（如「扫描版PDF，无文本层」）内联提示，悬停看全文 */}
+                {a.note && <span className="text-[#c0a04d]">⚠ {a.note}</span>}
+                <button
+                  type="button"
+                  onClick={() => onRemoveAttachment?.(a.id)}
+                  className="text-[#4a4a50] transition-colors hover:text-[#c05b4d]"
+                  title="移除附件"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            )
+          })}
         </div>
       )}
       <div className="mx-auto flex max-w-2xl items-center gap-4">
