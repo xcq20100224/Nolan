@@ -19,6 +19,10 @@ Nolan 语音助手 · 大脑模块（brain.py）· 阶段五
 阶段十一起说话卫生：工具 JSON 提取器三段强化（拆围栏 / 混合 raw_decode / 平衡扫描+修复），
 泄漏兜底死契约——解析失败的工具 JSON 剥离后只留口语部分返回；
 think 出口闸统一过 speak_filter，代码/JSON/命令行是思考不是台词，永远不许成为返回值。
+阶段十二起附件防劫持：_think_impl 入口拆分「指令」与「附件」——
+意图路由的唯一合法输入是主人的嘴（指令），不是主人递过来的纸（附件）；
+所有规则层只看剥离附件后的纯指令，附件原文仅作为上下文交给大模型层；
+记忆萃取/情景记录钩子同样只吃指令，附件全文不进记忆库。
 
 决策流程（按序）：
   1. 空输入 -> 提示重说；2. 退出意图 -> '__EXIT__'；
@@ -1293,6 +1297,37 @@ def glm_one_shot(prompt: str) -> str | None:
     return _request_llm(base_url + "/chat/completions", payload, headers)
 
 
+# == 附件防劫持：指令 / 附件拆分 ==
+
+# 前端附件标记契约（固定格式，可依赖）：
+#   [附件《文件名》内容开始] ... [附件内容结束，请基于以上内容回答]
+# 可能有多个附件块，正文指令在最后一个结束标记之后（也可能夹在两附件之间）。
+_ATTACHMENT_BLOCK_RE = re.compile(
+    r"\[附件《[^》]*》内容开始\].*?\[附件内容结束，请基于以上内容回答\]",
+    re.DOTALL,
+)
+
+
+def _split_attachment(text: str) -> tuple:
+    """
+    拆分「主人的嘴」与「主人递过来的纸」：
+    返回 (instruction, full_text)——剥离附件块后的纯指令 + 原文。
+
+    - 无附件标记：(原文, 原文)，零行为变化；
+    - 完整附件块（可多个）：instruction 为剔除所有附件块后的指令；
+    - 标记残缺（只有开始没有结束、或结束后仍有未闭合的开始）：保守按无附件
+      处理，返回 (原文, 原文)——宁可被劫持风险留在已知形态，也不瞎猜截断点。
+    """
+    if "[附件《" not in text:
+        return text, text
+    instruction = _ATTACHMENT_BLOCK_RE.sub("\n", text).strip()
+    if instruction == text.strip():
+        return text, text  # 开始标记无配对结束：整块未识别，保守放行
+    if "[附件《" in instruction:
+        return text, text  # 仍有未闭合的开始标记（残缺）：保守放行
+    return instruction, text
+
+
 def _think_impl(user_text: str, history: list[dict]) -> str:
     """
     Nolan 大脑主入口（实现体；公开入口 think 在其外挂了记忆萃取钩子）。
@@ -1311,19 +1346,24 @@ def _think_impl(user_text: str, history: list[dict]) -> str:
 
     text = user_text.strip()
 
-    # 2. 退出意图
-    if any(p in text for p in _EXIT_PATTERNS):
+    # 附件防劫持（阶段十二）：意图路由的唯一合法输入是主人的嘴（instruction），
+    # 不是主人递过来的纸（附件）。下方所有规则层一律只看剥离附件后的纯指令；
+    # 附件原文 full_text 只交给大模型层——附件是上下文，LLM 需要读它来分析。
+    instruction, full_text = _split_attachment(text)
+
+    # 2. 退出意图（附件里的「再见/退出」不许劫持会话）
+    if any(p in instruction for p in _EXIT_PATTERNS):
         return EXIT_SIGNAL
 
     # 3. 待确认状态机（run_shell / gui_control 共用）：在记忆意图之前检查，
     #    确认 / 取消 / 新指令覆盖均在此分派
-    pending_reply = _handle_pending_shell(text)
+    pending_reply = _handle_pending_shell(instruction)
     if pending_reply is not None:
         return pending_reply
 
     # 4. 记忆意图：记住 / 回忆 / 忘掉，结果文本零包装直接返回
     #    复合任务跳过本层——「搜 X 再记住 Y」被本层劫持会丢掉前半截（实测）
-    memory_reply = None if _is_composite(text) else _handle_memory_intent(text)
+    memory_reply = None if _is_composite(instruction) else _handle_memory_intent(instruction)
     if memory_reply is not None:
         return memory_reply
 
@@ -1331,13 +1371,13 @@ def _think_impl(user_text: str, history: list[dict]) -> str:
     #    必须排在提醒意图之前——「每隔30分钟提醒我喝水」含「提醒我」，
     #    先进提醒分支会被当一次性提醒劫持（周期信息丢失）。
     #    复合任务跳过本层，同记忆/提醒层的防劫持理由。
-    trigger_reply = None if _is_composite(text) else _handle_trigger_intent(text)
+    trigger_reply = None if _is_composite(instruction) else _handle_trigger_intent(instruction)
     if trigger_reply is not None:
         return trigger_reply
 
     # 5. 提醒意图：提醒我 / 我的提醒，结果文本零包装直接返回
     #    复合任务同样跳过（「写日报然后提醒我晚上看」被本层劫持会丢掉写日报）
-    reminder_reply = None if _is_composite(text) else _handle_reminder_intent(text)
+    reminder_reply = None if _is_composite(instruction) else _handle_reminder_intent(instruction)
     if reminder_reply is not None:
         return reminder_reply
 
@@ -1348,10 +1388,10 @@ def _think_impl(user_text: str, history: list[dict]) -> str:
     #    例外：「搜 X 总结写到 F」复合任务走固定三段快速通道（确定性优先，
     #    实测 Agent 循环在此类任务上不稳：死循环调 get_time / 写空文件）。
     if hands is not None:
-        sw = _parse_search_write(text)
+        sw = _parse_search_write(instruction)
         if sw is not None:
             return _run_search_write(*sw)
-    intent = None if _is_composite(text) else _parse_intent(text)
+    intent = None if _is_composite(instruction) else _parse_intent(instruction)
     if intent is not None and hands is not None:
         tool, args = intent
         if tool == "web_search":
@@ -1360,19 +1400,20 @@ def _think_impl(user_text: str, history: list[dict]) -> str:
             return _answer_from_search(args["query"])
         return _execute_tool(tool, args)
 
-    # 7. 大模型层（含长期记忆与工具协议）
+    # 7. 大模型层（含长期记忆与工具协议）：附件原文 full_text 在此进入对话——
+    #    附件是主人给的阅读材料，LLM 必须读到它才能完成「分析文件内容」。
     #    复合任务（大目标）先过分层规划器：拆步 -> 逐步执行 -> 汇总；
     #    规划器不可用（无 LLM/拆不出步骤）时降级回平铺 Agent 循环。
     #    _PLAN_DEPTH > 0 说明当前是规划器派生的子任务，直接走原路径防递归。
-    if _is_composite(text) and _PLAN_DEPTH == 0:
-        reply = _plan_and_execute(text, history)
+    if _is_composite(instruction) and _PLAN_DEPTH == 0:
+        reply = _plan_and_execute(full_text, history)
     else:
-        reply = _think_via_llm(text, history)
+        reply = _think_via_llm(full_text, history)
     if reply:
         return reply
 
-    # 8. 规则闲聊兜底
-    return random.choice(_FALLBACK_REPLIES).format(text=text)
+    # 8. 规则闲聊兜底（不回显附件全文，只复述指令）
+    return random.choice(_FALLBACK_REPLIES).format(text=instruction or text)
 
 
 def think(user_text: str, history: list[dict]) -> str:
@@ -1388,15 +1429,20 @@ def think(user_text: str, history: list[dict]) -> str:
     原始 JSON/代码永远不许成为 think() 的返回值（可见与可念同一标准）。
     """
     reply = _speak_guard(_think_impl(user_text, history))
+    # 记忆萃取/情景记录同样只吃指令（附件全文不该进记忆库）；
+    # 纯附件消息（无指令）用占位语记一笔，不录附件原文
+    instr = _split_attachment(user_text.strip())[0] if isinstance(user_text, str) else ""
+    if not instr:
+        instr = "（先生发来附件，未附指令）"
     if episodic is not None and reply and reply != EXIT_SIGNAL:
         try:
             episodic.log_event(
                 "conversation",
-                "先生：%s｜我：%s" % (user_text.strip()[:40], reply[:60]))
+                "先生：%s｜我：%s" % (instr[:40], reply[:60]))
         except Exception:
             pass
     if memory_v2 is not None and reply and reply != EXIT_SIGNAL:
-        u, a = user_text, reply
+        u, a = instr, reply
 
         def _extract():
             try:

@@ -129,7 +129,7 @@ except ImportError:
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-06-audioclean"
+_VERSION = "2026-08-06-historyslim"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -164,9 +164,9 @@ _UPLOADS_DIR = os.path.normpath(os.path.join(_FILES_DIR, "uploads"))
 _UPLOAD_MAX_BYTES = 50 * 1024 * 1024       # 上传文件大小上限 50MB
 _UPLOAD_MAX_BODY_BYTES = 65 * 1024 * 1024  # base64 请求体粗闸门上限（50MB 膨胀约 1/3 再加余量）
 _EXCERPT_CHARS = 8000                      # 响应 excerpt 带上前 8000 字
-                                           # （与前端附件拼接上限一致：read_file 工具
-                                           #  按 basename 解析，读不到 uploads/ 子目录的
-                                           #  .extracted.txt 全文，故 excerpt 尽量多带）
+                                           # （与前端附件拼接上限一致；超出部分
+                                           #  由 read_file 工具经 uploads/ 子目录的
+                                           #  .extracted.txt 落盘全文回读）
 
 # /api/files 下载白名单（图片之外的扩展；下载统一带 Content-Disposition: attachment）
 _DOWNLOAD_MIME = {
@@ -261,9 +261,9 @@ def _save_upload(name: str, data: bytes,
     安全闸门（与 _serve_file 同一套思路）：
       大小上限 50MB；文件名净化只留安全字符；时间戳前缀防覆盖；
       落盘目录必须仍在 files 目录内（commonpath 双重保险）。
-    非图片/二进制类的抽取全文落盘 <存储名>.extracted.txt（深度追问回读用；
-    read_file 工具按 basename 解析读不到 uploads/ 子目录，故响应 excerpt
-    已尽量多带，落盘主要服务于文件柜留痕与后续排查）。
+    非图片/二进制类的抽取全文落盘 <存储名>.extracted.txt（深度追问回读用：
+    read_file 工具特许「uploads/文件名」一层子目录，历史存根里的回读路径
+    即指向此文件，见 _slim_for_history）。
     """
     if not data:
         raise ValueError("文件内容为空。")
@@ -1174,6 +1174,54 @@ _brain_lock = threading.Lock()   # brain 调用与 mouth 播报共用同一把�
 _history = []                    # 服务端维护的对话历史，裁剪到 20 轮（40 条）
 _HISTORY_MAX_TURNS = 20
 
+# == 历史瘦身（上下文工程）：附件全文只活在当前轮，历史里只留紧凑存根 ==
+# 根因——前端把附件抽取全文（≤8000 字）拼进用户消息（标记块
+# [附件《存储名》内容开始]…[附件内容结束，请基于以上内容回答]），若原样写入
+# _history，这段全文要在历史里躺 20 轮，LLM 每轮都扛着它：上下文被稀释、
+# 注意力被带偏（实测「乱回答」的物理来源之一）。
+# 对策——写入历史前把附件块替换为存根（文件名/字数/落盘路径）；全文落盘在
+# jarvis/files/uploads/<存储名>.extracted.txt，LLM 需要时用 read_file 工具
+# 按「uploads/<存储名>.extracted.txt」回读（hands._sandbox_path 特许
+# uploads/ 一层子目录）。发给 brain 的当前轮消息仍是全文，不受影响。
+_ATTACH_BLOCK_RE = re.compile(
+    r"\[附件《([^》]*)》内容开始\]\n?(.*?)\n?\[附件内容结束，请基于以上内容回答\]",
+    re.DOTALL,
+)
+_ATTACH_START_MARK = "[附件《"
+
+
+def _slim_for_history(user_text: str, uploads_dir: str = _UPLOADS_DIR) -> str:
+    """
+    把消息中的附件全文块替换为紧凑存根（纯逻辑，可单测）：
+      「附件《安全名》（共N字，全文已存 uploads/<安全名>.extracted.txt，
+        可用 read_file 工具回读「uploads/<安全名>.extracted.txt」）」
+    - 安全名与 upload 落盘同一规则（_sanitize_filename，对前端已净化的
+      存储名幂等）；N 为本消息内嵌附件正文的字数（前端按 8000 字截断，
+      不一定是文件全文总字数）；
+    - 无附件消息原样返回；多附件逐块替换；附件块前后的问题文本原样保留；
+    - 保守闸门：起始标记数与完整块数不一致（标记残缺）时整条原样返回，
+      绝不半截替换弄丢内容；
+    - 落盘副本不存在时（图片 VLM 文本/文件被清理等）存根降级为
+      「无全文落盘副本可回读」，不给 LLM 指一条读不到的路。
+    """
+    text = user_text or ""
+    if _ATTACH_START_MARK not in text:
+        return text
+    blocks = list(_ATTACH_BLOCK_RE.finditer(text))
+    if text.count(_ATTACH_START_MARK) != len(blocks):
+        return text  # 有残缺标记（缺结尾/头尾不全），保守原样返回
+
+    def _stub(m):
+        safe = _sanitize_filename(m.group(1))
+        n = len(m.group(2))
+        rel = f"uploads/{safe}.extracted.txt"
+        if os.path.isfile(os.path.join(uploads_dir, safe + ".extracted.txt")):
+            return (f"「附件《{safe}》（共{n}字，全文已存 {rel}，"
+                    f"可用 read_file 工具回读「{rel}」）」")
+        return f"「附件《{safe}》（共{n}字，无全文落盘副本可回读）」"
+
+    return _ATTACH_BLOCK_RE.sub(_stub, text)
+
 
 def _speak_async(text: str) -> None:
     """在后台守护线程里用同一把 Lock 串行播报；mouth 为 None 静默跳过。"""
@@ -1282,7 +1330,9 @@ def _chat(user_text: str) -> dict:
         # 历史写入与裁剪也在同一临界区内：与 brain.think 串行化，
         # 杜绝并发请求把对话历史交错、裁剪互相覆盖
         if reply != "__EXIT__":
-            _history.append({"role": "user", "content": user_text})
+            # 历史瘦身：写入历史的是存根版（附件全文不躺历史）；
+            # 发给 brain 的当前轮 user_text 仍是全文（LLM 本轮要读附件）
+            _history.append({"role": "user", "content": _slim_for_history(user_text)})
             _history.append({"role": "assistant", "content": reply})
             if len(_history) > _HISTORY_MAX_TURNS * 2:
                 _history = _history[-_HISTORY_MAX_TURNS * 2:]
@@ -1950,9 +2000,10 @@ class NolanHandler(BaseHTTPRequestHandler):
                 elif kind == "tts_done":
                     tts_done = True
 
-            # 历史落账：与 /api/chat 同一把锁串行化、同一裁剪规则
+            # 历史落账：与 /api/chat 同一把锁串行化、同一裁剪规则；
+            # 同样写入存根版（附件全文不躺历史，当前轮全文已发给 LLM）
             with _brain_lock:
-                _history.append({"role": "user", "content": user_text})
+                _history.append({"role": "user", "content": _slim_for_history(user_text)})
                 _history.append({"role": "assistant", "content": reply})
                 if len(_history) > _HISTORY_MAX_TURNS * 2:
                     _history = _history[-_HISTORY_MAX_TURNS * 2:]
