@@ -33,6 +33,18 @@ try:
 except Exception:  # noqa: BLE001 - 任何导入期异常都按「眼睛不可用」处理
     _eyes = None
 
+# PPT 全服务与微信交付（商业场景第一单）：同为防御式降级——
+# 模块缺席时对应工具仍注册，调用时礼貌说明不可用，绝不拖垮整条手臂。
+try:
+    import ppt_maker as _ppt_maker
+except Exception:  # noqa: BLE001
+    _ppt_maker = None
+
+try:
+    import wechat_send as _wechat_send
+except Exception:  # noqa: BLE001
+    _wechat_send = None
+
 # ---------------------------------------------------------------------------
 # 常量与边界
 # ---------------------------------------------------------------------------
@@ -1348,6 +1360,50 @@ def _set_web_background(name: str) -> str:
         return f"抱歉先生，更换聊天背景时出了问题：{e}"
 
 
+def _make_ppt(topic: str, pages: int = 8, style: str = "工作汇报") -> str:
+    """
+    PPT 全服务：LLM 出内容，python-pptx 生成真 .pptx（每页备注栏写演讲稿），
+    落盘文件柜。ppt_maker 返回 dict，这里翻成可直接播报的人话；永不抛异常。
+    """
+    if _ppt_maker is None:
+        return "抱歉先生，PPT 制作模块现在不可用（可能缺少 python-pptx 组件）。"
+    try:
+        pages = int(pages)
+    except (TypeError, ValueError):
+        pages = 8
+    try:
+        result = _ppt_maker.make_ppt(
+            topic=str(topic or ""), pages=pages, style=str(style or ""))
+    except Exception:
+        return "抱歉先生，制作 PPT 时出了点意外，请让我重试。"
+    if not isinstance(result, dict):
+        return "抱歉先生，制作 PPT 时出了点意外，请让我重试。"
+    if not result.get("ok"):
+        return f"抱歉先生，PPT 没做成：{result.get('error', '原因未知')}。"
+    return (
+        f"好的先生，PPT 已经做好并放进文件柜了：《{result.get('title') or topic}》，"
+        f"文件名 {result.get('file_name')}，共 {result.get('pages')} 页，"
+        "每一页的备注栏里都写好了演讲稿，您照着讲就行。"
+        "需要的话我还可以直接帮您发到微信。"
+    )
+
+
+def _wechat_send_file(file_name: str, target: str = "文件传输助手") -> str:
+    """
+    微信交付：技能库复用 / GUI 自动化闭环 / 诚实指引 三段降级。
+    wechat_send.send_file 返回的就是定型话术，直接播报；永不抛异常。
+    """
+    if _wechat_send is None:
+        return "抱歉先生，微信发送模块现在不可用。"
+    try:
+        return _wechat_send.send_file(
+            file_name=str(file_name or ""),
+            target=str(target or "").strip() or "文件传输助手",
+        )
+    except Exception:
+        return "抱歉先生，微信发送时出了点意外，文件还在文件柜里，请让我重试。"
+
+
 # ---------------------------------------------------------------------------
 # 契约接口
 # ---------------------------------------------------------------------------
@@ -1431,6 +1487,20 @@ _TOOLS = {
         "captures 子目录里 capture_screen 截下的图也能直接找到；"
         "通常接在 capture_screen 之后，用其返回的文件名作为 name",
         {"name": "图片文件名，如 capture_20250101_120000.png"},
+    ),
+    "make_ppt": (
+        _make_ppt,
+        "制作 PPT 演示文稿并交付全套服务：生成真正的 .pptx 文件存进文件柜，"
+        "每一页的备注栏里都写好了演讲稿（这一页该讲什么、怎么讲）；"
+        "做好之后可以接着用 wechat_send_file 把文件发到微信完成交付",
+        {"topic": "PPT 主题", "pages": "内容页数，3 到 20，默认 8",
+         "style": "风格：工作汇报 / 课堂讲解 / 科普分享，默认工作汇报"},
+    ),
+    "wechat_send_file": (
+        _wechat_send_file,
+        "把文件柜里的文件（如刚做好的 PPT）通过微信发送给指定联系人或群，"
+        "默认发到文件传输助手；常接在 make_ppt、write_file 之后完成交付",
+        {"file_name": "文件柜里的文件名", "target": "微信联系人或群名，默认文件传输助手"},
     ),
 }
 
