@@ -4,6 +4,8 @@ Nolan · PPT 引擎（ppt_maker.py）——两阶段精写 + 自动选版式版
 一句话生成带演讲稿的真 .pptx 文件：
   - 阶段 1 · 大纲：1 次 LLM 调用产出 总标题 + 副标题 + 每页
     {layout, page_title, core_point, keywords, ...版式草稿字段}；
+    标题规则为结论式标题（action title）：page_title 必须是带数字/比较级的断言句，
+    全篇按「情境 -> 冲突 -> 分析 -> 行动」叙事弧线组织页面顺序；
     LLM 按内容为每页从八种版式（toc/section/bullets/two_column/big_number/quote/chart/closing）
     中自动选型，并给出 two_column 栏题、big_number 数字草稿、chart 数据草稿等；
   - 阶段 2 · 逐页精写：每页 1 次 LLM 调用（串行），按版式要内容——
@@ -49,6 +51,13 @@ try:
     from ppt_layouts import render_deck as _render_deck
 except Exception:
     _render_deck = None
+
+# ---- 联网研究模块（R1）：防御式导入。缺席/失败时研究材料为空串，
+#      管线自动降级为纯模型记忆生成，主流程无感。
+try:
+    from ppt_research import research_topic as _research_topic
+except Exception:
+    _research_topic = None
 
 MODULE_DIR = Path(__file__).resolve().parent
 FILES_DIR = MODULE_DIR / "files"
@@ -183,19 +192,27 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
 
 只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
 {{
-  "title": "整套 PPT 的主标题（≤20字）",
-  "subtitle": "副标题：一句话点明本套 PPT 的价值（≤30字）",
+  "title": "整套 PPT 主标题：一句断言，一句话说清全篇核心论点（≤20字，见下方标题规则）",
+  "subtitle": "副标题：补充本套 PPT 的场景与受众（≤30字）",
   "cover_image_prompt": "封面背景图的画面描述（必需，见下方配图规则）",
   "pages": [
     {{
       "layout": "本页版式（八种之一，见下方选版式规则）",
-      "page_title": "本页小标题（≤15字）",
+      "page_title": "本页核心断言（≤22字，见下方标题规则）",
       "core_point": "本页核心论点，一句话（30-50字）：必须具体、有信息量，是本页正文要论证的靶心",
       "keywords": ["本页 3-5 个关键词：具体的技术名词、数据点、案例名或机制名"],
       "image_prompt": "本页配图的画面描述（可选，仅按下方配图规则给，不配图的页不要输出此字段）"
     }}
   ]
 }}
+
+【标题规则：结论式标题（action title）】
+- 每页 "page_title" 必须是一句「断言」而非「话题词」：读完标题就知道本页结论，
+  尽量带数字或比较级；标题即论点，正文要点是它的论据；
+- 反例 ✗「处理法与发酵控制」→ 正例 ✓「处理法决定 60% 的风味基调」；
+  反例 ✗「全球供需格局演变」→ 正例 ✓「中国供给全球 60% 的动力电池」；
+- 顶层 "title" 同样是断言句：一句话说清整套 PPT 的核心论点；
+  "subtitle" 负责补充场景与受众（给谁看、什么场合）。
 
 【配图规则】
 - 顶层 "cover_image_prompt" 必填：封面背景图，画面要宏大或抽象、有氛围感，
@@ -226,7 +243,9 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
 
 要求：
 - pages 数组恰好 {pages} 项正文页（toc 另算），对应 {pages} 页内容；
-- 全篇逻辑递进（背景/现状 -> 核心内容 -> 总结/行动），页与页之间分工明确、互不重复；
+- 全篇按叙事弧线组织页面顺序：情境（现状/背景）→ 冲突（矛盾/挑战）→
+  分析（原因/机制）→ 行动（建议/展望）；第一页内容页必须回答
+  「为什么现在该关心这件事」，页与页之间分工明确、互不重复；
 - 每页 core_point 必须是可论证的具体论点，禁止「介绍XX」「XX很重要」式空话；
 - keywords 要能给后续写作提供弹药（名词、数字、案例），不要空泛形容词；
 - 内容贴合「{style}」场景。"""
@@ -238,10 +257,12 @@ def _norm_layout(raw) -> str:
     return layout if layout in LAYOUTS else "bullets"
 
 
-def _gen_outline(topic: str, pages: int, style: str, caller):
+def _gen_outline(topic: str, pages: int, style: str, caller, research: str = ""):
     """阶段 1：拿大纲。返回 (规范化大纲 dict, None) 或 (None, 人话错误)。
-    大纲页除 page_title/core_point/keywords 外，还带 layout 与版式草稿字段。"""
-    prompt = _OUTLINE_PROMPT.format(topic=topic, pages=pages, style=style)
+    大纲页除 page_title/core_point/keywords 外，还带 layout 与版式草稿字段。
+    research：R1 联网研究材料（空串=无，纯模型记忆）。"""
+    prompt = _OUTLINE_PROMPT.format(topic=topic, pages=pages, style=style) \
+        + _research_block(research)
     try:
         data = _call_json(prompt, caller, repair_once=True)
     except Exception:
@@ -265,7 +286,7 @@ def _gen_outline(topic: str, pages: int, style: str, caller):
             if content_count >= pages:
                 continue                       # 超出请求页数的正文页丢弃
             content_count += 1
-        page_title = str(item.get("page_title") or "").strip()[:20]
+        page_title = str(item.get("page_title") or "").strip()[:22]   # 断言句上限放宽到 22 字
         if not page_title:
             page_title = "目录" if layout == "toc" else f"第 {content_count or i + 1} 节"
         core_point = str(item.get("core_point") or "").strip()
@@ -355,7 +376,7 @@ _PAGE_PROMPT = """你正在为一份{style} PPT 逐页精写正文，现在写�
 - 前一页标题：「{prev_title}」；后一页标题：「{next_title}」（内容不得与它们重复撞车）
 
 【本页任务】
-- 本页小标题：「{page_title}」
+- 本页核心断言（标题即论点，正文是它的论据）：「{page_title}」
 - 本页核心论点（必须围绕它展开论证）：{core_point}
 - 可用素材关键词：{keywords}
 
@@ -367,12 +388,15 @@ _PAGE_PROMPT = """你正在为一份{style} PPT 逐页精写正文，现在写�
 
 硬性要求（验收线，达不到会被退回重写）：
 - bullets 必须 4 到 6 条；每条 30 到 60 字；
+- 正文要点必须与本页断言式标题形成论证关系：标题是论点，
+  每条要点都是支撑它的论据（数据、案例、机制或推导），不允许与断言无关的凑数内容；
 - 每条要点必须承载具体信息：真实数据、具体案例、机制解释或可操作结论，
   禁止「AI很强大」「前景广阔」这类空话套话；
 - 要点之间互补不重复，合起来要能论证本页核心论点；
 - 风格要求：{style_hint}；
-- speaker_note 为 150-250 字的口语化演讲稿：这页怎么开场、要点之间怎么串、
-  如何自然过渡到下一页，是真人上台能照着讲的稿子，不是要点的复读。"""
+- speaker_note 为 150-250 字的口语化演讲稿：开场第一句要点出本页断言，
+  然后讲这页怎么展开、要点之间怎么串、如何自然过渡到下一页，
+  是真人上台能照着讲的稿子，不是要点的复读。"""
 
 # 非常规版式的共享上下文块（与 _PAGE_PROMPT 背景部分一致）
 _PAGE_CONTEXT = """你正在为一份{style} PPT 逐页精写正文，现在写第 {idx}/{total} 页。
@@ -383,7 +407,7 @@ _PAGE_CONTEXT = """你正在为一份{style} PPT 逐页精写正文，现在写�
 - 前一页标题：「{prev_title}」；后一页标题：「{next_title}」（内容不得与它们重复撞车）
 
 【本页任务】
-- 本页小标题：「{page_title}」
+- 本页核心断言（标题即论点，正文是它的论据）：「{page_title}」
 - 本页核心论点（必须围绕它展开论证）：{core_point}
 - 可用素材关键词：{keywords}
 
@@ -743,9 +767,21 @@ def _page_prompt(layout: str, style: str, idx: int, total: int, topic: str,
     return ctx + _QUOTE_TASK.format(style_hint=style_hint)
 
 
+def _research_block(research: str) -> str:
+    """研究材料注入段：非空时拼在 prompt 尾部（引文编号无意义，提示忽略）；
+    空串返回 ""——管线降级为纯模型记忆，行为与接入前完全一致。"""
+    research = (research or "").strip()
+    if not research:
+        return ""
+    return (
+        "\n\n【真实研究材料】以下是联网检索到的与主题相关的最新事实、数据与案例"
+        "（附来源与年份；方括号引文编号请忽略）：大纲设计、标题断言、正文数据与"
+        "图表数值必须优先采用这些材料，且不得与材料中的事实矛盾：\n" + research + "\n")
+
+
 def _gen_page(topic: str, deck_title: str, style: str, item: dict,
               idx: int, total: int, prev_title: str, next_title: str,
-              caller) -> dict:
+              caller, research: str = "") -> dict:
     """阶段 2 单页：按版式精写 -> 版式质量闸 -> 不达标重写（最多 2 次）-> 取历次最好 -> 兜底。
     返回 {layout, content, speaker_note, rewrites, fallback}。
     toc/section 不烧调用；彻底失败时非常规版式降级为 bullets 兜底页。"""
@@ -759,7 +795,8 @@ def _gen_page(topic: str, deck_title: str, style: str, item: dict,
 
     style_hint = _STYLE_HINTS.get(style, _STYLE_HINTS["科普分享"])
     prompt = _page_prompt(layout, style, idx, total, topic, deck_title,
-                          prev_title, next_title, item, style_hint)
+                          prev_title, next_title, item, style_hint) \
+        + _research_block(research)   # 研究材料拼一次，重写 prompt 引用 original_prompt 自动带上
 
     candidates = []   # 历次有效候选：(content, note, 是否达标)
     feedback = ""
@@ -1198,9 +1235,10 @@ def _alloc_path(topic: str) -> Path:
 # ---------------------------------------------------------------- 公开 API
 
 def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller=None,
-             with_images: bool = True) -> dict:
+             with_images: bool = True, with_research: bool = True) -> dict:
     """一句话生成带演讲稿的 .pptx。契约见模块 docstring。
-    with_images：CogView AI 配图总开关（路 B），False 时整条生图链跳过、零 HTTP。"""
+    with_images：CogView AI 配图总开关（路 B），False 时整条生图链跳过、零 HTTP。
+    with_research：联网研究总开关（R1），False 时跳过阶段 0、纯模型记忆生成。"""
     global last_run
     topic = (topic or "").strip()
     if not topic:
@@ -1216,8 +1254,18 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
     stats = {"outline_retries": 0, "page_stats": [], "llm_calls": 0}
     last_run = stats
 
+    # ---- 阶段 0：联网研究（R1，25s 硬预算；失败/关闭返回空串，
+    #      大纲与精写自动降级为纯模型记忆，行为与接入前一致）
+    research = ""
+    if with_research and _research_topic is not None:
+        try:
+            research = _research_topic(topic) or ""
+        except Exception:
+            research = ""
+    stats["research_chars"] = len(research)
+
     # ---- 阶段 1：大纲（失败即整单失败，没有大纲就没有弹药）
-    outline, err = _gen_outline(topic, pages, style, caller)
+    outline, err = _gen_outline(topic, pages, style, caller, research)
     if outline is None:
         return {"ok": False, "error": err}
 
@@ -1229,7 +1277,7 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
         prev_t = titles[i - 1] if i > 0 else "（封面）"
         next_t = titles[i + 1] if i + 1 < len(titles) else "（结束页）"
         page = _gen_page(topic, outline["title"], style, item,
-                         i + 1, len(deck_pages), prev_t, next_t, caller)
+                         i + 1, len(deck_pages), prev_t, next_t, caller, research)
         contents.append(page)
 
     # ---- 归一化成路 A 契约 deck，并登记运行统计

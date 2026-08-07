@@ -281,11 +281,16 @@ class PptMakerTest(unittest.TestCase):
         # 生图测试用 _enable_images 自行打桩假配置 + urlopen 路由。
         self._orig_img_cfg = ppt_maker._load_image_config
         ppt_maker._load_image_config = lambda: None
+        # 默认断掉联网研究链（R1）：模块视为缺席 -> 研究材料空串，既有测试零 HTTP。
+        # 研究注入测试用 _enable_research 自行打桩。
+        self._orig_research = ppt_maker._research_topic
+        ppt_maker._research_topic = None
 
     def tearDown(self):
         ppt_maker.FILES_DIR = self._orig_dir
         ppt_maker._render_deck = self._orig_render
         ppt_maker._load_image_config = self._orig_img_cfg
+        ppt_maker._research_topic = self._orig_research
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ---- 路 B 打桩工具 ----
@@ -901,6 +906,55 @@ class PptMakerTest(unittest.TestCase):
         self.assertEqual(len(http.api_bodies()), 2)       # 只有 2 个内容页
         self.assertTrue(deck["pages"][0]["image"])
         self.assertTrue(deck["pages"][1]["image"])
+
+    # ================================================================ 新增：叙事升级（R2）
+
+    # 27. 大纲 prompt 含结论式标题（action title）与叙事弧线规则
+    def test_outline_prompt_has_action_title_rules(self):
+        mock = _MockLLM(_script_for(3))
+        r = ppt_maker.make_ppt("人工智能简介", pages=3, llm_caller=mock)
+        self.assertTrue(r["ok"], r.get("error"))
+        outline_prompt = mock.calls[0]
+        self.assertIn("断言", outline_prompt)                # 结论式标题规则关键词
+        self.assertIn("action title", outline_prompt)
+        self.assertIn("叙事弧线", outline_prompt)            # 情境→冲突→分析→行动
+        self.assertIn("为什么现在该关心这件事", outline_prompt)
+
+    # 28. page_title 截断放宽到 22 字（断言句天然更长）
+    def test_page_title_truncated_at_22(self):
+        long_title = "这是一段超过二十二字长度的断言式页面标题用来验证截断逻辑是否生效"
+        outline = json.dumps({
+            "title": "t",
+            "pages": [{"page_title": long_title,
+                       "core_point": "核心论点：验证标题截断行为是否符合预期。",
+                       "keywords": ["截断"]}],
+        }, ensure_ascii=False)
+        data, err = ppt_maker._gen_outline("t", 3, "工作汇报", _MockLLM([outline]))
+        self.assertIsNone(err)
+        self.assertEqual(data["pages"][0]["page_title"], long_title[:22])
+        self.assertEqual(len(data["pages"][0]["page_title"]), 22)
+
+    # ================================================================ 新增：联网研究接入（R1 集成）
+
+    # 29. 研究材料注入大纲与精写 prompt；空串时 prompt 不含研究段
+    def test_research_injected_into_prompts(self):
+        ppt_maker._research_topic = lambda topic, **kw: "2025年产销超1600万辆（中汽协，2026.1）"
+        mock = _MockLLM(_script_for(3))
+        r = ppt_maker.make_ppt("新能源车", pages=3, llm_caller=mock)
+        self.assertTrue(r["ok"], r.get("error"))
+        self.assertIn("真实研究材料", mock.calls[0])          # 大纲 prompt 带研究段
+        self.assertIn("1600万辆", mock.calls[0])              # 材料原文进去了
+        self.assertIn("真实研究材料", mock.calls[1])          # 精写 prompt 同样带
+        self.assertEqual(ppt_maker.last_run["research_chars"], len("2025年产销超1600万辆（中汽协，2026.1）"))
+
+    # 30. 研究模块缺席/异常 -> 空串降级，prompt 无研究段，流程不受影响的
+    def test_research_absent_degrades_cleanly(self):
+        ppt_maker._research_topic = None                       # setUp 已置 None，显式重申语义
+        mock = _MockLLM(_script_for(3))
+        r = ppt_maker.make_ppt("新能源车", pages=3, llm_caller=mock)
+        self.assertTrue(r["ok"], r.get("error"))
+        self.assertNotIn("真实研究材料", mock.calls[0])
+        self.assertEqual(ppt_maker.last_run["research_chars"], 0)
 
 
 if __name__ == "__main__":
