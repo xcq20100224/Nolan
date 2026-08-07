@@ -12,6 +12,12 @@ Nolan · PPT 引擎（ppt_maker.py）——两阶段精写 + 自动选版式版
     toc/section 不烧调用，大纲字段直接用、演讲稿模板合成；
     每页过对应版式的质量闸，不达标重写（最多 2 次），仍不达标取历次最好；
     某页彻底失败时非常规版式降级为 bullets 兜底页，页数永不缺斤短两；
+  - 生图（路 B）：大纲阶段 LLM 同时产出 cover_image_prompt（封面背景）与各页可选
+    image_prompt（内容页配图，全篇最多 4 页，只给真正需要画面感的页）；
+    排版前统一批量串行调 CogView 生图并下载落盘 files/ppt_assets/，
+    成功才把绝对路径写进 page["image"]/deck["cover_image"]；
+    单张任何失败只置 None 降级无图版式，配置缺失整条链静默跳过，绝不整单失败；
+    总开关 with_images=False 时零 HTTP 调用；
   - 排版：路 A 的 jarvis/ppt_layouts.py 就位时走 render_deck（防御式导入，缺席置 None），
     不可用时回退内置排版（要点式渲染 + 正文字号三档自适应 18/16/14pt），模块任何时刻可用；
   - 文件：python-pptx 造 16:9 幻灯片，每页演讲稿写进 notes_slide（PowerPoint/WPS 备注窗格可见）；
@@ -19,9 +25,11 @@ Nolan · PPT 引擎（ppt_maker.py）——两阶段精写 + 自动选版式版
   - 降级：大纲阶段失败 -> ok=False；逐页阶段任何单页失败 -> 兜底页顶上，绝不整单失败。
 
 集成契约（签名冻结，主控按此接线）：
-    make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller=None) -> dict
+    make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller=None,
+             with_images: bool = True) -> dict
     成功 {"ok": True, "path": 绝对路径, "file_name": "xxx.pptx", "pages": 物理总页数(含封面), "title": "..."}
     失败 {"ok": False, "error": "人话原因"}
+    with_images 为可选关键字参数（路 B 追加）：False 时整条生图链跳过、零 HTTP 调用。
 
 pages 参数语义：向 LLM 请求的内容页数量（钳制 3-20）；返回值里的 pages 是物理总页数（内容页 + 1 封面）。
 
@@ -32,6 +40,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import urllib.request
 from pathlib import Path
 
 # ---- 版式渲染引擎（路 A）：防御式导入。ppt_layouts 完工前此模块不存在，
@@ -56,6 +65,13 @@ FONT_NAME = "微软雅黑"
 
 MAX_BULLETS = 6
 MAX_BULLET_LEN = 80       # 防御性截断（要求 LLM 30-60 字，留余量）
+
+# ---- CogView AI 配图（路 B·生图篇）----
+MAX_IMAGE_PAGES = 4       # 全篇内容页配图上限：按页序保留前 4 页
+IMG_API_TIMEOUT = 30      # 生图 API 单张预算（秒）
+IMG_DL_TIMEOUT = 20       # 图片下载单张预算（秒）
+# 全套配图统一风格后缀：由代码拼接到每条画面描述之后，保证整套图风格一致
+IMAGE_STYLE_SUFFIX = "，极简扁平插画风格，暖色调，赭红与米白配色，无文字无水印"
 
 # ---- 版式词汇表（路 A 交接契约，八种）----
 LAYOUTS = {"toc", "section", "bullets", "two_column",
@@ -169,15 +185,26 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
 {{
   "title": "整套 PPT 的主标题（≤20字）",
   "subtitle": "副标题：一句话点明本套 PPT 的价值（≤30字）",
+  "cover_image_prompt": "封面背景图的画面描述（必需，见下方配图规则）",
   "pages": [
     {{
       "layout": "本页版式（八种之一，见下方选版式规则）",
       "page_title": "本页小标题（≤15字）",
       "core_point": "本页核心论点，一句话（30-50字）：必须具体、有信息量，是本页正文要论证的靶心",
-      "keywords": ["本页 3-5 个关键词：具体的技术名词、数据点、案例名或机制名"]
+      "keywords": ["本页 3-5 个关键词：具体的技术名词、数据点、案例名或机制名"],
+      "image_prompt": "本页配图的画面描述（可选，仅按下方配图规则给，不配图的页不要输出此字段）"
     }}
   ]
 }}
+
+【配图规则】
+- 顶层 "cover_image_prompt" 必填：封面背景图，画面要宏大或抽象、有氛围感，
+  暖色调，绝不包含任何文字、字母、数字，也不含人脸特写；
+- 内容页的 "image_prompt"：本套 PPT 应配 3 到 4 页图（上限 4 页），凡是
+  bullets 版式且有画面感的页（产品、场景、工艺、概念可视化）默认都应该配图；
+  只有数据页、对比页、金句页才明确不配图；
+- 画面描述必须具体：写清主体 + 场景 + 色调，中英文均可；只描述画面内容，
+  统一风格由系统拼接，不要自己写风格词或「插画」「无文字」这类指令。
 
 【选版式规则】为每页从以下八种版式中选最合适的一种，写进 "layout"，并按需附加字段：
 - "bullets"：默认形态，绝大多数内容页用它，无需附加字段；
@@ -257,6 +284,11 @@ def _gen_outline(topic: str, pages: int, style: str, caller):
             "core_point": core_point,
             "keywords": keywords,
         }
+        # ---- 配图草稿（路 B）：内容页可选 image_prompt；只进大纲，不进契约 page，
+        #      生图阶段再按最终版式决定去留（非 bullets 页静默丢弃）
+        image_prompt = str(item.get("image_prompt") or "").strip()[:200]
+        if image_prompt:
+            entry["image_prompt"] = image_prompt
         # ---- 版式草稿字段：精写阶段的弹药/上下文
         if layout == "toc":
             entries = []
@@ -299,7 +331,11 @@ def _gen_outline(topic: str, pages: int, style: str, caller):
     if outline_pages and outline_pages[-1]["layout"] == "bullets":
         outline_pages[-1]["layout"] = "closing"
 
-    return {"title": title, "subtitle": subtitle, "pages": outline_pages}, None
+    # 封面背景图画面描述（路 B）：必需但 LLM 可能漏给，漏给则无封面图、不阻塞
+    cover_image_prompt = str(data.get("cover_image_prompt") or "").strip()[:300]
+
+    return {"title": title, "subtitle": subtitle, "pages": outline_pages,
+            "cover_image_prompt": cover_image_prompt}, None
 
 
 # ---------------------------------------------------------------- 阶段 2：逐页精写
@@ -829,6 +865,125 @@ def _normalize_deck(outline: dict, contents: list, style: str) -> dict:
     return {"title": outline["title"], "subtitle": subtitle, "pages": pages}
 
 
+# ---------------------------------------------------------------- 生图阶段（路 B：CogView 配图）
+
+def _load_image_config():
+    """读 llm_config.json 的 base_url/api_key（与大脑同一把 key）。
+    配置缺失/读失败返回 None —— 整条生图链静默跳过。"""
+    try:
+        cfg = json.loads((MODULE_DIR / "llm_config.json").read_text(encoding="utf-8"))
+        base = str(cfg.get("base_url") or "").strip().rstrip("/")
+        key = str(cfg.get("api_key") or "").strip()
+        if base and key:
+            return base, key
+    except Exception:
+        pass
+    return None
+
+
+def _cogview_generate(prompt: str, base: str, key: str, size: str = "1024x1024"):
+    """调 CogView 生图 API，返回图片 url；任何异常/结构缺失返回 None。
+    size：封面用 1344x768（近 16:9，铺屏不形变），内容页默认 1024x1024。"""
+    body = json.dumps({
+        "model": "cogview-3",
+        "prompt": prompt + IMAGE_STYLE_SUFFIX,   # 统一风格后缀在此拼接
+        "size": size,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        base + "/images/generations", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + key})
+    try:
+        with urllib.request.urlopen(req, timeout=IMG_API_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        data = payload.get("data")
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            url = str(data[0].get("url") or "").strip()
+            if url:
+                return url
+    except Exception:
+        pass
+    return None
+
+
+def _download_image(url: str, assets_dir: Path, seq: int):
+    """下载图片落盘，按 content-type 定后缀（默认 .png）；成功返回绝对路径，失败 None。"""
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Nolan-PPT/1.0"})
+        with urllib.request.urlopen(req, timeout=IMG_DL_TIMEOUT) as resp:
+            ctype = ""
+            try:
+                ctype = str(resp.headers.get("Content-Type") or "")
+            except Exception:
+                ctype = ""
+            blob = resp.read()
+        if not blob:
+            return None
+        ctype = ctype.split(";")[0].strip().lower()
+        ext = ".jpg" if ("jpeg" in ctype or "jpg" in ctype) else ".png"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        path = assets_dir / f"pptimg_{time.strftime('%Y%m%d-%H%M%S')}_{seq}{ext}"
+        path.write_bytes(blob)
+        return str(path.resolve())
+    except Exception:
+        return None
+
+
+def _gen_one_image(prompt: str, base: str, key: str, assets_dir: Path, seq: int,
+                   size: str = "1024x1024"):
+    """单张全流程：API 生图 -> 下载落盘。任何一层失败返回 None（调用方置字段 None）。"""
+    url = _cogview_generate(prompt, base, key, size)
+    if not url:
+        return None
+    return _download_image(url, assets_dir, seq)
+
+
+def _attach_images(deck: dict, outline: dict, enabled: bool = True) -> int:
+    """生图阶段总入口（排版前统一批量生成，串行）。
+    先把契约键初始化成 None（路 A 可依赖键存在），enabled=False 或配置缺失直接返回。
+    内容页配图候选：最终版式为 bullets 且大纲给了 image_prompt 的页，按页序钳前 4。
+    返回成功落盘的图片张数。绝不抛异常。"""
+    deck["cover_image"] = None
+    for pg in deck["pages"]:
+        if pg["layout"] == "bullets":
+            pg["image"] = None
+    if not enabled:
+        return 0
+    try:
+        cfg = _load_image_config()
+        if cfg is None:
+            return 0
+        base, key = cfg
+        assets_dir = FILES_DIR / "ppt_assets"
+        made = 0
+        seq = 0
+        # 封面背景图
+        cover_prompt = str(outline.get("cover_image_prompt") or "").strip()
+        if cover_prompt:
+            seq += 1
+            path = _gen_one_image(cover_prompt, base, key, assets_dir, seq,
+                                  size="1344x768")  # 近 16:9，封面铺屏不形变
+            if path:
+                deck["cover_image"] = path
+                made += 1
+        # 内容页配图：zip 大纲与契约页（同序），非 bullets 页的 image_prompt 静默丢弃
+        cands = []
+        for item, pg in zip(outline["pages"], deck["pages"]):
+            prompt = str(item.get("image_prompt") or "").strip()
+            if prompt and pg["layout"] == "bullets":
+                cands.append((pg, prompt))
+        for pg, prompt in cands[:MAX_IMAGE_PAGES]:
+            seq += 1
+            path = _gen_one_image(prompt, base, key, assets_dir, seq)
+            if path:
+                pg["image"] = path
+                made += 1
+        return made
+    except Exception:
+        return 0
+
+
 def _stat_counts(pg: dict):
     """运行统计用：从契约 page 折算 (要点条数, 内容字数)。"""
     layout = pg["layout"]
@@ -1042,8 +1197,10 @@ def _alloc_path(topic: str) -> Path:
 
 # ---------------------------------------------------------------- 公开 API
 
-def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller=None) -> dict:
-    """一句话生成带演讲稿的 .pptx。契约见模块 docstring。"""
+def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller=None,
+             with_images: bool = True) -> dict:
+    """一句话生成带演讲稿的 .pptx。契约见模块 docstring。
+    with_images：CogView AI 配图总开关（路 B），False 时整条生图链跳过、零 HTTP。"""
     global last_run
     topic = (topic or "").strip()
     if not topic:
@@ -1084,6 +1241,10 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
             "bullets": n_bullets, "chars": n_chars,
             "rewrites": contents[i]["rewrites"], "fallback": contents[i]["fallback"],
         })
+
+    # ---- 生图阶段（路 B）：排版前统一批量串行生成；任何单张失败只降级无图，
+    #      with_images=False 或配置缺失时整条链静默跳过，绝不整单失败
+    stats["images"] = _attach_images(deck, outline, enabled=bool(with_images))
 
     try:
         out_path = _alloc_path(topic)

@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -181,6 +182,85 @@ def _script_for(n_pages, page_json=None):
     return [_outline_json(n_pages)] + [page_json or _page_json(f"P{i}") for i in range(1, n_pages + 1)]
 
 
+# ---------------------------------------------------------------- 路 B 生图 mock 素材
+
+def _image_outline_json(n=4, layouts=None, title="人工智能简介"):
+    """带配图 prompt 的大纲：cover_image_prompt + 每页 image_prompt。
+    layouts 为 None 时全部 bullets（注意：末页会被归一化升级为 closing）。"""
+    pages = []
+    for i in range(1, n + 1):
+        layout = (layouts[i - 1] if layouts else "bullets")
+        item = {
+            "layout": layout,
+            "page_title": f"章节{i}",
+            "core_point": f"第{i}页核心论点：该环节的关键机制决定了整体效果，必须讲清原理与数据。",
+            "keywords": [f"关键词{i}甲", f"关键词{i}乙"],
+            "image_prompt": f"warm scene of concept {i}, clay red accents",
+        }
+        if layout == "two_column":
+            item["left"] = {"heading": "左栏"}
+            item["right"] = {"heading": "右栏"}
+        pages.append(item)
+    return json.dumps({
+        "title": title,
+        "subtitle": "带配图的测试大纲",
+        "cover_image_prompt": "vast abstract landscape, warm sunrise over geometric hills",
+        "pages": pages,
+    }, ensure_ascii=False)
+
+
+class _FakeResp:
+    """urlopen 打桩返回值：with 语义 + read() + headers。"""
+
+    def __init__(self, body=b"", ctype="application/json"):
+        self._body = body
+        self.headers = {"Content-Type": ctype}
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _MockHTTP:
+    """urllib.request.urlopen 打桩：按 URL 路由生图 API 与图片下载。
+    api_fails / dl_fails：命中序号（1 起）的调用抛异常；
+    dl_ctypes：第 n 次下载的 Content-Type（默认 image/png）。"""
+
+    def __init__(self, api_fails=(), dl_fails=(), dl_ctypes=None):
+        self.calls = []            # (url, api_body_bytes_or_None)
+        self.api_fails = set(api_fails)
+        self.dl_fails = set(dl_fails)
+        self.dl_ctypes = dict(dl_ctypes or {})
+        self._api_n = 0
+        self._dl_n = 0
+
+    def __call__(self, req, timeout=None):
+        url = getattr(req, "full_url", str(req))
+        if "/images/generations" in url:
+            self._api_n += 1
+            self.calls.append((url, getattr(req, "data", None)))
+            if self._api_n in self.api_fails:
+                raise RuntimeError(f"生图 API 第 {self._api_n} 次调用炸了")
+            return _FakeResp(json.dumps(
+                {"data": [{"url": f"https://img.mock/pic{self._api_n}.png"}]}
+            ).encode("utf-8"))
+        self._dl_n += 1
+        self.calls.append((url, None))
+        if self._dl_n in self.dl_fails:
+            raise RuntimeError(f"第 {self._dl_n} 次下载超时")
+        ctype = self.dl_ctypes.get(self._dl_n, "image/png")
+        return _FakeResp(b"\x89PNG\r\n\x1a\n fake-image-bytes", ctype)
+
+    def api_bodies(self):
+        """全部生图 API 调用的请求体（解码成 dict）。"""
+        return [json.loads(b.decode("utf-8")) for _u, b in self.calls if b]
+
+
 def _body_text(prs, slide_idx):
     """抽某页正文文本框的全部文字。"""
     return "\n".join(
@@ -197,11 +277,29 @@ class PptMakerTest(unittest.TestCase):
         # 默认强制走内置兜底排版：既有 15 个测试的行为与路 A 是否就位解耦
         self._orig_render = ppt_maker._render_deck
         ppt_maker._render_deck = None
+        # 默认断掉生图链（路 B）：配置视为缺失 -> 静默跳过，既有测试零 HTTP。
+        # 生图测试用 _enable_images 自行打桩假配置 + urlopen 路由。
+        self._orig_img_cfg = ppt_maker._load_image_config
+        ppt_maker._load_image_config = lambda: None
 
     def tearDown(self):
         ppt_maker.FILES_DIR = self._orig_dir
         ppt_maker._render_deck = self._orig_render
+        ppt_maker._load_image_config = self._orig_img_cfg
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ---- 路 B 打桩工具 ----
+    def _enable_images(self, http):
+        """打桩生图链：假配置（base,key）+ urlopen 路由 mock。addCleanup 自动还原。"""
+        orig_cfg = ppt_maker._load_image_config
+        orig_open = urllib.request.urlopen
+        ppt_maker._load_image_config = lambda: ("https://api.mock", "mock-key")
+        urllib.request.urlopen = http
+
+        def _restore():
+            ppt_maker._load_image_config = orig_cfg
+            urllib.request.urlopen = orig_open
+        self.addCleanup(_restore)
 
     # 1. 标准两阶段 -> 真 pptx：页数、标题、notes 非空、调用次数 = 1 + N
     def test_standard_pipeline_builds_real_pptx(self):
@@ -635,6 +733,174 @@ class PptMakerTest(unittest.TestCase):
             + [{"number": "", "caption": ""}, "不是字典"])
         self.assertEqual(len(stats), 3)
         self.assertEqual(stats[0], {"number": "0%", "caption": "c0"})
+
+    # ================================================================ 新增：路 B 生图管线
+
+    # 19. 配图 prompt 被收集、风格后缀被拼接；成功 -> 绝对路径 + 文件真实落盘
+    def test_images_collected_suffixed_and_saved(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        http = _MockHTTP(dl_ctypes={1: "image/jpeg"})   # 封面下载给 jpeg -> 后缀 .jpg
+        self._enable_images(http)
+        # 3 页全 bullets：末页归一化升级 closing -> 只有前 2 页是配图候选
+        script = [_image_outline_json(3)] + [_page_json(f"P{i}") for i in range(1, 4)]
+        mock = _MockLLM(script)
+        r = ppt_maker.make_ppt("人工智能简介", pages=3, llm_caller=mock)
+        self.assertTrue(r["ok"], r.get("error"))
+
+        deck = render.calls[0][1]
+        # API 调用 = 1 封面 + 2 内容页，prompt 含原始描述且拼接了统一风格后缀
+        bodies = http.api_bodies()
+        self.assertEqual(len(bodies), 3)
+        self.assertIn("vast abstract landscape", bodies[0]["prompt"])
+        self.assertIn("warm scene of concept 1", bodies[1]["prompt"])
+        self.assertIn("warm scene of concept 2", bodies[2]["prompt"])
+        for b in bodies:
+            self.assertTrue(b["prompt"].endswith(ppt_maker.IMAGE_STYLE_SUFFIX))
+            self.assertEqual(b["model"], "cogview-3")
+        # 封面：绝对路径、.jpg 后缀（按 content-type）、文件真实落盘
+        cover = deck["cover_image"]
+        self.assertTrue(cover)
+        self.assertTrue(Path(cover).is_absolute())
+        self.assertTrue(cover.endswith(".jpg"))
+        self.assertTrue(Path(cover).is_file())
+        self.assertEqual(Path(cover).parent, self.tmp / "ppt_assets")
+        # 内容页：前两页有图（.png），closing 页不给图（无 image 键）
+        for pg in deck["pages"][:2]:
+            self.assertEqual(pg["layout"], "bullets")
+            self.assertTrue(pg["image"])
+            self.assertTrue(Path(pg["image"]).is_absolute())
+            self.assertTrue(pg["image"].endswith(".png"))
+            self.assertTrue(Path(pg["image"]).is_file())
+        self.assertEqual(deck["pages"][2]["layout"], "closing")
+        self.assertNotIn("image", deck["pages"][2])
+        self.assertEqual(ppt_maker.last_run["images"], 3)
+
+    # 20. 生图 API 失败 -> 该张字段 None，其余照常，整单不失败
+    def test_image_api_failure_degrades(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        http = _MockHTTP(api_fails={2})       # 第 2 次 API（第 1 内容页）炸
+        self._enable_images(http)
+        script = [_image_outline_json(3)] + [_page_json(f"P{i}") for i in range(1, 4)]
+        r = ppt_maker.make_ppt("人工智能简介", pages=3, llm_caller=_MockLLM(script))
+        self.assertTrue(r["ok"], r.get("error"))
+        deck = render.calls[0][1]
+        self.assertTrue(deck["cover_image"])              # 封面成功
+        self.assertIsNone(deck["pages"][0]["image"])      # 失败页 None
+        self.assertTrue(deck["pages"][1]["image"])        # 后续页不受影响
+        self.assertEqual(ppt_maker.last_run["images"], 2)
+        # 失败页文件不落盘：ppt_assets 里只有 2 张
+        self.assertEqual(len(list((self.tmp / "ppt_assets").glob("pptimg_*"))), 2)
+
+    # 21. 下载失败 -> 字段 None，流程继续
+    def test_image_download_failure_degrades(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        http = _MockHTTP(dl_fails={1})        # 封面下载炸
+        self._enable_images(http)
+        script = [_image_outline_json(3)] + [_page_json(f"P{i}") for i in range(1, 4)]
+        r = ppt_maker.make_ppt("人工智能简介", pages=3, llm_caller=_MockLLM(script))
+        self.assertTrue(r["ok"], r.get("error"))
+        deck = render.calls[0][1]
+        self.assertIsNone(deck["cover_image"])            # 封面降级无图
+        self.assertTrue(deck["pages"][0]["image"])        # 内容页照常
+        self.assertTrue(deck["pages"][1]["image"])
+        self.assertEqual(ppt_maker.last_run["images"], 2)
+
+    # 22. 配图页数 >4 -> 钳制到 4（按页序保留前 4）
+    def test_image_pages_clamped_to_four(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        http = _MockHTTP()
+        self._enable_images(http)
+        # 6 页全 bullets：末页升级 closing -> 5 个候选，钳到前 4
+        script = [_image_outline_json(6)] + [_page_json(f"P{i}") for i in range(1, 7)]
+        r = ppt_maker.make_ppt("人工智能简介", pages=6, llm_caller=_MockLLM(script))
+        self.assertTrue(r["ok"], r.get("error"))
+        deck = render.calls[0][1]
+        # API 调用 = 1 封面 + 恰好 4 内容页
+        self.assertEqual(len(http.api_bodies()), 5)
+        for pg in deck["pages"][:4]:
+            self.assertTrue(pg["image"], f"{pg['page_title']} 应有图")
+        self.assertIsNone(deck["pages"][4]["image"])      # 第 5 页被钳掉
+        self.assertEqual(deck["pages"][5]["layout"], "closing")
+        self.assertEqual(ppt_maker.last_run["images"], 5)  # 封面 + 4 页
+
+    # 23. 非 bullets 页的 image_prompt 被静默丢弃
+    def test_non_bullets_image_prompt_dropped(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        http = _MockHTTP()
+        self._enable_images(http)
+        outline = _image_outline_json(
+            4, layouts=["two_column", "quote", "bullets", "closing"])
+        script = [outline, _two_column_json(), _quote_json(),
+                  _page_json("P3"), _page_json("P4")]
+        r = ppt_maker.make_ppt("人工智能简介", pages=4, llm_caller=_MockLLM(script))
+        self.assertTrue(r["ok"], r.get("error"))
+        deck = render.calls[0][1]
+        # 只有 bullets 页（第 3 页）配图：API = 1 封面 + 1 内容页
+        self.assertEqual(len(http.api_bodies()), 2)
+        self.assertEqual(deck["pages"][0]["layout"], "two_column")
+        self.assertNotIn("image", deck["pages"][0])
+        self.assertEqual(deck["pages"][1]["layout"], "quote")
+        self.assertNotIn("image", deck["pages"][1])
+        self.assertTrue(deck["pages"][2]["image"])
+        self.assertNotIn("image", deck["pages"][3])       # closing 不配图
+
+    # 24. with_images=False -> 零 HTTP 调用，契约键初始化为 None
+    def test_with_images_false_zero_http(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        http = _MockHTTP()
+        self._enable_images(http)
+        script = [_image_outline_json(3)] + [_page_json(f"P{i}") for i in range(1, 4)]
+        r = ppt_maker.make_ppt("人工智能简介", pages=3, llm_caller=_MockLLM(script),
+                               with_images=False)
+        self.assertTrue(r["ok"], r.get("error"))
+        self.assertEqual(http.calls, [])                  # 零 HTTP
+        deck = render.calls[0][1]
+        self.assertIsNone(deck["cover_image"])
+        for pg in deck["pages"][:2]:
+            self.assertIsNone(pg["image"])
+        self.assertEqual(ppt_maker.last_run["images"], 0)
+        self.assertFalse((self.tmp / "ppt_assets").exists())
+
+    # 25. 配置缺失（无 key）-> 整条生图链静默跳过、零 HTTP（setUp 默认即无配置）
+    def test_missing_config_silent_skip(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        http = _MockHTTP()
+        orig_open = urllib.request.urlopen
+        urllib.request.urlopen = http
+        self.addCleanup(lambda: setattr(urllib.request, "urlopen", orig_open))
+        script = [_image_outline_json(3)] + [_page_json(f"P{i}") for i in range(1, 4)]
+        r = ppt_maker.make_ppt("人工智能简介", pages=3, llm_caller=_MockLLM(script))
+        self.assertTrue(r["ok"], r.get("error"))
+        self.assertEqual(http.calls, [])
+        deck = render.calls[0][1]
+        self.assertIsNone(deck["cover_image"])
+        for pg in deck["pages"][:2]:
+            self.assertIsNone(pg["image"])
+        self.assertEqual(ppt_maker.last_run["images"], 0)
+
+    # 26. 大纲不给 cover_image_prompt -> 封面无图但内容页配图照常
+    def test_missing_cover_prompt_skips_cover_only(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        http = _MockHTTP()
+        self._enable_images(http)
+        outline = json.loads(_image_outline_json(3))
+        del outline["cover_image_prompt"]
+        script = [json.dumps(outline, ensure_ascii=False)] + [_page_json(f"P{i}") for i in range(1, 4)]
+        r = ppt_maker.make_ppt("人工智能简介", pages=3, llm_caller=_MockLLM(script))
+        self.assertTrue(r["ok"], r.get("error"))
+        deck = render.calls[0][1]
+        self.assertIsNone(deck["cover_image"])
+        self.assertEqual(len(http.api_bodies()), 2)       # 只有 2 个内容页
+        self.assertTrue(deck["pages"][0]["image"])
+        self.assertTrue(deck["pages"][1]["image"])
 
 
 if __name__ == "__main__":

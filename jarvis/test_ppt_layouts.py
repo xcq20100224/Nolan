@@ -8,14 +8,18 @@ jarvis/test_ppt_layouts.py —— ppt_layouts 版式引擎的验收测试（不�
   3. chart 页含 GraphicFrame 原生图表（has_chart），且类型映射正确；
   4. 深色版式（封面/章节/金句）与浅色版式背景色断言；
   5. 缺字段页不抛异常、未知 layout 降级 bullets、chart 数据缺失降级；
-  6. toc 超 8 条分两栏（仅冒烟，不断言坐标）。
+  6. toc 超 8 条分两栏（仅冒烟，不断言坐标）；
+  7. AI 配图扩展（路 B 契约）：bullets 带图左文右图、cover_image 封面背景图
+     + 蒙层 z-order、无效图片路径静默降级。
 
 运行：python jarvis/test_ppt_layouts.py（全部断言通过即全绿）
 """
 from __future__ import annotations
 
 import io
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 # 保证能 import 同目录模块（从仓库根或 jarvis/ 目录运行都行）
@@ -23,7 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pptx import Presentation          # noqa: E402
 from pptx.util import Inches           # noqa: E402
-from pptx.enum.chart import XL_CHART_TYPE  # noqa: E402
+from pptx.enum.chart import XL_CHART_TYPE    # noqa: E402
+from pptx.enum.shapes import MSO_SHAPE_TYPE  # noqa: E402
+from pptx.oxml.ns import qn                 # noqa: E402
 
 from ppt_layouts import render_deck    # noqa: E402
 
@@ -137,6 +143,33 @@ def _charts(slide):
     return [sh.chart for sh in slide.shapes if sh.has_chart]
 
 
+# ---------------------------------------------------------------- 测试图现场生成（PIL）
+
+def _make_test_images() -> dict:
+    """用 PIL 现场生成两张暖色纯色块测试图，存临时目录。
+    返回 {"img_4_3": 1024x768 路径, "img_16_9": 1920x1080 路径}。"""
+    from PIL import Image
+    tmp = tempfile.mkdtemp(prefix="nolan_ppt_img_")
+    p43 = os.path.join(tmp, "warm_block_4x3.png")
+    p169 = os.path.join(tmp, "warm_block_16x9.png")
+    Image.new("RGB", (1024, 768), (192, 96, 74)).save(p43)     # 赭红暖色块
+    Image.new("RGB", (1920, 1080), (168, 123, 95)).save(p169)  # 陶棕暖色块
+    return {"img_4_3": p43, "img_16_9": p169}
+
+
+def _pictures(slide):
+    """页面上所有 Picture 形状（按 z-order 顺序）。"""
+    return [sh for sh in slide.shapes if sh.shape_type == MSO_SHAPE_TYPE.PICTURE]
+
+
+def _fill_hex(shape) -> str:
+    """取形状实心填充色；非实心/取不到返回空串。"""
+    try:
+        return str(shape.fill.fore_color.rgb)
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------- 测试项
 
 def test_full_deck():
@@ -231,10 +264,154 @@ def test_unknown_layout_falls_back_to_bullets():
     print("[PASS] test_unknown_layout_falls_back_to_bullets: 未知版式正确降级为要点页")
 
 
+def test_bullets_with_image():
+    """bullets 带图页：左文右图 —— 有 Picture、浅金衬底在图下、文字仍在；
+    two_column 携带 image 字段应被忽略（保持纯文字）。"""
+    imgs = _make_test_images()
+    deck = {
+        "title": "配图版式测试", "subtitle": "",
+        "pages": [
+            {"layout": "bullets",
+             "page_title": "左文右图要点页",
+             "bullets": ["全双工语音链路时延降到 230ms，体验接近真人对话",
+                         "记忆系统跨会话召回率提升到 84%",
+                         "PPT 管线新增 AI 配图版式，要点页自动左文右图"],
+             "image": imgs["img_4_3"],
+             "speaker_note": "带图要点页：先讲左侧三条要点，再点右侧配图。"},
+            {"layout": "two_column",
+             "page_title": "带 image 字段的两栏页（应忽略）",
+             "left": {"heading": "左栏", "points": ["要点一"]},
+             "right": {"heading": "右栏", "points": ["要点二"]},
+             "image": imgs["img_4_3"],   # two_column 不响应 image
+             "speaker_note": "两栏页应保持纯文字。"},
+        ],
+    }
+    prs = _new_prs()
+    render_deck(prs, deck)
+    prs = _reopen(prs)
+
+    # 1) bullets 带图页：恰好 1 张配图
+    slide = prs.slides[1]
+    pics = _pictures(slide)
+    assert len(pics) == 1, f"带图要点页应有 1 张配图，实际 {len(pics)}"
+
+    # 2) 文字仍在：标题与要点都渲染出来了
+    all_text = "\n".join(sh.text_frame.text for sh in slide.shapes if sh.has_text_frame)
+    assert "左文右图要点页" in all_text, "带图页应保留页标题"
+    assert "全双工语音链路时延降到 230ms" in all_text, "带图页应保留要点文字"
+
+    # 3) 浅金衬底色块存在，且 z-order 在图片之下
+    shapes = list(slide.shapes)
+    pic_idx = shapes.index(pics[0])
+    gold_idx = next((i for i, sh in enumerate(shapes)
+                     if sh.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE
+                     and _fill_hex(sh) == "D9C9A3"), None)
+    assert gold_idx is not None, "配图外应有浅金衬底色块"
+    assert gold_idx < pic_idx, "衬底色块应垫在图片之下（z-order）"
+
+    # 4) 图高不超过正文区（5.1 英寸）
+    assert pics[0].height <= Inches(5.11), f"图高超限：{pics[0].height}"
+
+    # 5) two_column 携带 image 字段被忽略：无 Picture
+    tc_slide = prs.slides[2]
+    assert not _pictures(tc_slide), "two_column 应忽略 image 字段，保持纯文字"
+    tc_text = "\n".join(sh.text_frame.text for sh in tc_slide.shapes if sh.has_text_frame)
+    assert "左栏" in tc_text and "右栏" in tc_text
+
+    print("[PASS] test_bullets_with_image: 左文右图（配图+浅金衬底 z-order 正确）/ "
+          "two_column 忽略 image")
+
+
+def test_cover_image():
+    """封面背景图：Picture + 深棕蒙层（30% 不透明）+ 标题文字框，z-order 依次递增。"""
+    imgs = _make_test_images()
+    deck = {
+        "title": "封面背景图测试",
+        "subtitle": "蒙层之上的副标题",
+        "cover_image": imgs["img_16_9"],
+        "pages": [{"layout": "bullets", "page_title": "占位页",
+                   "bullets": ["占位要点"], "speaker_note": "占位备注。"}],
+    }
+    prs = _new_prs()
+    render_deck(prs, deck)
+    prs = _reopen(prs)
+
+    slide = prs.slides[0]
+    shapes = list(slide.shapes)
+
+    # 1) 封面有背景图，且在形状列表最前（先图）
+    pics = [(i, sh) for i, sh in enumerate(shapes)
+            if sh.shape_type == MSO_SHAPE_TYPE.PICTURE]
+    assert pics, "封面应有背景图 Picture"
+    pic_idx = pics[0][0]
+
+    # 2) 蒙层：图片之后第一个深棕 #3B322C 矩形（后蒙层）
+    overlay_idx = next((i for i, sh in enumerate(shapes)
+                        if i > pic_idx
+                        and sh.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE
+                        and _fill_hex(sh) == "3B322C"), None)
+    assert overlay_idx is not None, "背景图之上应有深棕蒙层矩形"
+
+    # 3) 蒙层透明度：OOXML alpha = 30000（30% 不透明 / 70% 透明）
+    srgb = shapes[overlay_idx]._element.spPr.find(qn("a:solidFill")).find(qn("a:srgbClr"))
+    alpha = srgb.find(qn("a:alpha")) if srgb is not None else None
+    assert alpha is not None and alpha.get("val") == "30000", \
+        f"蒙层 alpha 应为 30000，实际 {alpha.get('val') if alpha is not None else None}"
+
+    # 4) 标题文字框在蒙层之上（后文字）
+    title_idx = next((i for i, sh in enumerate(shapes)
+                      if sh.has_text_frame and "封面背景图测试" in sh.text_frame.text), None)
+    assert title_idx is not None, "封面应有标题文字框"
+    assert pic_idx < overlay_idx < title_idx, \
+        f"z-order 应为 图({pic_idx}) < 蒙层({overlay_idx}) < 文字({title_idx})"
+
+    # 5) 副标题也在（文字层完整）
+    all_text = "\n".join(sh.text_frame.text for sh in slide.shapes if sh.has_text_frame)
+    assert "蒙层之上的副标题" in all_text
+
+    print("[PASS] test_cover_image: 封面 图->蒙层(alpha 30000)->文字 z-order 正确")
+
+
+def test_missing_image_degrades():
+    """image / cover_image 指向不存在路径：静默降级无图版式，绝不抛异常。"""
+    bogus = os.path.join(tempfile.gettempdir(), "nolan_绝不存在的配图_9f3k2.png")
+    assert not os.path.isfile(bogus), "前置条件：测试用 bogus 路径不能真的存在"
+    deck = {
+        "title": "无效图降级测试", "subtitle": "",
+        "cover_image": bogus,   # 封面图不存在 -> 纯色封面
+        "pages": [
+            {"layout": "bullets", "page_title": "无效配图页",
+             "bullets": ["要点甲", "要点乙"],
+             "image": bogus,   # 配图不存在 -> 无图 bullets 版式
+             "speaker_note": "降级备注。"},
+            {"layout": "closing", "page_title": "结尾页",
+             "bullets": ["行动项一"], "image": bogus,
+             "speaker_note": "结尾备注。"},
+        ],
+    }
+    prs = _new_prs()
+    render_deck(prs, deck)   # 不抛异常即第一断言
+    prs = _reopen(prs)
+
+    # 封面与内容页都不应出现 Picture
+    for i, slide in enumerate(prs.slides, start=1):
+        assert not _pictures(slide), f"第 {i} 页不应有图片（无效路径应降级）"
+
+    # 降级后文字内容完整
+    s1_text = "\n".join(sh.text_frame.text for sh in prs.slides[1].shapes if sh.has_text_frame)
+    assert "无效配图页" in s1_text and "要点甲" in s1_text
+    assert _bg_hex(prs.slides[1]) == "FAF7F2", "降级后应为标准米白 bullets 版式"
+
+    print("[PASS] test_missing_image_degrades: 无效图片路径静默降级，无异常，文字完整")
+
+
 # ---------------------------------------------------------------- 入口
 
 if __name__ == "__main__":
     test_full_deck()
     test_fault_tolerance()
     test_unknown_layout_falls_back_to_bullets()
+    test_bullets_with_image()
+    test_cover_image()
+    test_missing_image_degrades()
     print("\n全部测试通过 ✔")

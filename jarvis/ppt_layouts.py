@@ -16,6 +16,12 @@ Nolan · PPT 版式引擎（ppt_layouts.py）—— 成熟产品级版式渲染
                           big_number / quote / chart / closing
     （各 layout 的字段约定见契约 docstring，本文件头部不再重复）。
 
+    AI 配图扩展契约（与生图管线路 B 的交接）：
+      - page 可选键 "image"：图片绝对路径，仅 bullets 版式响应（左文右图），
+        two_column / closing 等其余版式一律忽略；渲染前 os.path.isfile 检查，
+        文件不存在就当无图降级，绝不抛异常；
+      - deck 顶层可选键 "cover_image"：封面背景图绝对路径，全屏铺图 + 深色蒙层。
+
 约定：
   - 封面由 render_deck 自动用 deck["title"]/["subtitle"] 生成，pages 里不含封面；
   - 每页（含封面）都把 speaker_note 物理写进 notes_slide（PPT/WPS 备注窗格可见）；
@@ -24,6 +30,7 @@ Nolan · PPT 版式引擎（ppt_layouts.py）—— 成熟产品级版式渲染
 """
 from __future__ import annotations
 
+import os
 import time
 
 # ================================================================ 设计 token
@@ -77,6 +84,14 @@ def _chart_type_map():
 # 正文字符宽度估算：16:9 内容区 18pt 下每行约 40 个全角字（沿用 ppt_maker 的经验值）
 _BODY_CHARS_PER_LINE = 40
 
+# ---- bullets 图文分栏参数（page["image"] 有效时启用「左文右图」）
+IMG_TEXT_W = 6.45                                # 左文区宽：内容区 11.733 的 55%
+IMG_GAP = 0.4                                    # 图文间距
+IMG_ZONE_W = CONTENT_W - IMG_TEXT_W - IMG_GAP    # 右图区宽 ≈ 4.88（约 42%）
+IMG_MAX_H = 5.1                                  # 图高上限：不超过正文区
+IMG_PAD = 0.09                                   # 浅金衬底色块比图大一圈的边距
+_IMG_CHARS_PER_LINE = 22                         # 半宽（约 5.8 英寸）下每行约 22 个全角字
+
 
 # ================================================================ 基础手法（取经自 ppt_maker，独立实现）
 
@@ -122,6 +137,25 @@ def _set_run_alpha(run, alpha_pct):
         pass   # 装饰性效果，失败不致命
 
 
+def _set_fill_alpha(shape, alpha_pct):
+    """给形状实心填充加透明度（alpha_pct: 0-100，越小越透明）。
+    用于封面背景图上的深色蒙层。OOXML：100% = 100000。"""
+    from pptx.oxml.ns import qn
+    try:
+        spPr = shape._element.spPr
+        solid = spPr.find(qn("a:solidFill"))
+        if solid is None:
+            return
+        srgb = solid.find(qn("a:srgbClr"))
+        if srgb is None:
+            return
+        alpha = srgb.makeelement(qn("a:alpha"), {})
+        alpha.set("val", str(int(alpha_pct * 1000)))
+        srgb.append(alpha)
+    except Exception:
+        pass   # 蒙层透明失败退化为实色，不致命
+
+
 def _set_bg(slide, color_hex):
     slide.background.fill.solid()
     slide.background.fill.fore_color.rgb = _rgb(color_hex)
@@ -156,11 +190,20 @@ def _add_accent_bar(slide, left, top, width, height):
 
 # ================================================================ 防溢出：正文三档缩字号
 
-def _fit_body_font(bullets):
-    """按总字数与估算行数三档缩字号（18 -> 16 -> 14），连带压缩段后距。"""
+def _fit_body_font(bullets, chars_per_line=None):
+    """按总字数与估算行数三档缩字号（18 -> 16 -> 14），连带压缩段后距。
+    chars_per_line 传半宽估值（图文模式约 22）时，按半宽重估阈值：
+    行数阈值按宽度比放宽，总字数阈值同步下调，保证左文右图下不溢出。"""
+    cpl = chars_per_line or _BODY_CHARS_PER_LINE
     total = sum(len(b) for b in bullets)
-    lines = sum(max(1, (len(b) + 3 + _BODY_CHARS_PER_LINE - 1) // _BODY_CHARS_PER_LINE)
+    lines = sum(max(1, (len(b) + 3 + cpl - 1) // cpl)
                 for b in bullets)   # +3 是「▪  」符号前缀
+    if cpl < _BODY_CHARS_PER_LINE:        # 半宽（图文）模式阈值
+        if total <= 180 and lines <= 12:
+            return SIZE_BODY, 0.18
+        if total <= 260 and lines <= 16:
+            return SIZE_BODY_MID, 0.14
+        return SIZE_BODY_MIN, 0.10
     if total <= 240 and lines <= 7:
         return SIZE_BODY, 0.18
     if total <= 320 and lines <= 9:
@@ -192,6 +235,18 @@ def _safe_bullets(page):
     """要点兜底：空 bullets 渲染「本页内容筹备中」，绝不空页。"""
     bullets = _safe_str_list(page.get("bullets"), max_items=8)
     return bullets or ["本页内容筹备中，详细要点以现场讲解为准。"]
+
+
+def _valid_image_path(v):
+    """配图路径有效性检查（路 B 交接契约）：必须是真实存在的文件，
+    否则返回 None 当无图降级，绝不抛异常。"""
+    if not isinstance(v, str) or not v.strip():
+        return None
+    p = v.strip()
+    try:
+        return p if os.path.isfile(p) else None
+    except Exception:
+        return None
 
 
 # ================================================================ 共享装饰件
@@ -245,11 +300,11 @@ def _write_note(slide, page, page_no):
 
 
 def _write_bullet_paras(tf, bullets, color_hex=COLOR_INK, marker_color=COLOR_ACCENT,
-                        base_size=None, marker="▪  ", gap_in=None):
+                        base_size=None, marker="▪  ", gap_in=None, chars_per_line=None):
     """写一串要点段落：赭红小方块符号 + 正文文字（符号与文字分 run，符号单独上色）。
-    base_size 为 None 时自动三档缩字号。"""
+    base_size 为 None 时自动三档缩字号；chars_per_line 传半宽估值时按半宽重估。"""
     if base_size is None:
-        size, gap = _fit_body_font(bullets)
+        size, gap = _fit_body_font(bullets, chars_per_line=chars_per_line)
     else:
         size, gap = base_size, (gap_in if gap_in is not None else 0.14)
     from pptx.util import Inches
@@ -266,12 +321,27 @@ def _write_bullet_paras(tf, bullets, color_hex=COLOR_INK, marker_color=COLOR_ACC
 
 # ================================================================ 版式 1：封面（render_deck 自动生成）
 
-def _render_cover(prs, title, subtitle, style):
-    """深棕底浅字：居中 40pt 主标 + 赭红短色条 + 副标题 + 底部风格/日期行。"""
+def _render_cover(prs, title, subtitle, style, cover_image=None):
+    """深棕底浅字：居中 40pt 主标 + 赭红短色条 + 副标题 + 底部风格/日期行。
+    cover_image 有效时：全屏铺图（按 slide 宽高铺满）+ 深棕半透明蒙层，
+    文字层保持在蒙层之上，排版与无图时完全一致。"""
     from pptx.enum.text import PP_ALIGN
+    from pptx.util import Inches
     blank = prs.slide_layouts[6]
     s = prs.slides.add_slide(blank)
     _set_bg(s, COLOR_DARK)
+
+    # 封面背景图（路 B 交接契约）：先铺图、再蒙层，后续装饰与文字自然在其上
+    bg_img = _valid_image_path(cover_image)
+    if bg_img:
+        try:
+            s.shapes.add_picture(
+                bg_img, Inches(0), Inches(0),
+                width=Inches(SLIDE_W), height=Inches(SLIDE_H))   # 16:9 全屏铺满
+            overlay = _add_rect(s, 0, 0, SLIDE_W, SLIDE_H, COLOR_DARK)
+            _set_fill_alpha(overlay, 30)   # 深棕蒙层 70% 透明（30% 不透明），压图保可读性
+        except Exception:
+            pass   # 铺图失败退化为纯色封面，不致命
 
     # 顶部与底部浅金细线，框出仪式感
     _add_rect(s, MARGIN, 0.7, CONTENT_W, 0.014, COLOR_GOLD)
@@ -379,12 +449,49 @@ def _render_section(slide, page, page_no, style):
 # ================================================================ 版式 4：bullets 标准要点页
 
 def _render_bullets(slide, page, page_no, style):
-    """米白底：色条标题 + 赭红方块符号要点列，正文三档缩字号防溢出。"""
+    """米白底：色条标题 + 赭红方块符号要点列，正文三档缩字号防溢出。
+    page["image"] 有效时切换「左文右图」：文字区收窄到左 55%（半宽阈值重估
+    缩档），右侧放等比配图 + 浅金衬底色块；无图或图片缺失时与原版式一致。"""
     _set_bg(slide, COLOR_BG)
     _add_page_header(slide, _safe_str(page.get("page_title"), "（无标题）"))
     bullets = _safe_bullets(page)
-    tf = _add_textbox(slide, CONTENT_LEFT + 0.2, BODY_Y, CONTENT_W - 0.2, 5.1)
-    _write_bullet_paras(tf, bullets)
+
+    img = _valid_image_path(page.get("image"))
+    if not img:
+        # 无图：与既有版式完全一致
+        tf = _add_textbox(slide, CONTENT_LEFT + 0.2, BODY_Y, CONTENT_W - 0.2, 5.1)
+        _write_bullet_paras(tf, bullets)
+        return
+
+    # 有图：左文右图。文字区收窄，缩档阈值按半宽（约 22 全角字/行）重估
+    tf = _add_textbox(slide, CONTENT_LEFT + 0.2, BODY_Y, IMG_TEXT_W - 0.2, IMG_MAX_H)
+    _write_bullet_paras(tf, bullets, chars_per_line=_IMG_CHARS_PER_LINE)
+    _place_side_image(slide, img, CONTENT_LEFT + IMG_TEXT_W + IMG_GAP, BODY_Y)
+
+
+def _place_side_image(slide, img_path, left, top):
+    """右图区配图：先按区宽等比铺图，超高则按高度回缩并水平居中；
+    图下垫一圈浅金衬底色块（成熟产品手法，z-order 衬底在图之下）。
+    任何失败都静默降级为纯文字页，绝不抛异常。"""
+    from pptx.util import Inches, Emu
+    try:
+        pic = slide.shapes.add_picture(
+            img_path, Inches(left), Inches(top), width=Inches(IMG_ZONE_W))  # 只给宽度，等比
+        if pic.height > Inches(IMG_MAX_H):        # 图高不超过正文区：按高度回缩
+            ratio = Inches(IMG_MAX_H) / pic.height
+            pic.height = Inches(IMG_MAX_H)
+            pic.width = Emu(int(pic.width * ratio))
+        # 在图区内水平居中
+        pic.left = Emu(int(Inches(left) + (Inches(IMG_ZONE_W) - pic.width) / 2))
+        # 浅金衬底色块：比图大一圈，垫在图下
+        pad = Inches(IMG_PAD)
+        backing = _add_rect(slide,
+                            (pic.left - pad) / 914400, (pic.top - pad) / 914400,
+                            (pic.width + 2 * pad) / 914400, (pic.height + 2 * pad) / 914400,
+                            COLOR_GOLD)
+        pic._element.addprevious(backing._element)   # z-order：衬底挪到图片之下
+    except Exception:
+        pass   # 配图失败静默降级，绝不中断渲染
 
 
 # ================================================================ 版式 5：two_column 两栏对比页
@@ -690,10 +797,13 @@ def render_deck(prs, deck: dict, style: str = "工作汇报") -> None:
 
     deck = {
       "title": str, "subtitle": str,
+      "cover_image": str | None,   # 可选：封面背景图绝对路径，缺失/无效当无图
       "pages": [ page, ... ]   # 每个 page 必含 "layout" 与 "speaker_note"
     }
     page 按 layout 分八种：toc / section / bullets / two_column /
                           big_number / quote / chart / closing。
+    page 可选键 "image"：配图绝对路径，仅 bullets 版式响应（左文右图），
+    文件不存在时自动降级为无图版式，绝不抛异常。
     每页都要把 speaker_note 写进该页 notes_slide（物理写入，非注释）。
     封面由 render_deck 自动用 deck["title"]/["subtitle"] 生成，pages 里不含封面。
 
@@ -704,14 +814,15 @@ def render_deck(prs, deck: dict, style: str = "工作汇报") -> None:
     style = _safe_str(style, "工作汇报")
     title = _safe_str(deck.get("title"), "未命名汇报")
     subtitle = _safe_str(deck.get("subtitle"))
+    cover_image = deck.get("cover_image")   # 可选：封面背景图绝对路径（路 B 契约）
     pages_raw = deck.get("pages")
     pages = [p if isinstance(p, dict) else {} for p in pages_raw] \
         if isinstance(pages_raw, list) else []
 
     blank = prs.slide_layouts[6]
 
-    # ---- 封面（深底浅字，自动开场备注）
-    _render_cover(prs, title, subtitle, style)
+    # ---- 封面（深底浅字，自动开场备注；cover_image 有效时铺背景图 + 蒙层）
+    _render_cover(prs, title, subtitle, style, cover_image=cover_image)
 
     total = len(pages) + 1   # 物理总页数（含封面），页脚用
 
