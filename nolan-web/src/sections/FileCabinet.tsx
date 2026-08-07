@@ -45,7 +45,7 @@ export default function FileCabinet({ onClose }: FileCabinetProps) {
   const [files, setFiles] = useState<CabinetFile[] | null>(null)
   const [failed, setFailed] = useState(false)
 
-  // 每次打开面板刷新列表
+  // 每次打开面板刷新列表（手动刷新按钮沿用此函数）
   const refresh = () => {
     getFilesList()
       .then((list) => {
@@ -57,7 +57,30 @@ export default function FileCabinet({ onClose }: FileCabinetProps) {
         setFailed(true)
       })
   }
-  useEffect(refresh, [])
+
+  // 打开即刷新 + 面板存续期间每 3 秒自动轮询：
+  // Nolan 后台新生成的文件最长 3 秒后自动出现在列表里（原来必须关了重开）。
+  // 关闭面板（组件卸载）时 clearInterval，杜绝计时器泄漏；
+  // cancelled 标记挡住卸载后迟到的响应，避免对尸体组件 setState。
+  useEffect(() => {
+    let cancelled = false
+    refresh()
+    const timer = window.setInterval(() => {
+      getFilesList()
+        .then((list) => {
+          if (cancelled) return
+          setFiles(list)
+          setFailed(false)
+        })
+        .catch(() => {
+          // 轮询失败静默保留当前列表——不把面板闪成空，下一轮自愈
+        })
+    }, 3_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
 
   // Esc 关闭（与历史浮层一致）
   useEffect(() => {

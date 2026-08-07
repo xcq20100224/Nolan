@@ -9,7 +9,7 @@ import NegaInput from '@/sections/NegaInput'
 import FileCabinet from '@/sections/FileCabinet'
 import type { WaveMode } from '@/sections/WaveCanvas'
 import type { Message } from '@/types/message'
-import { checkHealth, sendChatStream, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, enqueueAudio, stopAllAudio, stopSpeak, soundTest, getBackground, clientLog, uploadFile } from '@/lib/api'
+import { checkHealth, sendChatStream, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, enqueueAudio, stopAllAudio, stopSpeak, soundTest, getBackground, getFilesList, clientLog, uploadFile } from '@/lib/api'
 
 /** 待发送附件（芯片展示 + 发送时拼 payload 的全量文本） */
 interface StagedAttachment {
@@ -86,6 +86,8 @@ export default function ChatApp() {
   const [historyOpen, setHistoryOpen] = useState(false)
   /** 文件柜面板开关 */
   const [cabinetOpen, setCabinetOpen] = useState(false)
+  /** 文件柜新文件红点角标（打开面板即清除） */
+  const [cabinetHasNew, setCabinetHasNew] = useState(false)
   /** 待发送附件（拖拽上传成功后暂存，发送时拼进 payload，最多 3 个） */
   const [attachments, setAttachments] = useState<StagedAttachment[]>([])
   /** 文件拖入聊天区的视觉高亮 */
@@ -102,6 +104,11 @@ export default function ChatApp() {
   attachmentsRef.current = attachments
   // 拖拽进出计数：子元素间移动不闪高亮
   const dragDepthRef = useRef(0)
+  // 文件柜轮询基线：name → mtime；null 表示尚未建立基线（首次拉取不算"新增"）
+  const cabinetBaselineRef = useRef<Map<string, number> | null>(null)
+  // 轮询回调里读取最新的面板开关状态（异步闭包不取旧值）
+  const cabinetOpenRef = useRef(cabinetOpen)
+  cabinetOpenRef.current = cabinetOpen
 
   /** 当前流式请求的中止器：新消息进场时中止未完成的上一轮 */
   const streamAbortRef = useRef<AbortController | null>(null)
@@ -330,6 +337,50 @@ export default function ChatApp() {
     }
   }, [])
 
+  // 每 5 秒轮询文件柜列表：发现 Nolan 后台新生成/更新的文件时——
+  //   ① 文件柜按钮上亮红点角标（打开面板后清除）；
+  //   ② 以 Nolan 消息插入字幕条（与到点提醒同款机制，克制不突兀）。
+  // 规则：
+  //   - 首次拉取只建基线，不算"新增"（避免一打开页面就误报）；
+  //   - 按 name+mtime 判定：名字没出现过、或同名但 mtime 变了，都算新文件；
+  //   - uploads/ 前缀是先生自己刚拖进来的上传文件，跳过通知；
+  //   - 页面隐藏（visibilityState === 'hidden'）时跳过请求省电；
+  //   - 面板正打开时跳过角标与通知——先生正看着列表，无需提醒。
+  // 多文件同时新增合并为一条「N 个新文件已放入文件柜」。
+  useEffect(() => {
+    let cancelled = false
+    const poll = async () => {
+      if (document.visibilityState === 'hidden') return
+      try {
+        const list = await getFilesList()
+        if (cancelled) return
+        const prev = cabinetBaselineRef.current
+        cabinetBaselineRef.current = new Map(list.map((f) => [f.name, f.mtime]))
+        if (prev === null) return // 首次：只建基线
+        const fresh = list.filter(
+          (f) =>
+            !f.name.startsWith('uploads/') &&
+            (!prev.has(f.name) || prev.get(f.name) !== f.mtime),
+        )
+        if (fresh.length === 0 || cabinetOpenRef.current) return
+        setCabinetHasNew(true)
+        if (fresh.length === 1) {
+          const base = fresh[0].name.split('/').pop() ?? fresh[0].name
+          pushNolan(`📁 新文件已放入文件柜：《${base}》`)
+        } else {
+          pushNolan(`📁 ${fresh.length} 个新文件已放入文件柜。`)
+        }
+      } catch {
+        // 后端短暂不可用时静默跳过，等待下一轮
+      }
+    }
+    const timer = window.setInterval(poll, 5_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [pushNolan])
+
   // 「记忆」按钮：查询长期记忆并作为 Nolan 消息插入
   const handleMemory = useCallback(async () => {
     try {
@@ -508,7 +559,11 @@ export default function ChatApp() {
           onStatus={pushNolan}
           attachments={attachments.map((a) => ({ id: a.id, name: a.name, chars: a.chars, kind: a.kind, note: a.note }))}
           onRemoveAttachment={handleRemoveAttachment}
-          onOpenCabinet={() => setCabinetOpen(true)}
+          cabinetHasNew={cabinetHasNew}
+          onOpenCabinet={() => {
+            setCabinetHasNew(false) // 打开面板即清除未读红点
+            setCabinetOpen(true)
+          }}
         />
 
         {historyOpen && <HistoryOverlay messages={messages} onClose={() => setHistoryOpen(false)} />}

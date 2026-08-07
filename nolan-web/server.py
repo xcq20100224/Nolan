@@ -129,7 +129,7 @@ except ImportError:
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-06-historyslim"
+_VERSION = "2026-08-07-displayfix"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -1304,6 +1304,32 @@ def _greeting_payload() -> dict:
     return {"greeted": False, "text": text, "audio_url": synth_for(text)}
 
 
+# == 显示层终态卫生（与发声层同一套 speak_filter 标准）==
+# 第一性原理：工具调用 JSON、代码块是 Nolan 的思考，不是给先生看的内容。
+# 发声层（synth_for）早已剥离；显示层此前只在 brain.think 出口闸（_speak_guard）
+# 剥过——但流式路径（/api/chat/stream）绕开 brain 自行拼装 LLM 全文，
+# 「人话 + 行尾工具 JSON」混排会原样漏进字幕终态与历史记录。
+# 此处收口：两条对话路径的最终回复文本在「落历史 + 发前端」之前统一过一道。
+# 流式中间态（逐字 delta）允许短暂出现 JSON 字符，终态必须干净。
+_DISPLAY_PLACEHOLDER = "（正在处理，请稍候…）"
+
+
+def _display_clean(text: str) -> str:
+    """显示层终态剥离：工具 JSON/代码块/路径/URL 一律剥掉，只留人话。
+
+    剥完为空（纯工具调用、无台词）用轻量占位——不用 TTS 那句兜底话术
+    （「详细内容我放在屏幕上了」在屏幕上读出来是循环指涉）。
+    过滤器缺失或异常时原样放行：显示层绝不因卫生检查阻断对话。
+    """
+    t = (text or "").strip()
+    if not t or _speak_filter is None:
+        return t
+    try:
+        return _speak_filter.speakable(t, max_chars=None) or _DISPLAY_PLACEHOLDER
+    except Exception:
+        return t
+
+
 def _chat(user_text: str) -> dict:
     """
     处理一轮对话：串行调用 brain.think，维护 history（裁剪 20 轮）。
@@ -1330,6 +1356,9 @@ def _chat(user_text: str) -> dict:
         # 历史写入与裁剪也在同一临界区内：与 brain.think 串行化，
         # 杜绝并发请求把对话历史交错、裁剪互相覆盖
         if reply != "__EXIT__":
+            # 显示层终态卫生：剥离工具 JSON/代码后再落历史、发前端
+            # （__EXIT__ 哨兵原样保留，绝不过滤）
+            reply = _display_clean(reply)
             # 历史瘦身：写入历史的是存根版（附件全文不躺历史）；
             # 发给 brain 的当前轮 user_text 仍是全文（LLM 本轮要读附件）
             _history.append({"role": "user", "content": _slim_for_history(user_text)})
@@ -2000,6 +2029,9 @@ class NolanHandler(BaseHTTPRequestHandler):
                 elif kind == "tts_done":
                     tts_done = True
 
+            # 显示层终态卫生：流式全文绕开 brain 出口闸，「人话+行尾工具 JSON」
+            # 混排会原样漏进来——落历史与 done 事件之前统一剥离（中间态 delta 不动）
+            reply = _display_clean(reply)
             # 历史落账：与 /api/chat 同一把锁串行化、同一裁剪规则；
             # 同样写入存根版（附件全文不躺历史，当前轮全文已发给 LLM）
             with _brain_lock:

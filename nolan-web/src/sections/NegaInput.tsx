@@ -62,9 +62,11 @@ interface NegaInputProps {
   onRemoveAttachment?: (id: string) => void
   /** 打开文件柜面板 */
   onOpenCabinet?: () => void
+  /** 文件柜有未读新文件（按钮上显示红点角标） */
+  cabinetHasNew?: boolean
 }
 
-export default function NegaInput({ disabled, onSend, onRecordingChange, onStatus, attachments = [], onRemoveAttachment, onOpenCabinet }: NegaInputProps) {
+export default function NegaInput({ disabled, onSend, onRecordingChange, onStatus, attachments = [], onRemoveAttachment, onOpenCabinet, cabinetHasNew = false }: NegaInputProps) {
   // 全局错误浮层：任何未捕获的 JS 错误都显示在屏幕上（调试期 instrumentation）
   const [jsError, setJsError] = useState('')
   useEffect(() => {
@@ -322,10 +324,14 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
           type="button"
           onClick={onOpenCabinet}
           disabled={disabled}
-          title="文件柜（Nolan 生成的文件在这里查看/下载）"
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#2e2e33] text-[#8a8578] transition-colors hover:border-[#5a5a60] hover:text-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-30"
+          title={cabinetHasNew ? '文件柜有新文件，点击查看' : '文件柜（Nolan 生成的文件在这里查看/下载）'}
+          className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#2e2e33] text-[#8a8578] transition-colors hover:border-[#5a5a60] hover:text-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-30"
         >
           <FolderOpen className="h-4 w-4" />
+          {/* 未读红点角标：有新文件时亮在按钮右上角，打开面板后由父组件清除 */}
+          {cabinetHasNew && (
+            <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-[#c05b4d]" />
+          )}
         </button>
         <button
           type="button"
