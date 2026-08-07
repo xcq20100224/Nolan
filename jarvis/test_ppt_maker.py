@@ -5,7 +5,11 @@ ppt_maker 两阶段 pipeline 单元测试：纯 mock，LLM 0 真实调用。
 落盘目录重定向到临时目录，不污染真实 files/。
 
 mock 脚本约定：script 列表按调用顺序出队；元素是 str 则返回，是 Exception 则抛出。
-调用顺序 = 1 次大纲 + 每页 1~3 次精写（重写才会追加）。
+调用顺序 = 1 次大纲 + 每页 1~3 次精写（重写才会追加；toc/section 页不耗调用）。
+
+版式相关测试约定：
+- setUp 强制 ppt_maker._render_deck = None（默认走内置兜底排版，与路 A 是否就位无关）；
+- 需要验证 render_deck 接线的测试自行注入 _MockRender，tearDown 统一还原。
 """
 import json
 import re
@@ -24,7 +28,7 @@ from pptx import Presentation
 # ---------------------------------------------------------------- mock 素材
 
 def _outline_json(n=4, title="人工智能简介"):
-    """合法大纲：n 页，每页 page_title/core_point/keywords 齐全。"""
+    """合法大纲：n 页，每页 page_title/core_point/keywords 齐全（无 layout -> bullets）。"""
     return json.dumps({
         "title": title,
         "pages": [
@@ -58,6 +62,93 @@ def _page_json(tag="要点", n_bullets=4, bullet_len="long", note=True):
     return json.dumps(data, ensure_ascii=False)
 
 
+_NOTE = ("这一页先抛出听众最关心的问题，再逐条拆解机制与数据，"
+         "每条讲完停顿半拍确认大家跟上，最后一句小结自然过渡到下一页。" * 2)
+
+
+def _tc_points(tag, n):
+    """two_column 单栏要点：每条约 45 字，6 条约 270 字，过 220 严线。"""
+    return [f"{tag}{j}：该维度实测数据显示头部玩家投入强度连续三年翻倍，单位成本下降约四成。"
+            for j in range(1, n + 1)]
+
+
+def _two_column_json(ln=3, rn=3, lh="中国", rh="海外"):
+    """合法 two_column 精写页：默认左右各 3 点。"""
+    return json.dumps({
+        "left": {"heading": lh, "points": _tc_points("左", ln)},
+        "right": {"heading": rh, "points": _tc_points("右", rn)},
+        "speaker_note": _NOTE,
+    }, ensure_ascii=False)
+
+
+def _big_number_json(stats=None):
+    """合法 big_number 精写页：默认 2 个数字。"""
+    if stats is None:
+        stats = [{"number": "42.7%", "caption": "2024 年国内市场渗透率，来源：行业白皮书"},
+                 {"number": "1280 亿元", "caption": "2024 年市场规模，来源：头部券商研报"}]
+    return json.dumps({"stats": stats, "speaker_note": _NOTE}, ensure_ascii=False)
+
+
+def _chart_json(values=None, n_bullets=2):
+    """合法 chart 精写页：默认 bar，3 类别 1 系列，2 条 60 字解读。"""
+    if values is None:
+        values = [100, 200, 300]
+    return json.dumps({
+        "chart": {"type": "bar", "title": "年度出货量",
+                  "categories": ["2022", "2023", "2024"],
+                  "series": [{"name": "出货量(万台)", "values": values}]},
+        "bullets": [_long_bullet(f"解读{j}") for j in range(1, n_bullets + 1)],
+        "speaker_note": _NOTE,
+    }, ensure_ascii=False)
+
+
+def _quote_json(text=None):
+    """合法 quote 精写页：默认 30+ 字金句。"""
+    if text is None:
+        text = "技术本身没有方向，方向是人给的；每一次范式转移，奖励的都是先想清楚的人。"
+    return json.dumps({"quote": text, "attribution": "—— 某行业观察者",
+                       "speaker_note": _NOTE}, ensure_ascii=False)
+
+
+def _layout_outline_json():
+    """八种版式混合大纲：toc + bullets + two_column + big_number + chart + quote
+    + 未知版式（应降级 bullets）+ closing。"""
+    return json.dumps({
+        "title": "新能源汽车产业分析",
+        "subtitle": "从政策到市场的全景扫描",
+        "pages": [
+            {"layout": "toc", "page_title": "目录",
+             "core_point": "全篇结构导览", "keywords": [],
+             "entries": ["市场格局", "中外对比", "关键数字", "销量走势", "金句点题", "奇怪页", "总结行动"]},
+            {"layout": "bullets", "page_title": "市场格局",
+             "core_point": "市场集中度快速提升，头部三家拿走六成份额，腰部玩家加速出清。",
+             "keywords": ["CR3", "出清"]},
+            {"layout": "two_column", "page_title": "中外对比",
+             "core_point": "中国靠供应链密度取胜，海外靠品牌溢价守成，路径分野已经清晰。",
+             "keywords": ["供应链", "品牌溢价"],
+             "left": {"heading": "中国"}, "right": {"heading": "海外"}},
+            {"layout": "big_number", "page_title": "关键数字",
+             "core_point": "三个数字足以看清这个行业：渗透率、市场规模、增速。",
+             "keywords": ["渗透率"],
+             "stats": [{"number": "42.7%", "caption": "渗透率草稿"}]},
+            {"layout": "chart", "page_title": "销量走势",
+             "core_point": "销量三年翻两番，增长斜率仍在变陡，未见平台期迹象。",
+             "keywords": ["出货量"],
+             "chart": {"type": "bar", "title": "销量", "categories": ["2022", "2023", "2024"],
+                       "series": [{"name": "万辆", "values": [100, 200, 300]}]}},
+            {"layout": "quote", "page_title": "金句点题",
+             "core_point": "用一句行业金句收住论证，点明范式转移的本质。",
+             "keywords": []},
+            {"layout": "weird_layout", "page_title": "奇怪页",
+             "core_point": "这一页版式名是乱写的，应被降级为普通要点页并正常精写。",
+             "keywords": ["降级"]},
+            {"layout": "closing", "page_title": "总结行动",
+             "core_point": "总结三个判断并给出两类玩家各自的行动建议。",
+             "keywords": ["行动建议"]},
+        ],
+    }, ensure_ascii=False)
+
+
 class _MockLLM:
     """记录调用与 prompt，按脚本返回；脚本元素为 Exception 时抛出。"""
 
@@ -73,6 +164,16 @@ class _MockLLM:
         if isinstance(item, Exception):
             raise item
         return item
+
+
+class _MockRender:
+    """mock 路 A 的 render_deck(prs, deck, style)：只记录入参，不造 slide。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, prs, deck, style):
+        self.calls.append((prs, deck, style))
 
 
 def _script_for(n_pages, page_json=None):
@@ -93,9 +194,13 @@ class PptMakerTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="ppt_maker_test_"))
         self._orig_dir = ppt_maker.FILES_DIR
         ppt_maker.FILES_DIR = self.tmp
+        # 默认强制走内置兜底排版：既有 15 个测试的行为与路 A 是否就位解耦
+        self._orig_render = ppt_maker._render_deck
+        ppt_maker._render_deck = None
 
     def tearDown(self):
         ppt_maker.FILES_DIR = self._orig_dir
+        ppt_maker._render_deck = self._orig_render
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # 1. 标准两阶段 -> 真 pptx：页数、标题、notes 非空、调用次数 = 1 + N
@@ -305,6 +410,231 @@ class PptMakerTest(unittest.TestCase):
                         if run.text.startswith("•"):
                             sizes2.add(run.font.size)
         self.assertEqual(sizes2, {Pt(16)})
+
+    # ================================================================ 新增：版式管线
+
+    # 11. 各版式大纲 -> 归一化 deck 符合路 A 契约（render_deck 捕获断言）
+    def test_layouts_normalized_into_contract_deck(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        # big_number 精写给 5 个数字（应钳到 3）；chart 精写 values 给字符串数字且多 1 个（应转 float 并截齐）
+        five_stats = _big_number_json(
+            [{"number": f"{i}0%", "caption": f"第{i}个数字的口径与来源说明"} for i in range(1, 6)])
+        str_chart = _chart_json(values=["12.5", "8.0", "20", "99"])   # 4 个值 vs 3 类别
+        script = [_layout_outline_json(),
+                  _page_json("格局"),        # bullets 页
+                  _two_column_json(),        # two_column 页
+                  five_stats,                # big_number 页
+                  str_chart,                 # chart 页
+                  _quote_json(),             # quote 页
+                  _page_json("奇怪"),        # 未知版式降级页
+                  _page_json("收尾")]        # closing 页
+        mock = _MockLLM(script)
+        r = ppt_maker.make_ppt("新能源汽车产业分析", pages=8, llm_caller=mock)
+        self.assertTrue(r["ok"], r.get("error"))
+        self.assertEqual(r["pages"], 9)                  # 8 大纲页（含 toc）+ 封面
+        # toc 不耗调用：1 大纲 + 7 精写
+        self.assertEqual(len(mock.calls), 8)
+
+        self.assertEqual(len(render.calls), 1)           # render_deck 恰好被调一次
+        prs, deck, style = render.calls[0]
+        self.assertAlmostEqual(prs.slide_width / prs.slide_height, 16 / 9, places=2)
+        self.assertEqual(style, "工作汇报")
+        # deck 顶层契约
+        self.assertEqual(deck["title"], "新能源汽车产业分析")
+        self.assertEqual(deck["subtitle"], "从政策到市场的全景扫描")
+        pages = deck["pages"]
+        self.assertEqual(len(pages), 8)
+        for pg in pages:
+            self.assertIn("layout", pg)
+            self.assertTrue(pg["speaker_note"].strip(), f"{pg['layout']} 页 speaker_note 为空")
+
+        # toc：entries 与大纲一致
+        self.assertEqual(pages[0]["layout"], "toc")
+        self.assertEqual(pages[0]["entries"],
+                         ["市场格局", "中外对比", "关键数字", "销量走势", "金句点题", "奇怪页", "总结行动"])
+        # two_column：左右栏 heading + 各 3 点
+        tc = pages[2]
+        self.assertEqual(tc["layout"], "two_column")
+        self.assertEqual(tc["left"]["heading"], "中国")
+        self.assertEqual(tc["right"]["heading"], "海外")
+        self.assertEqual(len(tc["left"]["points"]), 3)
+        self.assertEqual(len(tc["right"]["points"]), 3)
+        # big_number：5 个数字被钳到 3，number 全非空
+        bn = pages[3]
+        self.assertEqual(bn["layout"], "big_number")
+        self.assertEqual(len(bn["stats"]), 3)
+        for s in bn["stats"]:
+            self.assertTrue(s["number"])
+            self.assertTrue(s["caption"])
+        # chart：字符串数字转 float、多余值截齐到 categories 等长
+        ch = pages[4]
+        self.assertEqual(ch["layout"], "chart")
+        chart = ch["chart"]
+        self.assertEqual(chart["type"], "bar")
+        self.assertEqual(len(chart["series"]), 1)
+        self.assertEqual(chart["series"][0]["values"], [12.5, 8.0, 20.0])
+        for v in chart["series"][0]["values"]:
+            self.assertIsInstance(v, float)
+        self.assertEqual(len(chart["series"][0]["values"]), len(chart["categories"]))
+        self.assertEqual(len(ch["bullets"]), 2)          # 2 条解读
+        # quote：契约字段
+        q = pages[5]
+        self.assertEqual(q["layout"], "quote")
+        self.assertGreaterEqual(len(q["quote"]), 20)
+        self.assertTrue(q["attribution"])
+        # 未知版式降级 bullets
+        weird = pages[6]
+        self.assertEqual(weird["layout"], "bullets")
+        self.assertEqual(len(weird["bullets"]), 4)
+        # 收尾页 closing
+        self.assertEqual(pages[7]["layout"], "closing")
+
+    # 12. ppt_layouts 缺席（_render_deck=None）-> 回退内置排版，版式页摊平渲染仍出文件
+    def test_missing_ppt_layouts_falls_back_to_legacy(self):
+        self.assertIsNone(ppt_maker._render_deck)        # setUp 已强制 None
+        script = [_layout_outline_json(),
+                  _page_json("格局"),
+                  _two_column_json(),
+                  _big_number_json(),
+                  _chart_json(),
+                  _quote_json(),
+                  _page_json("奇怪"),
+                  _page_json("收尾")]
+        mock = _MockLLM(script)
+        r = ppt_maker.make_ppt("新能源汽车产业分析", pages=8, llm_caller=mock)
+        self.assertTrue(r["ok"], r.get("error"))
+        path = Path(r["path"])
+        self.assertTrue(path.exists())
+        prs = Presentation(str(path))
+        self.assertEqual(len(list(prs.slides)), 9)       # 封面 + 8 页
+        # two_column 页（物理 idx=3）摊平后含栏题与要点
+        body = _body_text(prs, 3)
+        self.assertIn("【中国】", body)
+        self.assertIn("【海外】", body)
+        self.assertIn("左1", body)
+        # big_number 页（物理 idx=4）含数字
+        self.assertIn("42.7%", _body_text(prs, 4))
+        # 每页 notes 非空
+        for i, slide in enumerate(prs.slides):
+            self.assertTrue(slide.notes_slide.notes_text_frame.text.strip(),
+                            f"slide {i} notes 为空")
+
+    # 13. two_column 质量闸：左右各 2 点不达标 -> 重写后各 3 点过闸
+    def test_two_column_gate_triggers_rewrite(self):
+        outline = json.dumps({
+            "title": "中外模式对比", "pages": [
+                {"layout": "two_column", "page_title": "中外对比",
+                 "core_point": "中国靠供应链密度取胜，海外靠品牌溢价守成，分野清晰。",
+                 "keywords": ["供应链"], "left": {"heading": "中国"}, "right": {"heading": "海外"}},
+                {"layout": "bullets", "page_title": "总结",
+                 "core_point": "两种路径各有死穴，胜负手在成本控制与品牌建设的组合拳。",
+                 "keywords": ["组合拳"]},
+            ]}, ensure_ascii=False)
+        thin = _two_column_json(ln=2, rn=2)              # 左右各 2 点 -> 不过闸
+        good = _two_column_json(ln=3, rn=3)
+        script = [outline, thin, good, _page_json("P2")]
+        mock = _MockLLM(script)
+        r = ppt_maker.make_ppt("中外模式对比", pages=2, llm_caller=mock)
+        self.assertTrue(r["ok"], r.get("error"))
+        self.assertEqual(ppt_maker.last_run["page_stats"][0]["rewrites"], 1)
+        self.assertEqual(ppt_maker.last_run["page_stats"][0]["layout"], "two_column")
+        self.assertEqual(len(mock.calls), 1 + 2 + 1)     # 大纲 + 第1页2次 + 第2页
+
+    # 14. big_number 质量闸：number 为空 -> 重写后补齐数字过闸
+    def test_big_number_gate_triggers_rewrite(self):
+        outline = json.dumps({
+            "title": "关键数字", "pages": [
+                {"layout": "big_number", "page_title": "关键数字",
+                 "core_point": "三个数字看清行业：渗透率、市场规模、增速。",
+                 "keywords": ["渗透率"], "stats": []},
+                {"layout": "bullets", "page_title": "总结",
+                 "core_point": "数字背后的结论是行业仍在高速扩张期，窗口未关。",
+                 "keywords": ["窗口"]},
+            ]}, ensure_ascii=False)
+        empty_num = _big_number_json([{"number": "", "caption": "口径说明但数字为空"}])
+        good = _big_number_json()
+        script = [outline, empty_num, good, _page_json("P2")]
+        mock = _MockLLM(script)
+        r = ppt_maker.make_ppt("关键数字", pages=2, llm_caller=mock)
+        self.assertTrue(r["ok"], r.get("error"))
+        st = ppt_maker.last_run["page_stats"][0]
+        self.assertEqual(st["rewrites"], 1)
+        self.assertEqual(st["layout"], "big_number")
+        self.assertEqual(len(mock.calls), 1 + 2 + 1)
+
+    # 15. quote 质量闸：金句 <20 字 -> 重写后过闸
+    def test_quote_gate_triggers_rewrite(self):
+        outline = json.dumps({
+            "title": "金句收束", "pages": [
+                {"layout": "quote", "page_title": "金句点题",
+                 "core_point": "用一句行业金句收住全篇论证，点明范式转移的本质。",
+                 "keywords": []},
+                {"layout": "bullets", "page_title": "总结",
+                 "core_point": "收束全篇给出行动建议，落点要具体可执行。",
+                 "keywords": ["行动"]},
+            ]}, ensure_ascii=False)
+        short = _quote_json("太短了。")                   # 4 字 -> 不过闸
+        good = _quote_json()
+        script = [outline, short, good, _page_json("P2")]
+        mock = _MockLLM(script)
+        r = ppt_maker.make_ppt("金句收束", pages=2, llm_caller=mock)
+        self.assertTrue(r["ok"], r.get("error"))
+        st = ppt_maker.last_run["page_stats"][0]
+        self.assertEqual(st["rewrites"], 1)
+        self.assertEqual(st["layout"], "quote")
+        self.assertEqual(len(mock.calls), 1 + 2 + 1)
+
+    # 16. 总页数 <12 时 section 被降级为 bullets（选版式规则的规范化兜底）
+    def test_section_downgraded_when_deck_short(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        outline = json.dumps({
+            "title": "短 deck", "pages": [
+                {"layout": "section", "page_title": "第一章",
+                 "core_point": "章节页在短 deck 里不允许，应降级为要点页。",
+                 "keywords": ["降级"]},
+                {"layout": "bullets", "page_title": "正文",
+                 "core_point": "正文页正常精写，给出具体数据与机制解释。",
+                 "keywords": ["正文"]},
+                {"layout": "bullets", "page_title": "收尾",
+                 "core_point": "收尾页升级为 closing，给出行动建议。",
+                 "keywords": ["行动"]},
+            ]}, ensure_ascii=False)
+        script = [outline, _page_json("S1"), _page_json("P2"), _page_json("P3")]
+        mock = _MockLLM(script)
+        r = ppt_maker.make_ppt("短 deck", pages=3, llm_caller=mock)
+        self.assertTrue(r["ok"], r.get("error"))
+        deck = render.calls[0][1]
+        self.assertEqual(deck["pages"][0]["layout"], "bullets")      # section 降级
+        self.assertEqual(deck["pages"][2]["layout"], "closing")      # 尾页升级 closing
+        # 降级后走 bullets 精写路径：3 页各 1 次调用
+        self.assertEqual(len(mock.calls), 1 + 3)
+
+    # 17. chart 归一化单元：字符串数字转 float、截齐补齐、非法 type 回 bar
+    def test_norm_chart_coercion(self):
+        chart = ppt_maker._norm_chart({
+            "type": "AREA",                                   # 非法 -> bar
+            "title": "t",
+            "categories": ["a", "b", "c"],
+            "series": [
+                {"name": "s1", "values": ["1,200", "3.5%", "x", "9"]},  # 转 float + 截到 3
+                {"name": "s2", "values": [1]},                          # 短了补 0.0
+            ]})
+        self.assertEqual(chart["type"], "bar")
+        self.assertEqual(chart["series"][0]["values"], [1200.0, 3.5, 0.0])
+        self.assertEqual(chart["series"][1]["values"], [1.0, 0.0, 0.0])
+        for s in chart["series"]:
+            for v in s["values"]:
+                self.assertIsInstance(v, float)
+
+    # 18. stats 归一化单元：钳 1-3 个、空壳丢弃
+    def test_norm_stats_clamped(self):
+        stats = ppt_maker._norm_stats(
+            [{"number": f"{i}%", "caption": f"c{i}"} for i in range(5)]
+            + [{"number": "", "caption": ""}, "不是字典"])
+        self.assertEqual(len(stats), 3)
+        self.assertEqual(stats[0], {"number": "0%", "caption": "c0"})
 
 
 if __name__ == "__main__":

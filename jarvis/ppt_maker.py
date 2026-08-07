@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Nolan · PPT 引擎（ppt_maker.py）——两阶段精写版
+Nolan · PPT 引擎（ppt_maker.py）——两阶段精写 + 自动选版式版
 一句话生成带演讲稿的真 .pptx 文件：
-  - 阶段 1 · 大纲：1 次 LLM 调用产出 总标题 + 每页 {page_title, core_point, keywords}；
-  - 阶段 2 · 逐页精写：每页 1 次 LLM 调用（串行），产出 4-6 条要点（每条 30-60 字）
-    与 150-250 字演讲稿；每页过质量闸，不达标重写（最多 2 次），仍不达标取历次最好；
-    某页调用异常时用大纲 core_point 扩成兜底要点，页数永不缺斤短两；
-  - 文件：python-pptx 造 16:9 幻灯片，正文字号按内容密度三档自适应（18/16/14pt），
-    每页演讲稿写进 notes_slide（PowerPoint/WPS 备注窗格可见）；
+  - 阶段 1 · 大纲：1 次 LLM 调用产出 总标题 + 副标题 + 每页
+    {layout, page_title, core_point, keywords, ...版式草稿字段}；
+    LLM 按内容为每页从八种版式（toc/section/bullets/two_column/big_number/quote/chart/closing）
+    中自动选型，并给出 two_column 栏题、big_number 数字草稿、chart 数据草稿等；
+  - 阶段 2 · 逐页精写：每页 1 次 LLM 调用（串行），按版式要内容——
+    bullets/closing 出 4-6 条要点；two_column 左右各 3-4 点；big_number 校准数字；
+    chart 出最终图表数据 + 2-3 条解读；quote 出金句与出处；
+    toc/section 不烧调用，大纲字段直接用、演讲稿模板合成；
+    每页过对应版式的质量闸，不达标重写（最多 2 次），仍不达标取历次最好；
+    某页彻底失败时非常规版式降级为 bullets 兜底页，页数永不缺斤短两；
+  - 排版：路 A 的 jarvis/ppt_layouts.py 就位时走 render_deck（防御式导入，缺席置 None），
+    不可用时回退内置排版（要点式渲染 + 正文字号三档自适应 18/16/14pt），模块任何时刻可用；
+  - 文件：python-pptx 造 16:9 幻灯片，每页演讲稿写进 notes_slide（PowerPoint/WPS 备注窗格可见）；
   - 落盘：jarvis/files/ 下，文件名 {主题安全名}_{YYYYMMDD-HHMM}.pptx；
   - 降级：大纲阶段失败 -> ok=False；逐页阶段任何单页失败 -> 兜底页顶上，绝不整单失败。
 
@@ -18,7 +25,7 @@ Nolan · PPT 引擎（ppt_maker.py）——两阶段精写版
 
 pages 参数语义：向 LLM 请求的内容页数量（钳制 3-20）；返回值里的 pages 是物理总页数（内容页 + 1 封面）。
 
-耗时预期：N 内容页 = 1 + N 次串行 LLM 调用，10 页约 60-120 秒。
+耗时预期：N 内容页 = 1 + N 次串行 LLM 调用（toc/section 页不耗调用），10 页约 60-120 秒。
 """
 from __future__ import annotations
 
@@ -26,6 +33,13 @@ import json
 import re
 import time
 from pathlib import Path
+
+# ---- 版式渲染引擎（路 A）：防御式导入。ppt_layouts 完工前此模块不存在，
+#      _render_deck 置 None，_build_pptx 回退内置排版路径，保证本模块任何时刻可用。
+try:
+    from ppt_layouts import render_deck as _render_deck
+except Exception:
+    _render_deck = None
 
 MODULE_DIR = Path(__file__).resolve().parent
 FILES_DIR = MODULE_DIR / "files"
@@ -43,12 +57,23 @@ FONT_NAME = "微软雅黑"
 MAX_BULLETS = 6
 MAX_BULLET_LEN = 80       # 防御性截断（要求 LLM 30-60 字，留余量）
 
+# ---- 版式词汇表（路 A 交接契约，八种）----
+LAYOUTS = {"toc", "section", "bullets", "two_column",
+           "big_number", "quote", "chart", "closing"}
+NO_DETAIL_LAYOUTS = {"toc", "section"}      # 不需要精写：大纲字段直接用
+CHART_TYPES = {"bar", "pie", "line"}        # chart.type 合法值
+
 # ---- 质量闸（逐页验收）----
-GATE_MIN_BULLETS = 4                 # 每页至少 4 条要点
+GATE_MIN_BULLETS = 4                 # bullets 系每页至少 4 条要点
 GATE_MIN_CHARS_DEFAULT = 180         # 正文总字数基线（科普分享等）
 GATE_MIN_CHARS_STRICT = 220          # 工作汇报 / 课堂讲解 更严
 GATE_STRICT_STYLES = {"工作汇报", "课堂讲解"}
 MAX_REWRITES = 2                     # 每页最多重写 2 次（即最多 3 次尝试）
+# 版式专属闸线
+GATE_TC_MIN_POINTS = 3               # two_column 左右各至少 3 点
+GATE_CHART_MIN_BULLETS = 2           # chart 解读至少 2 条
+GATE_CHART_MIN_CHARS = 60            # chart 解读总字数下限
+GATE_QUOTE_MIN_CHARS = 20            # quote 金句至少 20 字
 
 # 最近一次 make_ppt 的运行统计（供验收/调试读取，不属于公开契约）
 last_run: dict = {}
@@ -143,8 +168,10 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
 只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
 {{
   "title": "整套 PPT 的主标题（≤20字）",
+  "subtitle": "副标题：一句话点明本套 PPT 的价值（≤30字）",
   "pages": [
     {{
+      "layout": "本页版式（八种之一，见下方选版式规则）",
       "page_title": "本页小标题（≤15字）",
       "core_point": "本页核心论点，一句话（30-50字）：必须具体、有信息量，是本页正文要论证的靶心",
       "keywords": ["本页 3-5 个关键词：具体的技术名词、数据点、案例名或机制名"]
@@ -152,16 +179,41 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
   ]
 }}
 
+【选版式规则】为每页从以下八种版式中选最合适的一种，写进 "layout"，并按需附加字段：
+- "bullets"：默认形态，绝大多数内容页用它，无需附加字段；
+- "two_column"：内容天然有对比/对立结构（利弊、前后、中外）时选用，
+  附加 "left": {{"heading": "左栏标题"}} 和 "right": {{"heading": "右栏标题"}}；
+- "big_number"：本页有 1-3 个震撼数字（市场规模、增长率、占比）时选用，
+  附加 "stats": [{{"number": "数字（带单位，如 42.7%）", "caption": "口径与来源说明"}}]（1-3 个）；
+- "chart"：本页有随类别/时间变化的数据系列时选用，
+  附加 "chart": {{"type": "bar 或 pie 或 line", "title": "图表标题",
+    "categories": ["类别1", "类别2", "类别3"],
+    "series": [{{"name": "系列名", "values": [数值1, 数值2, 数值3]}}]}}，
+  values 先给合理估计值（后续精写阶段会校准），数量与 categories 一致；
+- "quote"：金句/名言点题页，附加 "quote": "金句原文" 和 "attribution": "出处"，
+  全篇至多 1 页，可以没有；
+- "section"：章节分隔页，仅当总页数 ≥12 时才允许插入，可以没有；
+- "toc"：目录页，当总页数 ≥8 时在 pages 数组首部插入一页，
+  附加 "entries": ["各页标题", ...]，不计入 {pages} 页正文页数；
+- "closing"：收尾页（行动建议/总结要点），最后一页用它，无需附加字段。
+
 要求：
-- pages 数组恰好 {pages} 项，对应 {pages} 页内容；
+- pages 数组恰好 {pages} 项正文页（toc 另算），对应 {pages} 页内容；
 - 全篇逻辑递进（背景/现状 -> 核心内容 -> 总结/行动），页与页之间分工明确、互不重复；
 - 每页 core_point 必须是可论证的具体论点，禁止「介绍XX」「XX很重要」式空话；
 - keywords 要能给后续写作提供弹药（名词、数字、案例），不要空泛形容词；
 - 内容贴合「{style}」场景。"""
 
 
+def _norm_layout(raw) -> str:
+    """版式名归一：未知/缺失一律降级 bullets（大纲阶段的防御闸门）。"""
+    layout = str(raw or "bullets").strip().lower()
+    return layout if layout in LAYOUTS else "bullets"
+
+
 def _gen_outline(topic: str, pages: int, style: str, caller):
-    """阶段 1：拿大纲。返回 (规范化大纲 dict, None) 或 (None, 人话错误)。"""
+    """阶段 1：拿大纲。返回 (规范化大纲 dict, None) 或 (None, 人话错误)。
+    大纲页除 page_title/core_point/keywords 外，还带 layout 与版式草稿字段。"""
     prompt = _OUTLINE_PROMPT.format(topic=topic, pages=pages, style=style)
     try:
         data = _call_json(prompt, caller, repair_once=True)
@@ -171,15 +223,24 @@ def _gen_outline(topic: str, pages: int, style: str, caller):
         return None, "大脑返回的内容格式乱了（不是合法 JSON），重试后仍失败，稍后再试"
 
     title = str(data.get("title") or "").strip()[:30]
+    subtitle = str(data.get("subtitle") or "").strip()[:40]
     pages_raw = data.get("pages")
     if not title or not isinstance(pages_raw, list) or not pages_raw:
         return None, "大脑返回的大纲结构不完整（缺标题或缺页面），稍后再试"
 
     outline_pages = []
-    for i, item in enumerate(pages_raw[:pages]):
+    content_count = 0          # toc/section 不占正文页配额
+    for i, item in enumerate(pages_raw):
         if not isinstance(item, dict):
             continue
-        page_title = str(item.get("page_title") or "").strip()[:20] or f"第 {i + 1} 节"
+        layout = _norm_layout(item.get("layout"))
+        if layout not in NO_DETAIL_LAYOUTS:
+            if content_count >= pages:
+                continue                       # 超出请求页数的正文页丢弃
+            content_count += 1
+        page_title = str(item.get("page_title") or "").strip()[:20]
+        if not page_title:
+            page_title = "目录" if layout == "toc" else f"第 {content_count or i + 1} 节"
         core_point = str(item.get("core_point") or "").strip()
         if not core_point:
             core_point = f"围绕「{page_title}」展开本页的核心内容与关键结论。"
@@ -190,14 +251,55 @@ def _gen_outline(topic: str, pages: int, style: str, caller):
                 k = str(k).strip()
                 if k:
                     keywords.append(k[:20])
-        outline_pages.append({
+        entry = {
+            "layout": layout,
             "page_title": page_title,
             "core_point": core_point,
             "keywords": keywords,
-        })
+        }
+        # ---- 版式草稿字段：精写阶段的弹药/上下文
+        if layout == "toc":
+            entries = []
+            if isinstance(item.get("entries"), list):
+                for e in item["entries"][:24]:
+                    e = str(e).strip()
+                    if e:
+                        entries.append(e[:20])
+            entry["entries"] = entries
+        elif layout == "two_column":
+            left = item.get("left") if isinstance(item.get("left"), dict) else {}
+            right = item.get("right") if isinstance(item.get("right"), dict) else {}
+            entry["left_heading"] = str(left.get("heading") or "左栏").strip()[:12] or "左栏"
+            entry["right_heading"] = str(right.get("heading") or "右栏").strip()[:12] or "右栏"
+        elif layout == "big_number":
+            entry["stats"] = _norm_stats(item.get("stats"))
+        elif layout == "chart":
+            entry["chart"] = _norm_chart(item.get("chart"))
+        elif layout == "quote":
+            entry["quote"] = str(item.get("quote") or "").strip()[:150]
+            entry["attribution"] = str(item.get("attribution") or "").strip()[:40]
+        outline_pages.append(entry)
+
     if not outline_pages:
         return None, "大脑返回的大纲结构不完整（缺标题或缺页面），稍后再试"
-    return {"title": title, "pages": outline_pages}, None
+
+    # ---- 选版式规则的规范化兜底（LLM 不守规矩时的防御）----
+    seen_quote = False
+    for e in outline_pages:
+        if e["layout"] == "quote":
+            if seen_quote:                       # 全篇至多 1 页 quote，多余的降级
+                e["layout"] = "bullets"
+            else:
+                seen_quote = True
+    if len(outline_pages) < 12:                  # section 仅当总页数 ≥12 才允许
+        for e in outline_pages:
+            if e["layout"] == "section":
+                e["layout"] = "bullets"
+    # 收尾页用 closing：最后一页是普通要点页时升级为 closing（精写同路径，零成本）
+    if outline_pages and outline_pages[-1]["layout"] == "bullets":
+        outline_pages[-1]["layout"] = "closing"
+
+    return {"title": title, "subtitle": subtitle, "pages": outline_pages}, None
 
 
 # ---------------------------------------------------------------- 阶段 2：逐页精写
@@ -236,6 +338,90 @@ _PAGE_PROMPT = """你正在为一份{style} PPT 逐页精写正文，现在写�
 - speaker_note 为 150-250 字的口语化演讲稿：这页怎么开场、要点之间怎么串、
   如何自然过渡到下一页，是真人上台能照着讲的稿子，不是要点的复读。"""
 
+# 非常规版式的共享上下文块（与 _PAGE_PROMPT 背景部分一致）
+_PAGE_CONTEXT = """你正在为一份{style} PPT 逐页精写正文，现在写第 {idx}/{total} 页。
+
+【全篇背景】
+- 总主题：「{topic}」
+- 整套 PPT 标题：「{deck_title}」
+- 前一页标题：「{prev_title}」；后一页标题：「{next_title}」（内容不得与它们重复撞车）
+
+【本页任务】
+- 本页小标题：「{page_title}」
+- 本页核心论点（必须围绕它展开论证）：{core_point}
+- 可用素材关键词：{keywords}
+
+"""
+
+_TWO_COLUMN_TASK = """本页版式：双栏对比页（two_column）。左栏主题「{left_heading}」，右栏主题「{right_heading}」。
+
+只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
+{{
+  "left": {{"heading": "{left_heading}", "points": ["要点1", "要点2", "要点3"]}},
+  "right": {{"heading": "{right_heading}", "points": ["要点1", "要点2", "要点3"]}},
+  "speaker_note": "本页演讲稿"
+}}
+
+硬性要求（验收线，达不到会被退回重写）：
+- 左右两栏各 3 到 4 条要点；每条 20 到 50 字；
+- 两栏要形成鲜明对照：同一维度上左说左的、右说右的，不要各说各话；
+- 每条要点必须承载具体信息：真实数据、具体案例、机制解释或可操作结论，禁止空话套话；
+- 两栏合计总字数不少于 {min_chars} 字；
+- 风格要求：{style_hint}；
+- speaker_note 为 150-250 字的口语化演讲稿：怎么开场、两栏怎么对照着讲、如何过渡到下一页。"""
+
+_BIG_NUMBER_TASK = """本页版式：大数字页（big_number）。大纲草稿数字（可校准改写）：{draft}
+
+只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
+{{
+  "stats": [{{"number": "42.7%", "caption": "2024 年国内市场渗透率，数据来源：行业白皮书"}}],
+  "speaker_note": "本页演讲稿"
+}}
+
+硬性要求（验收线，达不到会被退回重写）：
+- stats 1 到 3 个，每个 number 非空：必须是带单位或百分号的震撼数字，要真实、有出处感；
+- caption 20-50 字：说清数字的口径、年份与来源类型；
+- 几个数字之间要有分工（规模/增速/占比），不要同义反复；
+- 风格要求：{style_hint}；
+- speaker_note 为 150-250 字的口语化演讲稿：数字怎么抛、怎么解释意义、如何过渡。"""
+
+_CHART_TASK = """本页版式：图表页（chart）。大纲草稿（数据需校准）：{draft}
+
+只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
+{{
+  "chart": {{
+    "type": "bar",
+    "title": "图表标题",
+    "categories": ["类别1", "类别2", "类别3"],
+    "series": [{{"name": "系列名", "values": [100, 200, 300]}}]
+  }},
+  "bullets": ["解读1", "解读2"],
+  "speaker_note": "本页演讲稿"
+}}
+
+硬性要求（验收线，达不到会被退回重写）：
+- type 只能是 "bar"、"pie" 或 "line"，沿用大纲草稿的类型，除非它明显不合适；
+- values 必须是纯数字（不要带单位/百分号），每个系列的 values 长度与 categories 完全一致；
+- 数据要合理可信：量级、趋势符合真实世界常识，在大纲草稿基础上校准；
+- bullets 是图解读，2 到 3 条，每条 30 到 60 字：说趋势、说拐点、说含义，禁止复述数字；
+- 风格要求：{style_hint}；
+- speaker_note 为 150-250 字的口语化演讲稿：图怎么看、结论是什么、如何过渡。"""
+
+_QUOTE_TASK = """本页版式：金句页（quote）。
+
+只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
+{{
+  "quote": "金句原文",
+  "attribution": "—— 作者/出处",
+  "speaker_note": "本页演讲稿"
+}}
+
+硬性要求（验收线，达不到会被退回重写）：
+- quote 至少 20 字：必须与本页核心论点严丝合缝，是真金句而非口号；
+- attribution 给出处（人名/作品/场合），存疑就写「佚名」；
+- 风格要求：{style_hint}；
+- speaker_note 为 150-250 字的口语化演讲稿：为什么在这里引用它、它与全篇论证的关系、如何过渡。"""
+
 # 重写 prompt：带上一次不达标的具体原因，换措辞再要一次
 _PAGE_REWRITE_PROMPT = """你上一次为这一页写的内容没有通过验收，需要重写。
 
@@ -262,8 +448,91 @@ def _norm_bullets(raw) -> list:
     return bullets
 
 
+def _norm_column(raw, fallback_heading: str) -> dict:
+    """归一 two_column 的单栏：heading ≤12 字，points 最多 4 条。"""
+    d = raw if isinstance(raw, dict) else {}
+    heading = str(d.get("heading") or "").strip()[:12] or fallback_heading
+    points = []
+    if isinstance(d.get("points"), list):
+        for p in d["points"][:4]:
+            p = str(p).strip()
+            if p:
+                points.append(p[:MAX_BULLET_LEN])
+    return {"heading": heading, "points": points}
+
+
+def _norm_stats(raw) -> list:
+    """归一 big_number 数字列表：钳 1-3 个（此处先截到 3，空壳丢弃）。"""
+    stats = []
+    if isinstance(raw, list):
+        for s in raw[:3]:
+            if not isinstance(s, dict):
+                continue
+            number = str(s.get("number") or "").strip()[:20]
+            caption = str(s.get("caption") or "").strip()[:MAX_BULLET_LEN]
+            if number or caption:
+                stats.append({"number": number, "caption": caption})
+    return stats
+
+
+def _coerce_float(v) -> float:
+    """chart values 强制转 float：字符串数字、千分位逗号、百分号都能吃，转不动补 0.0。"""
+    try:
+        return float(str(v).replace(",", "").replace("%", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _norm_chart(raw) -> dict:
+    """归一 chart 结构：type 合法化；categories 清洗；series.values 转 float 并截齐补齐到
+    categories 等长（长了截断、短了补 0.0）。"""
+    d = raw if isinstance(raw, dict) else {}
+    ctype = str(d.get("type") or "bar").strip().lower()
+    if ctype not in CHART_TYPES:
+        ctype = "bar"
+    title = str(d.get("title") or "").strip()[:30]
+    categories = []
+    if isinstance(d.get("categories"), list):
+        for c in d["categories"][:12]:
+            c = str(c).strip()
+            if c:
+                categories.append(c[:15])
+    series = []
+    if isinstance(d.get("series"), list):
+        for s in d["series"][:4]:
+            if not isinstance(s, dict):
+                continue
+            name = str(s.get("name") or "").strip()[:20] or f"系列{len(series) + 1}"
+            values = []
+            if isinstance(s.get("values"), list):
+                values = [_coerce_float(v) for v in s["values"][:len(categories)]]
+            while len(values) < len(categories):
+                values.append(0.0)
+            series.append({"name": name, "values": values})
+    return {"type": ctype, "title": title, "categories": categories, "series": series}
+
+
+def _extract_content(layout: str, data: dict, item: dict) -> dict:
+    """按版式从 LLM 的精写 JSON 中抽取并归一内容字段。"""
+    if layout == "two_column":
+        return {
+            "left": _norm_column(data.get("left"), item.get("left_heading") or "左栏"),
+            "right": _norm_column(data.get("right"), item.get("right_heading") or "右栏"),
+        }
+    if layout == "big_number":
+        return {"stats": _norm_stats(data.get("stats"))}
+    if layout == "chart":
+        return {"chart": _norm_chart(data.get("chart")),
+                "bullets": _norm_bullets(data.get("bullets"))[:3]}
+    if layout == "quote":
+        return {"quote": str(data.get("quote") or "").strip()[:150],
+                "attribution": str(data.get("attribution") or "").strip()[:40]}
+    # bullets / closing 及任何漏网版式
+    return {"bullets": _norm_bullets(data.get("bullets"))}
+
+
 def _quality_check(bullets: list, style: str):
-    """质量闸：要点数 >= 4 且正文总字数达标。返回 (是否通过, 不达标原因)。"""
+    """bullets 系质量闸：要点数 >= 4 且正文总字数达标。返回 (是否通过, 不达标原因)。"""
     total_chars = sum(len(b) for b in bullets)
     min_chars = _gate_min_chars(style)
     if len(bullets) < GATE_MIN_BULLETS:
@@ -271,6 +540,74 @@ def _quality_check(bullets: list, style: str):
     if total_chars < min_chars:
         return False, f"正文总字数只有 {total_chars} 字（要求 ≥{min_chars} 字），要点普遍太短、缺少具体信息"
     return True, ""
+
+
+def _quality_check_page(layout: str, content: dict, style: str):
+    """按版式分发质量闸。返回 (是否通过, 不达标原因)。"""
+    if layout == "two_column":
+        lp = content["left"]["points"]
+        rp = content["right"]["points"]
+        total = sum(len(p) for p in lp) + sum(len(p) for p in rp)
+        min_chars = _gate_min_chars(style)
+        if len(lp) < GATE_TC_MIN_POINTS or len(rp) < GATE_TC_MIN_POINTS:
+            return False, (f"左栏 {len(lp)} 条、右栏 {len(rp)} 条要点"
+                           f"（要求左右各至少 {GATE_TC_MIN_POINTS} 条），两栏合计 {total} 字")
+        if total < min_chars:
+            return False, f"两栏合计总字数只有 {total} 字（要求 ≥{min_chars} 字），要点普遍太短、缺少具体信息"
+        return True, ""
+    if layout == "big_number":
+        stats = content["stats"]
+        if not stats:
+            return False, "缺少 stats 数字列表，大数字页必须给出 1-3 个震撼数字"
+        empty = [i + 1 for i, s in enumerate(stats) if not s["number"]]
+        if empty:
+            return False, f"第 {empty} 个数字的 number 为空，大数字页的数字必须非空、有出处感"
+        return True, ""
+    if layout == "chart":
+        chart = content["chart"]
+        if not chart["categories"] or not chart["series"]:
+            return False, "图表数据不完整（缺 categories 或 series），无法成图"
+        b = content["bullets"]
+        chars = sum(len(x) for x in b)
+        if len(b) < GATE_CHART_MIN_BULLETS:
+            return False, f"图解读只有 {len(b)} 条（要求 {GATE_CHART_MIN_BULLETS}-3 条）"
+        if chars < GATE_CHART_MIN_CHARS:
+            return False, f"图解读总字数只有 {chars} 字（要求 ≥{GATE_CHART_MIN_CHARS} 字），解读太浅"
+        return True, ""
+    if layout == "quote":
+        q = content["quote"]
+        if len(q) < GATE_QUOTE_MIN_CHARS:
+            return False, f"金句只有 {len(q)} 字（要求 ≥{GATE_QUOTE_MIN_CHARS} 字），太短、撑不起一页"
+        return True, ""
+    # bullets / closing
+    return _quality_check(content["bullets"], style)
+
+
+def _content_nonempty(layout: str, content: dict) -> bool:
+    """该版式内容是否物理非空（决定能否成为候选）。"""
+    if layout == "two_column":
+        return bool(content["left"]["points"] or content["right"]["points"])
+    if layout == "big_number":
+        return bool(content["stats"])
+    if layout == "chart":
+        return bool(content["chart"]["categories"] or content["bullets"])
+    if layout == "quote":
+        return bool(content["quote"])
+    return bool(content["bullets"])
+
+
+def _content_chars(layout: str, content: dict) -> int:
+    """内容总字数：重写仍不达标时取历次最好的比较基准。"""
+    if layout == "two_column":
+        return (sum(len(p) for p in content["left"]["points"])
+                + sum(len(p) for p in content["right"]["points"]))
+    if layout == "big_number":
+        return sum(len(s["number"]) + len(s["caption"]) for s in content["stats"])
+    if layout == "chart":
+        return sum(len(b) for b in content["bullets"])
+    if layout == "quote":
+        return len(content["quote"])
+    return sum(len(b) for b in content["bullets"])
 
 
 def _synthesize_note(page_title: str, bullets: list) -> str:
@@ -281,8 +618,39 @@ def _synthesize_note(page_title: str, bullets: list) -> str:
             "自然过渡到下一页。建议用时约 2 分钟。")
 
 
+def _synthesize_note_for(layout: str, item: dict, content: dict) -> str:
+    """按版式合成兜底演讲稿：把内容摊平成要点式语句复用模板。"""
+    title = item["page_title"]
+    if layout == "two_column":
+        flat = ([f"{content['left']['heading']}：{p}" for p in content["left"]["points"]]
+                + [f"{content['right']['heading']}：{p}" for p in content["right"]["points"]])
+        return _synthesize_note(title, flat) if flat else _synthesize_note(title, [item["core_point"]])
+    if layout == "big_number":
+        flat = [f"{s['number']}（{s['caption']}）" for s in content["stats"]]
+        return _synthesize_note(title, flat) if flat else _synthesize_note(title, [item["core_point"]])
+    if layout == "chart":
+        flat = content["bullets"] or [f"图表「{content['chart']['title']}」的数据走势"]
+        return _synthesize_note(title, flat)
+    if layout == "quote":
+        return (f"这一页是金句页。先平稳念出这句话：「{content['quote']}」（{content['attribution']}），"
+                f"停顿两秒让它沉下去，再用一两句话点明它与「{item['core_point'][:30]}」的关系，"
+                "然后自然过渡到下一页。建议用时约 1 分钟。")
+    return _synthesize_note(title, content.get("bullets") or [item["core_point"]])
+
+
+def _synthesize_struct_note(layout: str, item: dict) -> str:
+    """toc/section 的演讲稿：不烧 LLM 调用，模板合成。"""
+    if layout == "toc":
+        entries = "、".join(item.get("entries") or []) or "后续各章节"
+        return (f"这一页是目录。开场后用 30 秒报一遍整体结构：{entries}。"
+                "告诉听众每个部分回答什么问题，让大家的预期对齐，然后直接进入第一页。")
+    return (f"这一页是章节页「{item['page_title']}」。先用一句话收住上一部分，"
+            f"再抛出本章节的核心：{item['core_point']}。"
+            "停顿一拍，给听众一个翻篇的信号。建议用时约 30 秒。")
+
+
 def _fallback_page(item: dict) -> dict:
-    """某页 LLM 彻底失败时的兜底页：用大纲 core_point + keywords 扩成要点，
+    """某页 LLM 彻底失败时的兜底内容：用大纲 core_point + keywords 扩成要点，
     保证页数完整、内容贴题，绝不整单失败。"""
     cp = item["core_point"]
     kws = item.get("keywords") or []
@@ -301,24 +669,63 @@ def _fallback_page(item: dict) -> dict:
     note = (f"这一页讲「{item['page_title']}」。核心论点是：{cp}"
             f"围绕{'、'.join(kws) if kws else '上述要点'}逐条展开说明，"
             "讲清事实与机制后自然过渡到下一页。建议用时约 2 分钟。")
-    return {"bullets": bullets, "speaker_note": note,
-            "rewrites": 0, "fallback": True}
+    return {"bullets": bullets, "speaker_note": note}
+
+
+def _page_prompt(layout: str, style: str, idx: int, total: int, topic: str,
+                 deck_title: str, prev_title: str, next_title: str,
+                 item: dict, style_hint: str) -> str:
+    """按版式组装逐页精写 prompt。"""
+    if layout in ("bullets", "closing"):
+        prompt = _PAGE_PROMPT.format(
+            style=style, idx=idx, total=total, topic=topic, deck_title=deck_title,
+            prev_title=prev_title, next_title=next_title,
+            page_title=item["page_title"], core_point=item["core_point"],
+            keywords="、".join(item["keywords"]) if item["keywords"] else "（无）",
+            style_hint=style_hint)
+        if layout == "closing":
+            prompt += ("\n- 本页是全篇收尾页：要点以总结结论与可执行的行动建议为主，"
+                       "每条行动建议要有主语、有抓手，不要空喊口号。")
+        return prompt
+    ctx = _PAGE_CONTEXT.format(
+        style=style, idx=idx, total=total, topic=topic, deck_title=deck_title,
+        prev_title=prev_title, next_title=next_title,
+        page_title=item["page_title"], core_point=item["core_point"],
+        keywords="、".join(item["keywords"]) if item["keywords"] else "（无）")
+    if layout == "two_column":
+        return ctx + _TWO_COLUMN_TASK.format(
+            left_heading=item.get("left_heading") or "左栏",
+            right_heading=item.get("right_heading") or "右栏",
+            min_chars=_gate_min_chars(style), style_hint=style_hint)
+    if layout == "big_number":
+        draft = json.dumps(item.get("stats") or [], ensure_ascii=False) or "（无草稿）"
+        return ctx + _BIG_NUMBER_TASK.format(draft=draft, style_hint=style_hint)
+    if layout == "chart":
+        draft = json.dumps(item.get("chart") or {}, ensure_ascii=False) or "（无草稿）"
+        return ctx + _CHART_TASK.format(draft=draft, style_hint=style_hint)
+    # quote
+    return ctx + _QUOTE_TASK.format(style_hint=style_hint)
 
 
 def _gen_page(topic: str, deck_title: str, style: str, item: dict,
               idx: int, total: int, prev_title: str, next_title: str,
               caller) -> dict:
-    """阶段 2 单页：精写 -> 质量闸 -> 不达标重写（最多 2 次）-> 取历次最好 -> 兜底。
-    返回 {bullets, speaker_note, rewrites, fallback}。"""
-    style_hint = _STYLE_HINTS.get(style, _STYLE_HINTS["科普分享"])
-    prompt = _PAGE_PROMPT.format(
-        style=style, idx=idx, total=total, topic=topic, deck_title=deck_title,
-        prev_title=prev_title, next_title=next_title,
-        page_title=item["page_title"], core_point=item["core_point"],
-        keywords="、".join(item["keywords"]) if item["keywords"] else "（无）",
-        style_hint=style_hint)
+    """阶段 2 单页：按版式精写 -> 版式质量闸 -> 不达标重写（最多 2 次）-> 取历次最好 -> 兜底。
+    返回 {layout, content, speaker_note, rewrites, fallback}。
+    toc/section 不烧调用；彻底失败时非常规版式降级为 bullets 兜底页。"""
+    layout = item.get("layout", "bullets")
 
-    candidates = []   # 历次有效候选：(bullets, note, 是否达标)
+    # toc/section：大纲字段直接用，演讲稿模板合成，零 LLM 调用
+    if layout in NO_DETAIL_LAYOUTS:
+        return {"layout": layout, "content": {},
+                "speaker_note": _synthesize_struct_note(layout, item),
+                "rewrites": 0, "fallback": False}
+
+    style_hint = _STYLE_HINTS.get(style, _STYLE_HINTS["科普分享"])
+    prompt = _page_prompt(layout, style, idx, total, topic, deck_title,
+                          prev_title, next_title, item, style_hint)
+
+    candidates = []   # 历次有效候选：(content, note, 是否达标)
     feedback = ""
     for attempt in range(1 + MAX_REWRITES):
         this_prompt = prompt if attempt == 0 else _PAGE_REWRITE_PROMPT.format(
@@ -331,24 +738,114 @@ def _gen_page(topic: str, deck_title: str, style: str, item: dict,
         if data is None:
             feedback = "输出不是合法 JSON，无法解析"
             continue
-        bullets = _norm_bullets(data.get("bullets"))
+        content = _extract_content(layout, data, item)
         note = str(data.get("speaker_note") or "").strip()
-        ok, reason = _quality_check(bullets, style)
-        if bullets:
+        ok, reason = _quality_check_page(layout, content, style)
+        if _content_nonempty(layout, content):
             if not note:
-                note = _synthesize_note(item["page_title"], bullets)
-            candidates.append((bullets, note, ok))
+                note = _synthesize_note_for(layout, item, content)
+            candidates.append((content, note, ok))
         if ok:
-            return {"bullets": bullets, "speaker_note": note,
+            return {"layout": layout, "content": content, "speaker_note": note,
                     "rewrites": attempt, "fallback": False}
-        feedback = reason if bullets else ("输出缺少 bullets 列表。" + reason)
+        feedback = reason if _content_nonempty(layout, content) else ("输出内容结构缺失。" + reason)
 
     if candidates:
-        # 重写仍不达标：取历次最好（正文字数最多者），绝不整单失败
-        bullets, note, _ = max(candidates, key=lambda c: sum(len(b) for b in c[0]))
-        return {"bullets": bullets, "speaker_note": note,
+        # 重写仍不达标：取历次最好（内容字数最多者），绝不整单失败
+        content, note, _ = max(candidates, key=lambda c: _content_chars(layout, c[0]))
+        return {"layout": layout, "content": content, "speaker_note": note,
                 "rewrites": MAX_REWRITES, "fallback": False}
-    return _fallback_page(item)
+    # 彻底失败：非常规版式降级为 bullets 兜底页，页数与内容完整
+    fb = _fallback_page(item)
+    return {"layout": "bullets", "content": {"bullets": fb["bullets"]},
+            "speaker_note": fb["speaker_note"], "rewrites": 0, "fallback": True}
+
+
+# ---------------------------------------------------------------- 归一化：路 A 契约结构
+
+def _normalize_page(item: dict, page: dict) -> dict:
+    """把 (大纲项, 精写内容) 归一成路 A 契约的 page 结构；每页保证 speaker_note 非空。"""
+    layout = page["layout"]
+    content = page["content"]
+    title = item["page_title"]
+
+    if layout == "toc":
+        entries = [str(e).strip()[:20] for e in (item.get("entries") or []) if str(e).strip()]
+        pg = {"layout": "toc", "entries": entries}
+    elif layout == "section":
+        pg = {"layout": "section", "page_title": title, "core_point": item["core_point"]}
+    elif layout == "two_column":
+        pg = {"layout": "two_column", "page_title": title,
+              "left": content["left"], "right": content["right"]}
+    elif layout == "big_number":
+        stats = content["stats"][:3]
+        if not stats:                        # 防御：空数字页降级 bullets
+            fb = _fallback_page(item)
+            pg = {"layout": "bullets", "page_title": title, "bullets": fb["bullets"]}
+            content = {"bullets": fb["bullets"]}
+        else:
+            pg = {"layout": "big_number", "page_title": title, "stats": stats}
+    elif layout == "quote":
+        if not content["quote"]:             # 防御：空金句页降级 bullets
+            fb = _fallback_page(item)
+            pg = {"layout": "bullets", "page_title": title, "bullets": fb["bullets"]}
+            content = {"bullets": fb["bullets"]}
+        else:
+            pg = {"layout": "quote", "quote": content["quote"],
+                  "attribution": content["attribution"] or "佚名"}
+    elif layout == "chart":
+        chart = content["chart"]
+        if not chart["categories"] or not chart["series"]:   # 防御：空图表降级 bullets
+            fb = _fallback_page(item)
+            pg = {"layout": "bullets", "page_title": title, "bullets": fb["bullets"]}
+            content = {"bullets": fb["bullets"]}
+        else:
+            pg = {"layout": "chart", "page_title": title,
+                  "chart": chart, "bullets": content["bullets"][:3]}
+    elif layout == "closing":
+        pg = {"layout": "closing", "page_title": title, "bullets": content["bullets"]}
+    else:                                    # bullets 及未知降级
+        pg = {"layout": "bullets", "page_title": title,
+              "bullets": content.get("bullets") or []}
+
+    note = (page.get("speaker_note") or "").strip()
+    if not note:
+        note = _synthesize_note_for(pg["layout"], item, content)
+    pg["speaker_note"] = note
+    return pg
+
+
+def _normalize_deck(outline: dict, contents: list, style: str) -> dict:
+    """归一化整副 deck：路 A render_deck 的入参结构。
+    {title, subtitle, pages:[...契约 page...]}"""
+    pages = [_normalize_page(item, page)
+             for item, page in zip(outline["pages"], contents)]
+    # toc 缺 entries 时用全篇标题兜底
+    titles = [p["page_title"] for p in pages if p.get("page_title")]
+    for p in pages:
+        if p["layout"] == "toc" and not p["entries"]:
+            p["entries"] = titles
+    subtitle = outline.get("subtitle") or f"{style} · {time.strftime('%Y年%m月%d日')}"
+    return {"title": outline["title"], "subtitle": subtitle, "pages": pages}
+
+
+def _stat_counts(pg: dict):
+    """运行统计用：从契约 page 折算 (要点条数, 内容字数)。"""
+    layout = pg["layout"]
+    if layout in ("bullets", "closing"):
+        return len(pg["bullets"]), sum(len(b) for b in pg["bullets"])
+    if layout == "two_column":
+        pts = pg["left"]["points"] + pg["right"]["points"]
+        return len(pts), sum(len(p) for p in pts)
+    if layout == "big_number":
+        return len(pg["stats"]), sum(len(s["number"]) + len(s["caption"]) for s in pg["stats"])
+    if layout == "chart":
+        return len(pg["bullets"]), sum(len(b) for b in pg["bullets"])
+    if layout == "quote":
+        return 1, len(pg["quote"])
+    if layout == "section":
+        return 0, len(pg["core_point"])
+    return 0, sum(len(e) for e in pg.get("entries") or [])   # toc
 
 
 # ---------------------------------------------------------------- PPTX 造文件
@@ -417,11 +914,42 @@ def _fit_body_font(bullets: list):
     return 14, 0.10
 
 
-def _build_pptx(title: str, slides: list, style: str, out_path: Path) -> None:
+def _flatten_page(pg: dict) -> list:
+    """内置兜底排版用：把任意版式的契约 page 摊平成要点行（标题行用【】标出）。"""
+    layout = pg["layout"]
+    if layout in ("bullets", "closing"):
+        return list(pg["bullets"])
+    if layout == "two_column":
+        return ([f"【{pg['left']['heading']}】"] + list(pg["left"]["points"])
+                + [f"【{pg['right']['heading']}】"] + list(pg["right"]["points"]))
+    if layout == "big_number":
+        return [f"{s['number']}  ——  {s['caption']}" for s in pg["stats"]]
+    if layout == "chart":
+        c = pg["chart"]
+        lines = [f"【图表 · {c['title'] or pg['page_title']}（{c['type']}）】",
+                 " / ".join(c["categories"])]
+        return lines + list(pg["bullets"])
+    if layout == "quote":
+        return [f"「{pg['quote']}」", pg["attribution"]]
+    if layout == "section":
+        return [pg["core_point"]]
+    if layout == "toc":
+        return [f"{i + 1}. {e}" for i, e in enumerate(pg["entries"])]
+    return []
+
+
+def _legacy_heading(pg: dict) -> str:
+    """内置兜底排版的页标题。"""
+    return pg.get("page_title") or ("目录" if pg["layout"] == "toc" else "")
+
+
+def _build_pptx_legacy(deck: dict, style: str, out_path: Path) -> None:
+    """内置兜底排版：要点式渲染（ppt_layouts 缺席时的保底线）。"""
     from pptx import Presentation
     from pptx.util import Inches
     from pptx.enum.text import PP_ALIGN
 
+    pages = deck["pages"]
     prs = Presentation()
     prs.slide_width = Inches(13.333)   # 16:9
     prs.slide_height = Inches(7.5)
@@ -435,32 +963,33 @@ def _build_pptx(title: str, slides: list, style: str, out_path: Path) -> None:
     p = tf.paragraphs[0]
     p.alignment = PP_ALIGN.CENTER
     _set_run_font(p.add_run(), 40, COLOR_TITLE, bold=True)
-    p.runs[0].text = title
+    p.runs[0].text = deck["title"]
     tf2 = _add_textbox(s, 1.0, 4.4, 11.333, 0.8)
     p2 = tf2.paragraphs[0]
     p2.alignment = PP_ALIGN.CENTER
     r2 = p2.add_run()
-    r2.text = f"{style} · {time.strftime('%Y年%m月%d日')}"
+    r2.text = deck["subtitle"]
     _set_run_font(r2, 16, COLOR_BODY)
     s.notes_slide.notes_text_frame.text = (
-        f"开场白：各位好，今天汇报的主题是「{title}」。"
-        f"先用一句话点明这次分享的核心价值，再交代整体结构（共 {len(slides)} 个部分），"
+        f"开场白：各位好，今天汇报的主题是「{deck['title']}」。"
+        f"先用一句话点明这次分享的核心价值，再交代整体结构（共 {len(pages)} 个部分），"
         "语速放慢，与听众做一次眼神交流。建议用时约 30 秒。")
 
-    # ---- 内容页
-    for idx, sl in enumerate(slides, start=1):
+    # ---- 内容页（任意版式摊平成要点行渲染）
+    for idx, pg in enumerate(pages, start=1):
         s = prs.slides.add_slide(blank)
         _set_bg(s)
         _add_accent_bar(s, 0.6, 0.62, 0.09, 0.62)
         tf_h = _add_textbox(s, 0.9, 0.5, 11.8, 0.9)
         ph = tf_h.paragraphs[0]
         rh = ph.add_run()
-        rh.text = f"{idx:02d}  {sl['heading']}"
+        rh.text = f"{idx:02d}  {_legacy_heading(pg)}"
         _set_run_font(rh, 28, COLOR_TITLE, bold=True)
 
-        font_pt, gap_in = _fit_body_font(sl["bullets"])
+        bullets = _flatten_page(pg)
+        font_pt, gap_in = _fit_body_font(bullets)
         tf_b = _add_textbox(s, 1.1, 1.7, 11.2, 5.2)
-        for j, bullet in enumerate(sl["bullets"]):
+        for j, bullet in enumerate(bullets):
             pb = tf_b.paragraphs[0] if j == 0 else tf_b.add_paragraph()
             pb.space_after = Inches(gap_in)
             rb = pb.add_run()
@@ -468,9 +997,24 @@ def _build_pptx(title: str, slides: list, style: str, out_path: Path) -> None:
             _set_run_font(rb, font_pt, COLOR_BODY)
 
         # 演讲稿物理写入备注（PowerPoint/WPS 备注窗格可见）
-        s.notes_slide.notes_text_frame.text = sl["speaker_notes"]
+        s.notes_slide.notes_text_frame.text = pg["speaker_note"]
 
     prs.save(str(out_path))
+
+
+def _build_pptx(deck: dict, style: str, out_path: Path) -> None:
+    """排版总入口：路 A 的 render_deck 可用时走版式引擎，否则走内置兜底排版。
+    落盘/文件名/返回契约不变。"""
+    if _render_deck is not None:
+        from pptx import Presentation
+        from pptx.util import Inches
+        prs = Presentation()
+        prs.slide_width = Inches(13.333)   # 16:9，由本侧创建
+        prs.slide_height = Inches(7.5)
+        _render_deck(prs, deck, style)     # 封面由 deck["title"]/["subtitle"] 自动生成
+        prs.save(str(out_path))
+        return
+    _build_pptx_legacy(deck, style, out_path)
 
 
 # ---------------------------------------------------------------- 落盘
@@ -523,25 +1067,27 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
     # ---- 阶段 2：逐页精写（串行；单页失败只影响单页，兜底页顶上）
     deck_pages = outline["pages"]
     titles = [p["page_title"] for p in deck_pages]
-    slides = []
+    contents = []
     for i, item in enumerate(deck_pages):
         prev_t = titles[i - 1] if i > 0 else "（封面）"
         next_t = titles[i + 1] if i + 1 < len(titles) else "（结束页）"
         page = _gen_page(topic, outline["title"], style, item,
                          i + 1, len(deck_pages), prev_t, next_t, caller)
+        contents.append(page)
+
+    # ---- 归一化成路 A 契约 deck，并登记运行统计
+    deck = _normalize_deck(outline, contents, style)
+    for i, (item, pg) in enumerate(zip(deck_pages, deck["pages"])):
+        n_bullets, n_chars = _stat_counts(pg)
         stats["page_stats"].append({
-            "page": i + 1, "title": item["page_title"],
-            "bullets": len(page["bullets"]),
-            "chars": sum(len(b) for b in page["bullets"]),
-            "rewrites": page["rewrites"], "fallback": page["fallback"],
+            "page": i + 1, "title": item["page_title"], "layout": pg["layout"],
+            "bullets": n_bullets, "chars": n_chars,
+            "rewrites": contents[i]["rewrites"], "fallback": contents[i]["fallback"],
         })
-        slides.append({"heading": item["page_title"],
-                       "bullets": page["bullets"],
-                       "speaker_notes": page["speaker_note"]})
 
     try:
         out_path = _alloc_path(topic)
-        _build_pptx(outline["title"], slides, style, out_path)
+        _build_pptx(deck, style, out_path)
     except Exception as e:
         return {"ok": False, "error": f"PPT 文件生成失败：{e}"}
 
@@ -549,6 +1095,6 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
         "ok": True,
         "path": str(out_path.resolve()),
         "file_name": out_path.name,
-        "pages": len(slides) + 1,   # 物理总页数 = 内容页 + 封面
+        "pages": len(deck["pages"]) + 1,   # 物理总页数 = 内容页 + 封面
         "title": outline["title"],
     }
