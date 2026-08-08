@@ -643,7 +643,89 @@ def _execute_tool(tool: str, args: dict) -> str:
                 return hands.execute(tool, auto_args)
         _pending_shell = {"tool": tool, "args": dict(args)}
         return _confirm_prompt(tool, args) if tool in ("run_shell", "gui_control") else result
+    _record_ppt_context(tool, args, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# PPT 任务上下文与纠正路由：LLM 在「不对，换个视角」这类纠正轮会丢任务线
+# （实测病例：把 PPT 纠正当成闲聊写文稿；重做时发明新主题「苏州外国语学校」；
+# 页数从主人指定的 10 回落默认 8）。
+# 第一性原理：纠正轮的意图是确定的——沿用上一轮任务参数做修正，不许模型即兴。
+# 做法：make_ppt 成功后记录任务上下文；命中纠正信号时规则层直接构造工具调用，
+# 绕过 LLM 的自由裁量。
+_LAST_PPT: dict | None = None   # {'topic','pages','style','file','ts'}
+_LAST_PPT_TTL = 2 * 3600        # 上下文保鲜期：2 小时
+
+_PPT_CORRECT_STRONG = (
+    "不对", "不是", "错了", "重来", "重做", "重新做", "重新生成",
+    "换一个", "换个", "改成", "换成", "应该是", "我说的是", "我的意思是",
+)
+# 其它领域的「换个X」不许劫持（换背景/换歌等走各自正常路径）
+_PPT_CORRECT_EXCLUDE = ("背景", "壁纸", "头像", "铃声", "音乐", "首歌", "闹钟", "提醒")
+_PPT_EDIT_HINT_RE = re.compile(r"第\s*\d+\s*页|封面|版式|标题|换张图|配图|字体|颜色|演讲稿")
+_PPT_PAGES_RE = re.compile(r"(\d{1,2})\s*页")
+_PPT_FILLER_RE = re.compile(r"^(?:不[对是]?[，,、\s]*)+")
+
+
+def _record_ppt_context(tool: str, args: dict, result) -> None:
+    """make_ppt/edit_ppt 成功后记录任务上下文（供纠正轮继承）；永不抛异常。"""
+    global _LAST_PPT
+    try:
+        if not isinstance(result, str) or result.startswith("抱歉"):
+            return
+        if tool == "make_ppt":
+            m = re.search(r"文件名\s*([^\s，。]+)", result)
+            _LAST_PPT = {
+                "topic": str(args.get("topic") or ""),
+                "pages": int(args.get("pages") or 8),
+                "style": str(args.get("style") or "工作汇报"),
+                "file": m.group(1) if m else "",
+                "ts": time.time(),
+            }
+        elif tool == "edit_ppt" and _LAST_PPT is not None:
+            _LAST_PPT["ts"] = time.time()  # 修改成功：续保鲜期
+    except Exception:  # noqa: BLE001 - 上下文记录失败不影响主流程
+        pass
+
+
+def _ppt_correction_route(text: str):
+    """PPT 纠正轮确定性路由：命中返回 (tool, args)，否则 None。只读全局，零副作用。
+
+    触发：存在保鲜期内的 PPT 上下文，且文本带纠正信号
+    （强信号词，或「否定词 + PPT」短句如「不，是PPT」）。
+    分流：指向具体页/版式/标题/图 → edit_ppt 原位修改；
+          整体方向性纠正 → make_ppt 按「原主题+修正要求」重做，
+          页数/风格继承上一轮；纠正里另指页数（「做成12页」）以新值为准。
+    """
+    ctx = _LAST_PPT
+    if not ctx or not ctx.get("topic"):
+        return None
+    if time.time() - ctx.get("ts", 0) > _LAST_PPT_TTL:
+        return None
+    t = text.strip()
+    if any(k in t for k in _PPT_CORRECT_EXCLUDE):
+        return None
+    strong = any(k in t for k in _PPT_CORRECT_STRONG)
+    weak = ("不" in t or "重新" in t) and ("ppt" in t.lower())
+    if not (strong or weak):
+        return None
+    if _PPT_EDIT_HINT_RE.search(t):
+        if ctx.get("file"):
+            return ("edit_ppt", {"file_name": ctx["file"], "instruction": t})
+        return None
+    correction = _PPT_FILLER_RE.sub("", t).strip("，,。 ")
+    correction = re.sub(r"^是", "", correction).strip("，,。 ")
+    if not correction or correction.lower() in ("ppt", "要ppt"):
+        topic = ctx["topic"]  # 「不，是PPT」：剥完只剩介质词，按原 brief 重做
+    elif "ppt" in correction.lower():
+        topic = ctx["topic"]
+    else:
+        topic = f"{ctx['topic']}（{correction}）"
+    m = _PPT_PAGES_RE.search(t)
+    pages = int(m.group(1)) if m else ctx["pages"]
+    return ("make_ppt", {"topic": topic, "pages": pages, "style": ctx.get("style") or "工作汇报"})
+
 
 
 # == 大模型层：OpenAI 兼容聊天接口 + 工具协议 ==
@@ -727,6 +809,9 @@ def _build_system_prompt() -> str:
         "run_shell 用于命令行能完成的事；媒体播放控制优先用 media_control；"
         "做不到的事如实说明并给出可替代方案，禁止谎称完成；"
         "命令执行后没有输出时，要说明命令已执行但无法确认目标是否达成，并给出验证或替代办法。"
+        "PPT 任务纪律：主人刚让你做过 PPT 后，随后的纠正（不对/换个视角/改第N页等）"
+        "必须调用 edit_ppt 或 make_ppt 修正成品，禁止只在聊天里重写文稿充数；"
+        "主题与页数以主人在对话中说过的为准，禁止发明新主题，禁止回落默认页数。"
     )
     return prompt
 
@@ -1402,6 +1487,14 @@ def _think_impl(user_text: str, history: list[dict]) -> str:
             # 走 search_web 抓文本 -> LLM 一次性总结的快速通道
             return _answer_from_search(args["query"])
         return _execute_tool(tool, args)
+
+    # 6.5 PPT 纠正路由（确定性，先于大模型层）：纠正轮沿用上一轮任务上下文，
+    #    防 LLM 丢任务线（写聊天文稿充数/发明新主题/页数回落默认值）。
+    if hands is not None and not _is_composite(instruction):
+        ppt_route = _ppt_correction_route(instruction)
+        if ppt_route is not None:
+            print(f"[brain] PPT 纠正路由命中：{ppt_route[0]} {ppt_route[1]}")
+            return _execute_tool(*ppt_route)
 
     # 7. 大模型层（含长期记忆与工具协议）：附件原文 full_text 在此进入对话——
     #    附件是主人给的阅读材料，LLM 必须读到它才能完成「分析文件内容」。
