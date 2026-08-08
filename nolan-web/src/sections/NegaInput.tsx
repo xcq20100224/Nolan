@@ -1,15 +1,20 @@
-// NEGA 底部输入区：极简细线输入框（透明底、底部 1px 边线、聚焦变亮）+ 细线 🎤 按钮
+// Kimi 风格底部输入区：768px 居中容器，radius 20px，bg primary + separator.s1 边框，
+// 聚焦时 effect.shadow.inputDefault 阴影；顶部自动增高 textarea（16/24，上限 200px），
+// 底部工具栏：左 附件（回形针）+ 麦克风 + 停止说话，右 32px 圆形发送（kimiDark 底 + ArrowUp）
 // 语音方案（服务端录音）：麦克风属于机器不属于浏览器，浏览器只当遥控器
 //   点击 🎤 → POST /api/mic/start 服务端开始录音；再点一次 → POST /api/mic/stop 停止并识别
 // 不再需要任何浏览器麦克风权限，🎤 永不置灰（除非会话结束禁用）
-// 录音状态通过 onRecordingChange 上报给父组件，中央声波以模拟律动呈现（无真实波形流）
+// 录音状态通过 onRecordingChange 上报给父组件，声波条以模拟律动呈现（无真实波形流）
 import { useEffect, useRef, useState } from 'react'
-import type { KeyboardEvent } from 'react'
-import { FolderOpen, Mic, Paperclip, SendHorizontal, Square, X, FileText, FileSpreadsheet, FileAudio, FileVideo, FileArchive, File, Image as ImageIcon, Presentation } from 'lucide-react'
+import type { ChangeEvent, KeyboardEvent } from 'react'
+import { Mic, Paperclip, ArrowUp, Square, X, FileText, FileSpreadsheet, FileAudio, FileVideo, FileArchive, File, Image as ImageIcon, Presentation } from 'lucide-react'
 import { micStart, micStop, micState, clientLog, stopSpeak, stopAllAudio } from '@/lib/api'
 
 /** 「没听清」等占位提示的显示时长（毫秒） */
 const HINT_MS = 3000
+
+/** textarea 自动增高上限（px） */
+const TEXTAREA_MAX_H = 200
 
 /** 待发送附件芯片的展示结构（正文存在父组件，发送时拼进 payload） */
 export interface AttachmentChip {
@@ -52,21 +57,19 @@ interface NegaInputProps {
   disabled: boolean
   /** 发送文本消息 */
   onSend: (text: string) => void
-  /** 录音状态变化上报，驱动中央声波切换为模拟律动 */
+  /** 录音状态变化上报，驱动声波条切换为模拟律动 */
   onRecordingChange: (recording: boolean) => void
   /** 语音状态播报（以 Nolan 身份插入对话，让每一步都看得见） */
   onStatus?: (text: string) => void
-  /** 待发送的附件芯片（拖拽上传成功后由父组件维护，最多 3 个） */
+  /** 待发送的附件芯片（上传成功后由父组件维护，最多 3 个） */
   attachments?: AttachmentChip[]
   /** 移除一个待发送附件 */
   onRemoveAttachment?: (id: string) => void
-  /** 打开文件柜面板 */
-  onOpenCabinet?: () => void
-  /** 文件柜有未读新文件（按钮上显示红点角标） */
-  cabinetHasNew?: boolean
+  /** 回形针按钮：弹出文件选择框，选中后交给父组件上传暂存 */
+  onAddFiles?: (files: FileList | File[]) => void
 }
 
-export default function NegaInput({ disabled, onSend, onRecordingChange, onStatus, attachments = [], onRemoveAttachment, onOpenCabinet, cabinetHasNew = false }: NegaInputProps) {
+export default function NegaInput({ disabled, onSend, onRecordingChange, onStatus, attachments = [], onRemoveAttachment, onAddFiles }: NegaInputProps) {
   // 全局错误浮层：任何未捕获的 JS 错误都显示在屏幕上（调试期 instrumentation）
   const [jsError, setJsError] = useState('')
   useEffect(() => {
@@ -89,6 +92,8 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
 
   const timerRef = useRef<number | null>(null)
   const hintTimerRef = useRef<number | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   // 组件卸载后忽略迟到的识别回调
   const unmountedRef = useRef(false)
   // stop 请求进行中（识别可能耗时），防止连点重复触发
@@ -108,6 +113,14 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
   // 卸载清理时需读取最新录音状态
   const recordingRef = useRef(recording)
   recordingRef.current = recording
+
+  /** textarea 随内容自动增高（上限 TEXTAREA_MAX_H，超出内部滚动） */
+  const autoGrow = () => {
+    const el = textareaRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, TEXTAREA_MAX_H)}px`
+  }
 
   /** 停止秒数计时 */
   const stopTimer = () => {
@@ -202,7 +215,7 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
       clientLog('已确认服务端录音中，进入聆听态')
       setSeconds(0)
       setRecording(true)
-      // 上报录音状态，中央声波切换为模拟律动
+      // 上报录音状态，声波条切换为模拟律动
       onRecordingChangeRef.current(true)
       reportStatus('🎤 正在聆听，先生。说完请再点一次麦克风。')
       // 秒数计时
@@ -267,112 +280,157 @@ export default function NegaInput({ disabled, onSend, onRecordingChange, onStatu
     if (!canSend || disabled) return
     onSend(text.trim())
     setText('')
+    // 清空后收回 textarea 高度
+    requestAnimationFrame(() => autoGrow())
   }
 
-  // 回车发送（中文输入法组合中不触发）
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+  // 回车发送（Shift+Enter 换行；中文输入法组合中不触发）
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+      e.preventDefault()
       submit()
     }
   }
 
+  const handleTextChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
+    setText(e.target.value)
+    autoGrow()
+  }
+
+  /** 回形针：弹出文件选择框（多选），选中即走与拖拽相同的上传暂存链路 */
+  const handlePickFiles = (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) onAddFiles?.(e.target.files)
+    e.target.value = '' // 允许连续选择同一个文件
+  }
+
+  const sendEnabled = canSend && !disabled
+
   return (
-    <footer className="shrink-0 px-6 pb-8 pt-4">
+    <footer className="shrink-0 px-4 pb-4 pt-1">
       {jsError && (
-        <div className="mx-auto mb-2 max-w-2xl rounded border border-[#c05b4d] px-3 py-1 text-xs text-[#c05b4d]">
+        <div
+          className="mx-auto mb-2 max-w-[768px] rounded-[8px] border px-3 py-1 text-[12px] leading-[18px]"
+          style={{ borderColor: 'var(--danger)', color: 'var(--danger)' }}
+        >
           {jsError}
         </div>
       )}
-      {/* 待发送附件芯片：拖拽上传成功后出现，发送时随消息一起交付（最多 3 个） */}
-      {attachments.length > 0 && (
-        <div className="mx-auto mb-2 flex max-w-2xl flex-wrap gap-2">
-          {attachments.map((a) => {
-            const Icon = kindIcon(a.kind)
-            return (
-              <span
-                key={a.id}
-                title={a.note || undefined}
-                className="flex items-center gap-2 rounded-full border border-[#2e2e33] px-3 py-1 text-xs font-light text-[#8a8578]"
-              >
-                <Icon className="h-3 w-3" />
-                {a.name} · {a.chars} 字{a.kind ? ` · ${a.kind}` : ''}
-                {/* 通道说明（如「扫描版PDF，无文本层」）内联提示，悬停看全文 */}
-                {a.note && <span className="text-[#c0a04d]">⚠ {a.note}</span>}
-                <button
-                  type="button"
-                  onClick={() => onRemoveAttachment?.(a.id)}
-                  className="text-[#4a4a50] transition-colors hover:text-[#c05b4d]"
-                  title="移除附件"
+      {/* 隐藏的文件选择框（回形针触发，多选，与拖拽同一条上传链路） */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={handlePickFiles}
+      />
+      {/* 输入容器：radius 20px / bg primary / separator.s1 边框 / 聚焦阴影 inputDefault */}
+      <div
+        className="mx-auto w-full max-w-[768px] rounded-[20px] border border-[var(--separator)] bg-[var(--bg-primary)] transition-shadow duration-200 focus-within:shadow-[var(--input-focus-shadow)]"
+      >
+        {/* 待发送附件芯片：上传成功后出现，发送时随消息一起交付（最多 3 个） */}
+        {attachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 px-4 pt-3">
+            {attachments.map((a) => {
+              const Icon = kindIcon(a.kind)
+              return (
+                <span
+                  key={a.id}
+                  title={a.note || undefined}
+                  className="flex items-center gap-1.5 rounded-[8px] bg-[var(--fill-f1)] px-2 py-1 text-[12px] leading-[18px] text-[var(--label-secondary)]"
                 >
-                  <X className="h-3 w-3" />
-                </button>
-              </span>
-            )
-          })}
-        </div>
-      )}
-      <div className="mx-auto flex max-w-2xl items-center gap-4">
-        <input
+                  <Icon className="h-4 w-4" />
+                  {a.name} · {a.chars} 字{a.kind ? ` · ${a.kind}` : ''}
+                  {/* 通道说明（如「扫描版PDF，无文本层」）内联提示，悬停看全文；status.orange 警示色 */}
+                  {a.note && <span style={{ color: '#ff9500' }}>⚠ {a.note}</span>}
+                  <button
+                    type="button"
+                    onClick={() => onRemoveAttachment?.(a.id)}
+                    className="text-[var(--label-tertiary)] transition-colors duration-150 hover:text-[var(--danger)]"
+                    title="移除附件"
+                    aria-label={`移除附件 ${a.name}`}
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </span>
+              )
+            })}
+          </div>
+        )}
+
+        {/* 输入文本区：16/24 主文本，自动增高上限 200px */}
+        <textarea
+          ref={textareaRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={handleTextChange}
           onKeyDown={handleKeyDown}
           disabled={disabled}
+          rows={1}
           placeholder={placeholderHint || (disabled ? '会话已结束' : '请讲，先生…（可直接拖文件进来）')}
-          className="flex-1 border-b border-[#2e2e33] bg-transparent py-2 text-sm font-light text-[#e8e0d0] outline-none transition-colors placeholder:text-[#4a4a50] focus:border-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-50"
+          className="kimi-scroll max-h-[200px] w-full resize-none bg-transparent px-4 pb-1 pt-3 text-[16px] leading-6 text-[var(--label-primary)] outline-none placeholder:text-[var(--label-quaternary)] disabled:cursor-not-allowed disabled:opacity-50"
         />
-        <button
-          type="button"
-          onClick={onOpenCabinet}
-          disabled={disabled}
-          title={cabinetHasNew ? '文件柜有新文件，点击查看' : '文件柜（Nolan 生成的文件在这里查看/下载）'}
-          className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#2e2e33] text-[#8a8578] transition-colors hover:border-[#5a5a60] hover:text-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-30"
-        >
-          <FolderOpen className="h-4 w-4" />
-          {/* 未读红点角标：有新文件时亮在按钮右上角，打开面板后由父组件清除 */}
-          {cabinetHasNew && (
-            <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-[#c05b4d]" />
+
+        {/* 工具栏：左 附件 / 麦克风 / 停止说话，右 发送 */}
+        <div className="flex items-center gap-1 px-3 pb-2.5 pt-1">
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={disabled}
+            className="icon-btn"
+            title="添加附件（上传后随下一条消息一起发送，最多 3 个）"
+            aria-label="添加附件"
+          >
+            <Paperclip className="h-[18px] w-[18px]" />
+          </button>
+          <button
+            type="button"
+            onClick={handleMic}
+            disabled={disabled}
+            title={recording ? '停止录音（或再按一次 Alt）' : '语音输入（点击或按 Alt 键）'}
+            aria-label={recording ? '停止录音' : '语音输入'}
+            className={`icon-btn ${recording ? 'kimi-recording' : ''}`}
+            style={recording ? { color: 'var(--danger)' } : undefined}
+          >
+            <Mic className="h-[18px] w-[18px]" />
+          </button>
+          {recording && (
+            <span
+              className="w-8 shrink-0 text-center text-[12px] leading-[18px] tabular-nums"
+              style={{ color: 'var(--danger)' }}
+            >
+              {seconds}s
+            </span>
           )}
-        </button>
-        <button
-          type="button"
-          onClick={handleMic}
-          disabled={disabled}
-          title={recording ? '停止录音（或再按一次 Alt）' : '语音输入（点击或按 Alt 键）'}
-          className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-30 ${
-            recording
-              ? 'nega-recording border-[#c05b4d] text-[#c05b4d]'
-              : 'border-[#2e2e33] text-[#8a8578] hover:border-[#5a5a60] hover:text-[#e8e0d0]'
-          }`}
-        >
-          <Mic className="h-4 w-4" />
-        </button>
-        {recording && (
-          <span className="w-8 shrink-0 text-center text-sm tabular-nums text-[#c05b4d]">
-            {seconds}s
-          </span>
-        )}
-        <button
-          type="button"
-          onClick={submit}
-          disabled={disabled || !canSend}
-          title="发送"
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#2e2e33] text-[#8a8578] transition-colors hover:border-[#5a5a60] hover:text-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-30"
-        >
-          <SendHorizontal className="h-4 w-4" />
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            clientLog('点击-停止说话')
-            stopAllAudio() // 浏览器通道静音（此前只停服务端音箱，浏览器照播）
-            stopSpeak()
-          }}
-          disabled={disabled}
-          title="停止说话（打断当前播报）"
-          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#2e2e33] text-[#8a8578] transition-colors hover:border-[#5a5a60] hover:text-[#e8e0d0] disabled:cursor-not-allowed disabled:opacity-30"
-        >
-          <Square className="h-4 w-4" />
-        </button>
+          <button
+            type="button"
+            onClick={() => {
+              clientLog('点击-停止说话')
+              stopAllAudio() // 浏览器通道静音（此前只停服务端音箱，浏览器照播）
+              stopSpeak()
+            }}
+            disabled={disabled}
+            className="icon-btn"
+            title="停止说话（打断当前播报）"
+            aria-label="停止说话"
+          >
+            <Square className="h-[18px] w-[18px]" />
+          </button>
+
+          {/* 发送：32px 圆形主按钮（kimiDark 底 + ArrowUp），空文本 disabled（labels.quaternary） */}
+          <button
+            type="button"
+            onClick={submit}
+            disabled={!sendEnabled}
+            title="发送"
+            aria-label="发送"
+            className="ml-auto flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-[background-color,color,transform] duration-150 active:scale-[0.96] disabled:cursor-not-allowed disabled:active:scale-100"
+            style={{
+              background: sendEnabled ? 'var(--btn-primary-bg)' : 'var(--fill-f1)',
+              color: sendEnabled ? 'var(--btn-primary-text)' : 'var(--label-quaternary)',
+            }}
+          >
+            <ArrowUp className="h-[18px] w-[18px]" />
+          </button>
+        </div>
       </div>
     </footer>
   )

@@ -3,6 +3,83 @@
 @tailwind utilities;
 
 @layer base {
+  /* ============================================================
+     Kimi 双主题变量（亮色默认 / [data-theme="dark"] 暗色）
+     取值全部对应 kimi-design-skill tokens.json（default 态）：
+       --bg-primary        ← color.background.primary
+       --bg-secondary      ← color.background.secondary
+       --label-primary     ← color.labels.primary
+       --label-secondary   ← color.labels.secondary
+       --label-tertiary    ← color.labels.tertiary
+       --label-quaternary  ← color.labels.quaternary
+       --separator         ← color.separator.s1
+       --fill-f1 / --fill-f2 ← color.fills.f1 / f2
+       --bubble-user-bg    ← color.others.bubbleBlue（暗色用 background.tertiary #292929）
+       --bubble-user-text  ← color.always.white / always.whiteSecondary
+       --btn-primary-bg    ← color.brand.kimiDark
+       --btn-primary-text  ← color.always.white / labels.primary 反色
+       --kimi-blue         ← color.status.kimiBlue
+       --danger            ← color.status.danger
+       --positive-green    ← color.status.positiveGreen
+       --mask              ← color.mask.base
+       --chat-bg-overlay   ← 背景图主题蒙层（主控决策值，token gap）
+       --input-focus-shadow← effect.shadow.inputDefault
+       --shadow-small      ← effect.shadow.small
+       --wave-rgb          ← 声波基色（labels.primary 的 rgb 分量）
+       --danger-rgb        ← status.danger 的 rgb 分量
+     ============================================================ */
+  :root {
+    color-scheme: light;
+    --bg-primary: #ffffff;
+    --bg-secondary: #f5f5f5;
+    --label-primary: rgba(0, 0, 0, 0.9);
+    --label-secondary: rgba(0, 0, 0, 0.6);
+    --label-tertiary: rgba(0, 0, 0, 0.45);
+    --label-quaternary: rgba(0, 0, 0, 0.3);
+    --separator: rgba(0, 0, 0, 0.13);
+    --fill-f1: rgba(0, 0, 0, 0.03);
+    --fill-f2: rgba(0, 0, 0, 0.05);
+    --bubble-user-bg: #1783ff;
+    --bubble-user-text: #ffffff;
+    --btn-primary-bg: rgba(0, 0, 0, 0.9);
+    --btn-primary-text: #ffffff;
+    --kimi-blue: #1783ff;
+    --danger: #ff3849;
+    --positive-green: #16c456;
+    --mask: rgba(0, 0, 0, 0.4);
+    --chat-bg-overlay: rgba(255, 255, 255, 0.88);
+    --input-focus-shadow: 0 5px 16px -4px rgba(0, 0, 0, 0.07);
+    --shadow-small: 0 4px 16.4px rgba(0, 0, 0, 0.1);
+    --wave-rgb: 0, 0, 0;
+    --danger-rgb: 255, 56, 73;
+  }
+
+  [data-theme='dark'] {
+    color-scheme: dark;
+    --bg-primary: #121212;
+    --bg-secondary: #1f1f1f;
+    --label-primary: rgba(255, 255, 255, 0.84);
+    --label-secondary: rgba(255, 255, 255, 0.56);
+    --label-tertiary: rgba(255, 255, 255, 0.42);
+    --label-quaternary: rgba(255, 255, 255, 0.26);
+    --separator: rgba(255, 255, 255, 0.12);
+    --fill-f1: rgba(255, 255, 255, 0.05);
+    --fill-f2: rgba(255, 255, 255, 0.1);
+    --bubble-user-bg: #292929;
+    --bubble-user-text: rgba(255, 255, 255, 0.84);
+    --btn-primary-bg: rgba(255, 255, 255, 0.84);
+    --btn-primary-text: rgba(0, 0, 0, 0.9);
+    --kimi-blue: #1783ff;
+    --danger: #ff4756;
+    --positive-green: #16c456;
+    --mask: rgba(0, 0, 0, 0.6);
+    --chat-bg-overlay: rgba(18, 18, 18, 0.88);
+    --input-focus-shadow: 0 5px 16px -4px rgba(0, 0, 0, 0.35);
+    --shadow-small: 0 4px 16.4px rgba(0, 0, 0, 0.4);
+    --wave-rgb: 255, 255, 255;
+    --danger-rgb: 255, 71, 86;
+  }
+
   /* shadcn 主题变量保留（ui 组件目录仍在仓库中，避免潜在引用断色） */
   :root {
     --background: 0 0% 100%;
@@ -71,7 +148,6 @@
     @apply border-border;
   }
 
-  /* NEGA 基底：全屏近黑，细体无衬线，禁选默认高亮花哨样式 */
   html,
   body,
   #root {
@@ -79,46 +155,143 @@
   }
 
   body {
-    @apply bg-[#0b0b0d] text-[#e8e0d0] antialiased;
-    font-family:
-      'Helvetica Neue',
-      'PingFang SC',
-      'Microsoft YaHei',
-      'Segoe UI',
-      system-ui,
-      sans-serif;
+    @apply antialiased;
+    background: var(--bg-primary);
+    color: var(--label-primary);
+    font-family: 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+    /* 主题切换：仅颜色类属性的短过渡（animation.md §3.1 hover/color → ease） */
+    transition:
+      background-color 200ms ease,
+      color 200ms ease;
   }
 }
 
-/* 录音中按钮的红色脉冲光环 */
-@keyframes nega-rec-pulse {
+@layer components {
+  /* Header / 工具栏 32px 图标按钮（icon-system.md：独立图标按钮 18px） */
+  .icon-btn {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px; /* radius.sm */
+    color: var(--label-secondary);
+    transition:
+      background-color 150ms ease,
+      color 150ms ease,
+      transform 100ms ease;
+  }
+  .icon-btn:hover {
+    background: var(--fill-f1);
+    color: var(--label-primary);
+  }
+  .icon-btn:active {
+    transform: scale(0.96); /* animation.md §4.3 按压反馈 */
+  }
+  .icon-btn:disabled {
+    background: transparent;
+    color: var(--label-quaternary);
+    cursor: not-allowed;
+    transform: none;
+  }
+  .icon-btn:disabled:hover {
+    background: transparent;
+    color: var(--label-quaternary);
+  }
+
+  /* 细滚动条（吃主题变量） */
+  .kimi-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: var(--fill-f2) transparent;
+  }
+  .kimi-scroll::-webkit-scrollbar {
+    width: 4px;
+  }
+  .kimi-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .kimi-scroll::-webkit-scrollbar-thumb {
+    background: var(--fill-f2);
+    border-radius: 2px;
+  }
+
+  /* 录音中按钮的红色脉冲光环（status.danger，吃主题变量） */
+  .kimi-recording {
+    animation: kimi-rec-pulse 1.6s ease-out infinite;
+  }
+}
+
+@keyframes kimi-rec-pulse {
   0% {
-    box-shadow: 0 0 0 0 rgba(192, 91, 77, 0.45);
+    box-shadow: 0 0 0 0 rgba(var(--danger-rgb), 0.45);
   }
   70% {
-    box-shadow: 0 0 0 10px rgba(192, 91, 77, 0);
+    box-shadow: 0 0 0 10px rgba(var(--danger-rgb), 0);
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(192, 91, 77, 0);
+    box-shadow: 0 0 0 0 rgba(var(--danger-rgb), 0);
   }
 }
 
-.nega-recording {
-  animation: nega-rec-pulse 1.6s ease-out infinite;
+/* Modal 进出场（animation.md §4.5 / §4.2：入场 150–200ms，出场 ≈75%） */
+@keyframes kimi-mask-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes kimi-modal-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes kimi-mask-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+@keyframes kimi-modal-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.97);
+  }
 }
 
-/* 历史浮层的细滚动条 */
-.nega-scroll {
-  scrollbar-width: thin;
-  scrollbar-color: #2e2e33 transparent;
+.kimi-mask {
+  animation: kimi-mask-in 180ms cubic-bezier(0.23, 1, 0.32, 1);
 }
-.nega-scroll::-webkit-scrollbar {
-  width: 4px;
+.kimi-modal {
+  animation: kimi-modal-in 180ms cubic-bezier(0.23, 1, 0.32, 1);
 }
-.nega-scroll::-webkit-scrollbar-track {
-  background: transparent;
+.kimi-closing .kimi-mask {
+  animation: kimi-mask-out 140ms cubic-bezier(0.23, 1, 0.32, 1) forwards;
 }
-.nega-scroll::-webkit-scrollbar-thumb {
-  background: #2e2e33;
-  border-radius: 2px;
+.kimi-closing .kimi-modal {
+  animation: kimi-modal-out 140ms cubic-bezier(0.23, 1, 0.32, 1) forwards;
+}
+
+/* 降低动效偏好：保留透明度过渡，砍掉位移/缩放（animation.md §9.1） */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

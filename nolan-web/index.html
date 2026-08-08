@@ -1,9 +1,23 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Nolan</title>
+    <script>
+      // 首帧前读取持久化主题（默认亮色），避免暗色用户打开时白闪
+      try {
+        var t = localStorage.getItem('nolan-theme')
+        document.documentElement.dataset.theme = t === 'dark' ? 'dark' : 'light'
+      } catch (e) {
+        document.documentElement.dataset.theme = 'light'
+      }
+    </script>
+    <style>
+      /* CSS 变量加载前的兜底底色，杜绝主题闪烁 */
+      html { background: #ffffff; }
+      html[data-theme='dark'] { background: #121212; }
+    </style>
   </head>
   <body>
     <div id="root"></div>

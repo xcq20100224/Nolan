@@ -1,8 +1,9 @@
-// NEGA 中央声波可视化（核心视觉）：
+// 声波可视化（核心视觉）：
 //   idle      —— 闲置：低幅慢速呼吸式正弦波
-//   recording —— 录音：AnalyserNode 绘制真实麦克风波形
+//   recording —— 录音：AnalyserNode 绘制真实麦克风波形（红色 status.danger）
 //   busy      —— 等待回复 / 播报：快速律动模拟动画
-// 颜色统一使用暖白 / 淡金（#e8e0d0）单色系，三层线条透明度递减
+// 颜色吃 CSS 变量（--wave-rgb = labels.primary 分量，--danger-rgb = status.danger 分量），
+// 随亮 / 暗主题自动切换，三层线条透明度递减
 import { useEffect, useRef } from 'react'
 
 /** 声波模式：闲置 / 录音 / 等待回复 */
@@ -14,8 +15,21 @@ interface WaveCanvasProps {
   stream: MediaStream | null
 }
 
-/** 暖白淡金主色（rgb 分量，配合不同 alpha 使用） */
-const GOLD = '232, 224, 208'
+/** 主题基色缓存：从 CSS 变量读取的 rgb 分量字符串（如 "0, 0, 0"） */
+let cachedTheme: string | undefined
+let cachedWaveRgb = '0, 0, 0'
+let cachedDangerRgb = '255, 56, 73'
+
+/** 主题变化时重读 CSS 变量（每帧比对 data-theme 属性，仅字符串比较，零成本） */
+function refreshColors(): void {
+  const theme = document.documentElement.dataset.theme
+  if (theme === cachedTheme) return
+  cachedTheme = theme
+  const style = getComputedStyle(document.documentElement)
+  cachedWaveRgb = style.getPropertyValue('--wave-rgb').trim() || '0, 0, 0'
+  cachedDangerRgb = style.getPropertyValue('--danger-rgb').trim() || '255, 56, 73'
+}
+
 /** 时域采样点数（与分析器 fftSize 对应） */
 const FFT_SIZE = 2048
 
@@ -88,16 +102,17 @@ export default function WaveCanvas({ mode, stream }: WaveCanvasProps) {
     const timeDomain = new Uint8Array(FFT_SIZE)
     const t0 = performance.now()
 
-    /** 绘制一条横向波形线：sampler 返回 -1..1 的归一化振幅 */
+    /** 绘制一条横向波形线：sampler 返回 -1..1 的归一化振幅，rgb 为 "r, g, b" 分量串 */
     const strokeWave = (
       sampler: (x: number, w: number) => number,
       alpha: number,
       width: number,
+      rgb: string,
     ) => {
       const cy = cssH / 2
       const amp = cssH * 0.32
       ctx2d.beginPath()
-      ctx2d.strokeStyle = `rgba(${GOLD}, ${alpha})`
+      ctx2d.strokeStyle = `rgba(${rgb}, ${alpha})`
       ctx2d.lineWidth = width
       const step = 2
       for (let x = 0; x <= cssW; x += step) {
@@ -116,8 +131,13 @@ export default function WaveCanvas({ mode, stream }: WaveCanvasProps) {
       const t = (performance.now() - t0) / 1000
       ctx2d.clearRect(0, 0, cssW, cssH)
 
+      refreshColors()
       const current = modeRef.current
       const analyser = analyserRef.current
+      // 录音态用 status.danger 红色，其余用 labels.primary 主题基色
+      const base = current === 'recording' ? cachedDangerRgb : cachedWaveRgb
+      // 亮色下黑线、暗色下白线都需要足够存在感：基线 alpha 按模式区分
+      const dim = current === 'recording' ? 1 : cachedTheme === 'dark' ? 0.84 : 0.9
 
       if (current === 'recording' && analyser) {
         // 真实麦克风波形：时域数据映射到 -1..1
@@ -129,9 +149,9 @@ export default function WaveCanvas({ mode, stream }: WaveCanvasProps) {
           )
           return ((timeDomain[idx] - 128) / 128) * scale
         }
-        strokeWave((x, w) => sample(x, w, 1, 0), 0.9, 1.5)
-        strokeWave((x, w) => sample(x, w, 0.5, 90), 0.25, 1)
-        strokeWave((x, w) => sample(x, w, 0.25, 180), 0.12, 1)
+        strokeWave((x, w) => sample(x, w, 1, 0), 0.9 * dim, 1.5, base)
+        strokeWave((x, w) => sample(x, w, 0.5, 90), 0.25 * dim, 1, base)
+        strokeWave((x, w) => sample(x, w, 0.25, 180), 0.12 * dim, 1, base)
         return
       }
 
@@ -143,18 +163,21 @@ export default function WaveCanvas({ mode, stream }: WaveCanvasProps) {
             (Math.sin((x / w) * Math.PI * 6 + t * 7) * 0.7 +
               Math.sin((x / w) * Math.PI * 13 - t * 11) * 0.3) *
             pulse,
-          0.85,
+          0.85 * dim,
           1.5,
+          base,
         )
         strokeWave(
           (x, w) => Math.sin((x / w) * Math.PI * 4 - t * 5.5) * 0.5 * pulse,
-          0.25,
+          0.25 * dim,
           1,
+          base,
         )
         strokeWave(
           (x, w) => Math.sin((x / w) * Math.PI * 9 + t * 9.5) * 0.25 * pulse,
-          0.12,
+          0.12 * dim,
           1,
+          base,
         )
         return
       }
@@ -164,18 +187,21 @@ export default function WaveCanvas({ mode, stream }: WaveCanvasProps) {
       const ampScale = 0.18 + 0.14 * breath
       strokeWave(
         (x, w) => Math.sin((x / w) * Math.PI * 3 + t * 0.9) * ampScale,
-        0.55,
+        0.4 * dim,
         1.2,
+        base,
       )
       strokeWave(
         (x, w) => Math.sin((x / w) * Math.PI * 2 - t * 0.6) * ampScale * 0.6,
-        0.2,
+        0.16 * dim,
         1,
+        base,
       )
       strokeWave(
         (x, w) => Math.sin((x / w) * Math.PI * 5 + t * 0.4) * ampScale * 0.35,
-        0.1,
+        0.08 * dim,
         1,
+        base,
       )
     }
 
@@ -189,7 +215,7 @@ export default function WaveCanvas({ mode, stream }: WaveCanvasProps) {
   return (
     <canvas
       ref={canvasRef}
-      className="h-40 w-full max-w-3xl sm:h-48"
+      className="block h-full w-full"
       aria-label="Nolan 声波可视化"
     />
   )

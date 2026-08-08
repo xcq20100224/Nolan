@@ -1,9 +1,9 @@
-// Nolan NEGA 主界面：黑底全屏 + 中央声波可视化 + 字幕式对话 + 历史浮层
-// 交互逻辑与 API 契约保持原样：/api/health、/api/chat、/api/due 轮询、/api/memory、/api/reminders、exit 禁用
+// Nolan Kimi 风格主界面：56px 头部 + 居中对话区（用户气泡 / Nolan 通栏排版）+ 声波条 + 底部输入区
+// 交互逻辑与 API 契约保持原样：/api/health、/api/chat 流式、/api/due 轮询、/api/files_list 红点、exit 禁用
 import { useCallback, useEffect, useRef, useState } from 'react'
 import NegaHeader from '@/sections/NegaHeader'
+import type { Theme } from '@/sections/NegaHeader'
 import WaveCanvas from '@/sections/WaveCanvas'
-import SubtitleBar from '@/sections/SubtitleBar'
 import HistoryOverlay from '@/sections/HistoryOverlay'
 import NegaInput from '@/sections/NegaInput'
 import FileCabinet from '@/sections/FileCabinet'
@@ -30,6 +30,8 @@ interface StagedAttachment {
 const ATTACHMENT_PAYLOAD_MAX = 8000
 /** 一次最多携带的附件数 */
 const ATTACHMENT_MAX = 3
+/** localStorage 主题键（与 index.html 首帧脚本一致） */
+const THEME_KEY = 'nolan-theme'
 
 /** 当前时间，格式 HH:MM（24 小时制） */
 function nowHHMM(): string {
@@ -44,6 +46,11 @@ let seq = 0
 function nextId(): string {
   seq += 1
   return `${Date.now()}-${seq}`
+}
+
+/** 读取初始主题（index.html 首帧脚本已写入 data-theme，这里与之对齐；默认亮色） */
+function initialTheme(): Theme {
+  return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light'
 }
 
 /**
@@ -88,12 +95,14 @@ export default function ChatApp() {
   const [cabinetOpen, setCabinetOpen] = useState(false)
   /** 文件柜新文件红点角标（打开面板即清除） */
   const [cabinetHasNew, setCabinetHasNew] = useState(false)
-  /** 待发送附件（拖拽上传成功后暂存，发送时拼进 payload，最多 3 个） */
+  /** 待发送附件（拖拽/回形针上传成功后暂存，发送时拼进 payload，最多 3 个） */
   const [attachments, setAttachments] = useState<StagedAttachment[]>([])
   /** 文件拖入聊天区的视觉高亮 */
   const [dragActive, setDragActive] = useState(false)
-  /** 网页背景图地址（/api/background 轮询结果，null 时保持纯黑底） */
+  /** 网页背景图地址（/api/background 轮询结果，null 时纯色底） */
   const [bgUrl, setBgUrl] = useState<string | null>(null)
+  /** 亮 / 暗主题（默认亮色，localStorage 持久化，首帧由 index.html 内联脚本写入） */
+  const [theme, setTheme] = useState<Theme>(initialTheme)
 
   // 防止 React StrictMode 开发模式下副作用执行两次导致重复欢迎语
   const bootedRef = useRef(false)
@@ -109,6 +118,9 @@ export default function ChatApp() {
   // 轮询回调里读取最新的面板开关状态（异步闭包不取旧值）
   const cabinetOpenRef = useRef(cabinetOpen)
   cabinetOpenRef.current = cabinetOpen
+  // 对话滚动容器与「贴在底部」标记（用户上翻阅读时不强拉到底）
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  const nearBottomRef = useRef(true)
 
   /** 当前流式请求的中止器：新消息进场时中止未完成的上一轮 */
   const streamAbortRef = useRef<AbortController | null>(null)
@@ -119,7 +131,7 @@ export default function ChatApp() {
     setMessages((prev) => [...prev, { id: nextId(), role: 'nolan', text, time: nowHHMM() }])
   }, [])
 
-  /** 拖入文件 → 上传 → 暂存为待发送附件（最多 3 个；失败如实播报原因） */
+  /** 拖入/选择文件 → 上传 → 暂存为待发送附件（最多 3 个；失败如实播报原因） */
   const handleAddFiles = useCallback(
     (files: FileList | File[]) => {
       if (exitedRef.current) return
@@ -190,6 +202,9 @@ export default function ChatApp() {
     stopAllAudio()
     stopSpeak()
 
+    // 自己发言时强制回到底部
+    nearBottomRef.current = true
+
     // 1. 插入用户消息（附件芯片随消息展示：文件名 + 字数）
     setMessages((prev) => [
       ...prev,
@@ -224,7 +239,7 @@ export default function ChatApp() {
       await sendChatStream(
         payload,
         {
-          // LLM 增量文本：字幕逐字出现（不等任何音频，感知延迟的第一刀）
+          // LLM 增量文本：逐字出现（不等任何音频，感知延迟的第一刀）
           onDelta: (piece) => {
             acc += piece
             patchReply(acc)
@@ -289,14 +304,14 @@ export default function ChatApp() {
       .catch(fallbackWelcome)
   }, [])
 
-  // 每 15 秒轮询到点提醒：逐条作为 Nolan 消息插入字幕（前置 ⏰ 以示闹钟），并按顺序播放合成语音
+  // 每 15 秒轮询到点提醒：逐条作为 Nolan 消息插入对话（前置 ⏰ 以示闹钟），并按顺序播放合成语音
   useEffect(() => {
     let cancelled = false
     const poll = async () => {
       try {
         const due = await getDueMessages()
         if (cancelled) return
-        // 字幕：闹钟消息前置 ⏰，在 NEGA 黑金界面中保持克制的醒目
+        // 对话流：闹钟消息前置 ⏰，克制醒目
         due.forEach((msg) => pushNolan(`⏰ ${msg.text}`))
         // 语音：收集非空 audio_url，用 ended 事件串联依次播放，避免叠音
         playInSequence(
@@ -314,7 +329,7 @@ export default function ChatApp() {
   }, [pushNolan])
 
   // 每 15 秒轮询网页背景：首轮延迟 5 秒，与上方 /api/due 轮询（挂载即发起）错开，避免后端瞬时双倍请求。
-  // 拿到非空 image_url 时更新背景图；为 null 时恢复纯黑底；请求失败静默保留当前背景。
+  // 拿到非空 image_url 时更新背景图（只铺对话区 + 主题色蒙层）；为 null 时恢复纯色底；请求失败静默保留当前背景。
   useEffect(() => {
     let cancelled = false
     let timer: number | undefined
@@ -339,7 +354,7 @@ export default function ChatApp() {
 
   // 每 5 秒轮询文件柜列表：发现 Nolan 后台新生成/更新的文件时——
   //   ① 文件柜按钮上亮红点角标（打开面板后清除）；
-  //   ② 以 Nolan 消息插入字幕条（与到点提醒同款机制，克制不突兀）。
+  //   ② 以 Nolan 消息插入对话流（与到点提醒同款机制，克制不突兀）。
   // 规则：
   //   - 首次拉取只建基线，不算"新增"（避免一打开页面就误报）；
   //   - 按 name+mtime 判定：名字没出现过、或同名但 mtime 变了，都算新文件；
@@ -399,7 +414,7 @@ export default function ChatApp() {
     }
   }, [pushNolan])
 
-  // 「声音测试」按钮（右上角 🔊）：浏览器 + 音箱双通道同时发声，验证发声链是否完好
+  // 「声音测试」按钮（头部 🔊）：浏览器 + 音箱双通道同时发声，验证发声链是否完好
   const handleSoundTest = useCallback(async () => {
     try {
       const data = await soundTest()
@@ -411,7 +426,7 @@ export default function ChatApp() {
     }
   }, [pushNolan])
 
-  // 「唤醒词」开关（右上角）：开启后服务端耳蜗常驻，说「诺兰」即回应；
+  // 「唤醒词」开关（头部）：开启后服务端耳蜗常驻，说「诺兰」即回应；
   // 状态落盘在后端，挂载时同步真实状态
   const handleWakeToggle = useCallback(async () => {
     try {
@@ -432,7 +447,7 @@ export default function ChatApp() {
   }, [])
 
   // 耳蜗开启时 2.5 秒轮询事件：
-  //   wake 事件 → 播报确认音 + 字幕提示（原有行为）；
+  //   wake 事件 → 播报确认音 + 消息提示（原有行为）；
   //   bargein 事件（P3 全双工）→ 主人打断了播报：立即停掉浏览器播报，
   //   把听到的指令原文作为用户消息自动发送（物理闭环：开口 → 静音 → 执行）
   useEffect(() => {
@@ -465,14 +480,32 @@ export default function ChatApp() {
     }
   }, [wakeOn, pushNolan, handleSend])
 
+  // 新消息进场时：若视口贴着底部则跟随滚动（用户上翻阅读时不打扰）
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el && nearBottomRef.current) el.scrollTop = el.scrollHeight
+  }, [messages])
+
+  /** 主题切换：写 data-theme（CSS 变量即时生效）+ localStorage 持久化 */
+  const handleToggleTheme = useCallback(() => {
+    setTheme((prev) => {
+      const next: Theme = prev === 'dark' ? 'light' : 'dark'
+      document.documentElement.dataset.theme = next
+      try {
+        localStorage.setItem(THEME_KEY, next)
+      } catch {
+        // 隐私模式等写入失败时仅本次会话生效
+      }
+      return next
+    })
+  }, [])
+
   // 声波模式：录音 > 等待回复 > 闲置呼吸
   const waveMode: WaveMode = recording ? 'recording' : busy ? 'busy' : 'idle'
 
   return (
-    // 根容器改为相对定位的三层结构：背景图层（z-0）→ 深色遮罩（z-0）→ 前景内容（z-10）
-    // bgUrl 为 null 时两层背景均以 opacity-0 隐藏，页面回到纯黑底，切换由 0.5s 过渡完成
     <div
-      className="relative h-screen overflow-hidden bg-[#0b0b0d] text-[#e8e0d0]"
+      className="flex h-screen flex-col overflow-hidden bg-[var(--bg-primary)] text-[var(--label-primary)]"
       onDragEnter={(e) => {
         if (!e.dataTransfer.types.includes('Files')) return
         e.preventDefault()
@@ -498,47 +531,128 @@ export default function ChatApp() {
     >
       {/* 拖入文件的全屏高亮：松开即交给 Nolan 阅读 */}
       {dragActive && (
-        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-2 border-dashed border-[#8a8578] bg-black/60">
-          <p className="text-sm font-light tracking-[0.3em] text-[#e8e0d0]">
+        <div
+          className="pointer-events-none absolute inset-0 z-[1100] flex items-center justify-center border-2 border-dashed"
+          style={{ borderColor: 'var(--separator)', background: 'var(--mask)' }}
+        >
+          <p className="rounded-[12px] bg-[var(--bg-primary)] px-4 py-2 text-[14px] leading-5 text-[var(--label-primary)]">
             松开，把文件交给 Nolan 阅读
           </p>
         </div>
       )}
-      {/* 背景图层：cover center 铺满，0.5s 淡入淡出 */}
-      <div
-        aria-hidden
-        className="absolute inset-0 z-0 bg-cover bg-center transition-opacity duration-500"
-        style={{
-          backgroundImage: bgUrl ? `url(${bgUrl})` : undefined,
-          opacity: bgUrl ? 1 : 0,
+
+      <NegaHeader
+        online={online}
+        exited={exited}
+        onMemory={handleMemory}
+        onReminders={handleReminders}
+        onHistory={() => setHistoryOpen(true)}
+        onSoundTest={handleSoundTest}
+        wakeOn={wakeOn}
+        onWakeToggle={handleWakeToggle}
+        onOpenCabinet={() => {
+          setCabinetHasNew(false) // 打开面板即清除未读红点
+          setCabinetOpen(true)
         }}
-      />
-      {/* 深色遮罩：压在背景图之上，保证 NOLAN 标题、声波、字幕、输入框清晰可读 */}
-      <div
-        aria-hidden
-        className={`absolute inset-0 z-0 bg-black/70 transition-opacity duration-500 ${
-          bgUrl ? 'opacity-100' : 'opacity-0'
-        }`}
+        cabinetHasNew={cabinetHasNew}
+        theme={theme}
+        onToggleTheme={handleToggleTheme}
       />
 
-      {/* 前景内容：抬升到 z-10，布局与原结构一致 */}
-      <div className="relative z-10 flex h-full flex-col overflow-hidden">
-        <NegaHeader
-          online={online}
-          exited={exited}
-          onMemory={handleMemory}
-          onReminders={handleReminders}
-          onHistory={() => setHistoryOpen(true)}
-          onSoundTest={handleSoundTest}
-          wakeOn={wakeOn}
-          onWakeToggle={handleWakeToggle}
+      {/* 对话区：背景图只铺这一层（叠主题色蒙层），头部 / 输入区保持净面 */}
+      <main className="relative min-h-0 flex-1">
+        {/* 背景图层：cover center 铺满对话区，300ms 淡入淡出 */}
+        <div
+          aria-hidden
+          className="absolute inset-0 bg-cover bg-center transition-opacity duration-300"
+          style={{
+            backgroundImage: bgUrl ? `url(${bgUrl})` : undefined,
+            opacity: bgUrl ? 1 : 0,
+          }}
+        />
+        {/* 主题色蒙层：亮 rgba(255,255,255,0.88) / 暗 rgba(18,18,18,0.88)，保证文字可读 */}
+        <div
+          aria-hidden
+          className="absolute inset-0 transition-opacity duration-300"
+          style={{ background: 'var(--chat-bg-overlay)', opacity: bgUrl ? 1 : 0 }}
         />
 
-        {/* 中央：声波 + 状态提示 + 字幕 */}
-        <main className="flex min-h-0 flex-1 flex-col items-center justify-center px-4">
-          {/* 服务端录音后浏览器不再有真实波形流，stream 恒为 null（录音态由 mode='recording' 驱动模拟律动） */}
-          <WaveCanvas mode={waveMode} stream={null} />
-          <p className="mt-4 h-4 text-[11px] font-light tracking-[0.25em] text-[#4a4a50]">
+        {/* 消息列表：居中容器 max-w 800px，内容 768px，左右 inset 16px */}
+        <div
+          ref={scrollRef}
+          className="kimi-scroll relative h-full overflow-y-auto"
+          onScroll={(e) => {
+            const el = e.currentTarget
+            nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+          }}
+        >
+          <div className="mx-auto max-w-[800px] px-4 pb-8 pt-6">
+            <div className="mx-auto flex max-w-[768px] flex-col">
+              {messages.map((msg, i) => {
+                const isUser = msg.role === 'user'
+                // 组间距：不同发言人 36px；同发言人连续消息 8px
+                const gap = i === 0 ? '' : messages[i - 1].role === msg.role ? 'mt-2' : 'mt-9'
+                return (
+                  <div key={msg.id} className={`flex ${gap} ${isUser ? 'justify-end' : 'justify-start'}`}>
+                    {isUser ? (
+                      /* 用户：右对齐气泡，max-w 80%，radius 12px，bubbleBlue（亮）/ #292929（暗） */
+                      <div className="flex max-w-[80%] flex-col items-end">
+                        <div className="whitespace-pre-wrap rounded-[12px] bg-[var(--bubble-user-bg)] px-3.5 py-2.5 text-[16px] leading-6 text-[var(--bubble-user-text)]">
+                          {msg.text}
+                        </div>
+                        {/* 附件芯片：随消息发送的文件（正文已拼入 payload） */}
+                        {msg.attachments && msg.attachments.length > 0 && (
+                          <div className="mt-1 flex flex-wrap justify-end gap-1">
+                            {msg.attachments.map((a, ai) => (
+                              <span
+                                key={`${msg.id}-att-${ai}`}
+                                title={a.note || undefined}
+                                className="rounded-[8px] bg-[var(--fill-f1)] px-2 py-0.5 text-[12px] leading-[18px] text-[var(--label-tertiary)]"
+                              >
+                                📎 {a.name} · {a.chars} 字{a.kind ? ` · ${a.kind}` : ''}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        <span className="mt-1 text-[12px] leading-[18px] text-[var(--label-tertiary)]">
+                          {msg.time}
+                        </span>
+                      </div>
+                    ) : (
+                      /* Nolan：左对齐无气泡，通栏 768px 纯文本排版 */
+                      <div className="flex w-full flex-col">
+                        <p
+                          className={`whitespace-pre-wrap text-[16px] leading-6 ${
+                            msg.pending ? 'text-[var(--label-tertiary)]' : 'text-[var(--label-primary)]'
+                          }`}
+                        >
+                          {msg.text}
+                        </p>
+                        <span className="mt-1 text-[12px] leading-[18px] text-[var(--label-tertiary)]">
+                          Nolan · {msg.time}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+              {messages.length === 0 && (
+                <p className="py-16 text-center text-[14px] leading-5 text-[var(--label-tertiary)]">
+                  …
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      </main>
+
+      {/* 声波条 + 状态提示：录音红色律动 / 思考快速律动 / 闲置慢呼吸 */}
+      <div className="shrink-0 px-4">
+        <div className="mx-auto max-w-[768px]">
+          <div className="h-10">
+            <WaveCanvas mode={waveMode} stream={null} />
+          </div>
+          <p className="h-4 text-center text-[12px] leading-[18px] text-[var(--label-tertiary)]">
             {exited
               ? '会话已结束'
               : recording
@@ -549,32 +663,27 @@ export default function ChatApp() {
                     ? ''
                     : '后端离线'}
           </p>
-          <SubtitleBar messages={messages} onOpen={() => setHistoryOpen(true)} />
-        </main>
-
-        <NegaInput
-          disabled={exited}
-          onSend={handleSend}
-          onRecordingChange={setRecording}
-          onStatus={pushNolan}
-          attachments={attachments.map((a) => ({ id: a.id, name: a.name, chars: a.chars, kind: a.kind, note: a.note }))}
-          onRemoveAttachment={handleRemoveAttachment}
-          cabinetHasNew={cabinetHasNew}
-          onOpenCabinet={() => {
-            setCabinetHasNew(false) // 打开面板即清除未读红点
-            setCabinetOpen(true)
-          }}
-        />
-
-        {historyOpen && <HistoryOverlay messages={messages} onClose={() => setHistoryOpen(false)} />}
-
-        {cabinetOpen && <FileCabinet onClose={() => setCabinetOpen(false)} />}
-
-        {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
-        <span className="pointer-events-none absolute bottom-2 right-3 text-[10px] font-light tracking-widest text-[#3a3a40]">
-          build 0805-2
-        </span>
+        </div>
       </div>
+
+      <NegaInput
+        disabled={exited}
+        onSend={handleSend}
+        onRecordingChange={setRecording}
+        onStatus={pushNolan}
+        attachments={attachments.map((a) => ({ id: a.id, name: a.name, chars: a.chars, kind: a.kind, note: a.note }))}
+        onRemoveAttachment={handleRemoveAttachment}
+        onAddFiles={handleAddFiles}
+      />
+
+      {historyOpen && <HistoryOverlay messages={messages} onClose={() => setHistoryOpen(false)} />}
+
+      {cabinetOpen && <FileCabinet onClose={() => setCabinetOpen(false)} />}
+
+      {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
+      <span className="pointer-events-none absolute bottom-1 right-3 text-[10px] leading-[14px] tracking-widest text-[var(--label-quaternary)]">
+        build 0805-2
+      </span>
     </div>
   )
 }

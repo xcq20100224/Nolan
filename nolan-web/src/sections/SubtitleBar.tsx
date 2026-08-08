@@ -1,7 +1,7 @@
-// NEGA 字幕区：声波下方显示最近一轮对话
-//   你   —— 淡灰小字右对齐，单行截断
-//   Nolan —— 暖白正常字居中，最多两行，超出省略
-// 点击字幕区展开完整聊天记录浮层
+// 字幕条（保留组件，当前未挂载）：
+// 新版 Kimi 对话区改为完整消息流（用户气泡 / Nolan 通栏排版），
+// 「最近一轮对话」的展示角色已由消息流接管，「点击展开完整记录」由头部历史按钮接管。
+// 组件保留并已完成双主题适配（全部颜色吃 CSS 变量），需要字幕形态时可直接挂回。
 import type { Message } from '@/types/message'
 
 interface SubtitleBarProps {
@@ -23,22 +23,24 @@ export default function SubtitleBar({ messages, onOpen }: SubtitleBarProps) {
       title="点击展开完整对话记录"
     >
       {lastUser && (
-        <p className="truncate text-right text-xs font-light text-[#6b6b70]">
+        <p className="truncate text-right text-[12px] leading-[18px] text-[var(--label-tertiary)]">
           你：{lastUser.text}
         </p>
       )}
       {lastNolan && (
         <p
-          className={`text-base leading-relaxed sm:text-lg ${
+          className={`line-clamp-2 text-[16px] leading-6 ${
             lastNolan.pending
-              ? 'italic text-[#6b6b70]'
-              : 'text-[#e8e0d0]'
-          } line-clamp-2`}
+              ? 'text-[var(--label-tertiary)]'
+              : 'text-[var(--label-primary)]'
+          }`}
         >
           {lastNolan.text}
         </p>
       )}
-      {!lastNolan && !lastUser && <p className="text-xs text-[#3f3f45]">…</p>}
+      {!lastNolan && !lastUser && (
+        <p className="text-[12px] leading-[18px] text-[var(--label-quaternary)]">…</p>
+      )}
     </button>
   )
 }
