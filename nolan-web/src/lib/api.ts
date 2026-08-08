@@ -105,6 +105,8 @@ export interface StreamChatHandlers {
   onDone?: (d: { reply: string; degraded?: boolean }) => void
   /** 回退整段：与 /api/chat 响应完全同形（规则意图/工具调用/流式早期失败） */
   onFallback?: (d: { reply: string; audio_url: string | null; exit?: boolean }) => void
+  /** 大项目实时进度：step 为步骤描述，i/n 可选（第 i 步 / 共 n 步） */
+  onProgress?: (p: { step: string; i?: number; n?: number }) => void
 }
 
 /**
@@ -164,6 +166,13 @@ export async function sendChatStream(
               reply: String(ev.reply ?? ''),
               audio_url: typeof ev.audio_url === 'string' ? ev.audio_url : null,
               exit: ev.exit === true,
+            })
+          } else if (ev.type === 'progress') {
+            // 大项目进度推送：step 必有，i/n 可选（非数字则省略）
+            handlers.onProgress?.({
+              step: String(ev.step ?? ''),
+              i: typeof ev.i === 'number' ? ev.i : undefined,
+              n: typeof ev.n === 'number' ? ev.n : undefined,
             })
           }
         } catch {

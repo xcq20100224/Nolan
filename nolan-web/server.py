@@ -32,6 +32,9 @@ API 契约（一字不差）：
                            {"type":"sentence","text":...,"audio_url":...}  一句合成完毕（audio_url 可空）
                            {"type":"done","reply":...,"degraded"?:true} 全量收尾
                            {"type":"fallback","reply","audio_url","exit"?} 回退整段
+                           {"type":"progress","step":...,"i"?:...,"n"?:...} 长任务进度
+                         progress 事件只在回退整段执行工具（如 make_ppt）期间穿插推送，
+                         i/n 为可选计数（无计数时省略）；fallback/done 等既有事件不变。
                          回退契约：规则意图（提醒/记忆/工具/复合/退出/待确认）与流式
                          早期失败一律回退到与 /api/chat 完全相同的整段路径（brain.think +
                          synth_for），以 fallback 事件下发——对话绝不因流式化而挂掉。
@@ -124,12 +127,16 @@ try:
     import speak_filter as _speak_filter  # noqa: E402  Gap8 说话卫生（剥离代码/JSON）
 except ImportError:
     _speak_filter = None
+try:
+    import progress as _progress  # noqa: E402  通用进度总线（jarvis/progress.py）
+except Exception:
+    _progress = None
 
 # == 后端代码版本标识 ==
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-07-displayfix"
+_VERSION = "2026-08-08-progress"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -1669,6 +1676,54 @@ def _tts_stream_producer(sentence_q: "queue.Queue", event_q: "queue.Queue",
     event_q.put(("tts_done", None))
 
 
+def _fallback_with_progress(handler, user_text: str) -> None:
+    """整段回退（fallback 事件）+ 工具执行进度实时推送（progress 事件）。
+
+    为什么线程化：make_ppt 等大项目执行约 2 分钟，若在处理器线程同步执行
+    _chat（brain.think → hands.execute 全链），SSE 长时间静默、前端只能看到
+    一句话然后空等。改为：
+      工作线程   —— 跑 _chat 整段路径；执行期间 ppt_maker 等模块往
+                    jarvis/progress 进度总线 emit 埋点事件；
+      处理器线程 —— 每 0.3 秒 drain 一次总线，把进度事件实时写进 SSE；
+                    工作线程完成后照常下发 fallback 事件（契约不变）。
+    单一写者原则不变：仍然只有处理器线程碰 wfile，杜绝交错写帧。
+    模块级函数（非 NolanHandler 方法）：只依赖 handler._sse_send 表面，
+    与 _llm_stream_worker / _tts_stream_producer 同一可测形态。
+    """
+    if _progress is None:
+        # 进度总线缺席：行为与接线前完全一致（同步整段回退）
+        handler._sse_send({"type": "fallback", **_chat(user_text)})
+        return
+    _progress.begin()   # 订阅开始：ppt_maker 等的 emit 从此进队列
+    box = {}
+    done = threading.Event()
+
+    def _run():
+        try:
+            box["result"] = _chat(user_text)
+        except Exception as e:
+            # 异常装箱上交：由处理器线程走 _handle_chat_stream 既有 error 事件路径
+            box["error"] = e
+        finally:
+            done.set()  # 任何退出路径都置位，防处理器线程干等
+
+    threading.Thread(target=_run, daemon=True,
+                     name="chat-fallback-exec").start()
+    try:
+        while not done.wait(0.3):
+            for ev in _progress.drain():
+                handler._sse_send({"type": "progress", **ev})
+        # 收尾排空：工作线程已完成，最后一批进度必须先于 fallback 出场
+        for ev in _progress.drain():
+            handler._sse_send({"type": "progress", **ev})
+        if "error" in box:
+            raise box["error"]
+        handler._sse_send({"type": "fallback",
+                           **(box.get("result") or {"reply": "", "audio_url": None})})
+    finally:
+        _progress.end()   # 任何路径（含客户端断开）都退订，不泄漏到下一轮
+
+
 # == 条件触发后台检查（P4 · 主动性进阶）==
 # 为什么独立线程：条件评估要走 LLM 联网搜索（秒级），放进 /api/due 会挂住
 # 15 秒轮询、占满浏览器连接池（此前 TTS 同步合成挂死全链路的教训）。
@@ -1980,10 +2035,11 @@ class NolanHandler(BaseHTTPRequestHandler):
         cancel = threading.Event()
         try:
             # 分流：空文本 / 规则意图 / 无大模型配置 → 与 /api/chat 完全相同的整段路径，
-            # 以 fallback 事件下发（前端按普通回复处理，行为一字不差）
+            # 以 fallback 事件下发（前端按普通回复处理，行为一字不差）；
+            # 工具执行线程化：执行期间进度事件实时推送（make_ppt 不再静默空等）
             if (not user_text or _stream_hit_rule_intent(user_text)
                     or not _stream_llm_ready()):
-                self._sse_send({"type": "fallback", **_chat(user_text)})
+                _fallback_with_progress(self, user_text)
                 return
 
             # 新消息进场先打断音箱正在进行的播报（与 _chat 同一语义）
@@ -2019,9 +2075,10 @@ class NolanHandler(BaseHTTPRequestHandler):
                                     "audio_url": payload[1]})
                 elif kind == "abort":
                     # 流式早期失败/工具 JSON/空回复：整段回退（此刻无任何内容出场，
-                    # _chat 重走 brain.think + synth_for，不会重复发声）
+                    # _chat 重走 brain.think + synth_for，不会重复发声）；
+                    # 工具执行线程化：执行期间进度事件实时推送
                     cancel.set()
-                    self._sse_send({"type": "fallback", **_chat(user_text)})
+                    _fallback_with_progress(self, user_text)
                     return
                 elif kind == "llm_done":
                     reply = payload
@@ -2178,7 +2235,16 @@ class NolanHandler(BaseHTTPRequestHandler):
                 except ValueError as e:
                     self._send_error_json(400, str(e))
                     return
-                result = _chat(str(data.get("text", "") or ""))
+                # 进度总线卫生：本路径不接进度（行为同现状），但执行期间
+                # ppt_maker 等会 emit——begin/end 包住执行段，保证事件
+                # 不残留、不泄漏到下一轮流式请求
+                if _progress is not None:
+                    _progress.begin()
+                try:
+                    result = _chat(str(data.get("text", "") or ""))
+                finally:
+                    if _progress is not None:
+                        _progress.end()
                 self._send_json(200, result)
             elif path == "/api/wake/toggle":
                 # 唤醒词开关：{"enabled": true|false}，状态落盘重启保留

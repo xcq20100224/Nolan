@@ -1,6 +1,7 @@
 // Nolan Kimi 风格主界面：56px 头部 + 居中对话区（用户气泡 / Nolan 通栏排版）+ 声波条 + 底部输入区
 // 交互逻辑与 API 契约保持原样：/api/health、/api/chat 流式、/api/due 轮询、/api/files_list 红点、exit 禁用
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Check, ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
 import NegaHeader from '@/sections/NegaHeader'
 import type { Theme } from '@/sections/NegaHeader'
 import WaveCanvas from '@/sections/WaveCanvas'
@@ -9,6 +10,7 @@ import NegaInput from '@/sections/NegaInput'
 import FileCabinet from '@/sections/FileCabinet'
 import type { WaveMode } from '@/sections/WaveCanvas'
 import type { Message } from '@/types/message'
+import { MarkdownContent } from '@/lib/markdown'
 import { checkHealth, sendChatStream, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, enqueueAudio, stopAllAudio, stopSpeak, soundTest, getBackground, getFilesList, clientLog, uploadFile } from '@/lib/api'
 
 /** 待发送附件（芯片展示 + 发送时拼 payload 的全量文本） */
@@ -177,6 +179,13 @@ export default function ChatApp() {
     setAttachments(attachmentsRef.current)
   }, [])
 
+  /** 进度区折叠/展开切换（完成态下默认收起，点击展开查看全部步骤） */
+  const toggleProgress = useCallback((id: string) => {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, progressExpanded: !m.progressExpanded } : m)),
+    )
+  }, [])
+
   /** 发送用户消息并请求 brain 回复（句级流式：LLM 边想、TTS 边产、喇叭边播） */
   const handleSend = useCallback(async (text: string) => {
     if (exitedRef.current) return
@@ -235,6 +244,25 @@ export default function ChatApp() {
           m.id === placeholderId ? { ...m, text: replyText, time: nowHHMM(), pending: false } : m,
         ),
       )
+    // 大项目进度：新步骤到来时上一条转完成态，新步骤为当前进行项（旋转 Loader）
+    const appendProgress = (p: { step: string; i?: number; n?: number }) =>
+      setMessages((prev) =>
+        prev.map((m) => {
+          if (m.id !== placeholderId) return m
+          const steps = (m.progress ?? []).map((s) => ({ ...s, done: true }))
+          steps.push({ step: p.step, i: p.i, n: p.n, done: false })
+          return { ...m, progress: steps }
+        }),
+      )
+    // 工具完成（done/fallback/出错收尾）：全部转完成态并折叠为一行「已完成 N 步 · 展开」
+    const finalizeProgress = () =>
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === placeholderId && m.progress && !m.progressDone
+            ? { ...m, progress: m.progress.map((s) => ({ ...s, done: true })), progressDone: true }
+            : m,
+        ),
+      )
     try {
       await sendChatStream(
         payload,
@@ -254,17 +282,21 @@ export default function ChatApp() {
               acc = d.reply
               patchReply(d.reply)
             }
+            finalizeProgress()
           },
           // 回退整段：规则意图/工具调用/流式失败——行为与旧 /api/chat 完全一致
           onFallback: (d) => {
             acc = d.reply
             patchReply(d.reply)
+            finalizeProgress()
             if (d.audio_url) playAudio(d.audio_url)
             if (d.exit) {
               exitedRef.current = true
               setExited(true)
             }
           },
+          // 大项目实时进度：步骤逐条挂到当前占位消息上方
+          onProgress: appendProgress,
         },
         ctrl.signal,
       )
@@ -272,6 +304,7 @@ export default function ChatApp() {
       // 被自己打断（新一轮已接管）：静默，不覆盖新消息
       if (ctrl.signal.aborted) return
       patchReply('先生，后端暂时无响应，请稍后再试。')
+      finalizeProgress()
     } finally {
       // 只有当前这一轮仍是最新轮时才收尾 busy（防老轮 finally 抢掉新轮的律动）
       if (streamAbortRef.current === ctrl) setBusy(false)
@@ -283,7 +316,7 @@ export default function ChatApp() {
     if (bootedRef.current) return
     bootedRef.current = true
 
-    clientLog('页面加载 build 0805-2')
+    clientLog('页面加载 build 0805-3')
     checkHealth().then((ok) => {
       clientLog(`健康检查: ${ok}`)
       setOnline(ok)
@@ -595,7 +628,7 @@ export default function ChatApp() {
                 return (
                   <div key={msg.id} className={`flex ${gap} ${isUser ? 'justify-end' : 'justify-start'}`}>
                     {isUser ? (
-                      /* 用户：右对齐气泡，max-w 80%，radius 12px，bubbleBlue（亮）/ #292929（暗） */
+                      /* 用户：右对齐气泡，max-w 80%，radius 12px，黑底白字（亮）/ 白底黑字（暗） */
                       <div className="flex max-w-[80%] flex-col items-end">
                         <div className="whitespace-pre-wrap rounded-[12px] bg-[var(--bubble-user-bg)] px-3.5 py-2.5 text-[16px] leading-6 text-[var(--bubble-user-text)]">
                           {msg.text}
@@ -619,15 +652,70 @@ export default function ChatApp() {
                         </span>
                       </div>
                     ) : (
-                      /* Nolan：左对齐无气泡，通栏 768px 纯文本排版 */
+                      /* Nolan：左对齐无气泡，通栏 768px；markdown 轻量排版（粗体/列表/标题/代码块） */
                       <div className="flex w-full flex-col">
-                        <p
-                          className={`whitespace-pre-wrap text-[16px] leading-6 ${
-                            msg.pending ? 'text-[var(--label-tertiary)]' : 'text-[var(--label-primary)]'
-                          }`}
-                        >
-                          {msg.text}
-                        </p>
+                        {/* 大项目进度步骤区：无气泡无卡片，12px tertiary，像「思考过程」一样安静。
+                            无 progress 事件的普通对话此处不渲染任何残留。 */}
+                        {msg.progress && msg.progress.length > 0 && (
+                          <div className="mb-1.5 flex flex-col">
+                            {msg.progressDone ? (
+                              /* 完成态：默认折叠为一行，点击展开/收起全部步骤 */
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => toggleProgress(msg.id)}
+                                  className="flex items-center gap-1 self-start text-[12px] leading-[18px] text-[var(--label-tertiary)] transition-colors hover:text-[var(--label-secondary)]"
+                                >
+                                  {msg.progressExpanded ? (
+                                    <ChevronDown className="h-3 w-3 shrink-0" />
+                                  ) : (
+                                    <ChevronRight className="h-3 w-3 shrink-0" />
+                                  )}
+                                  已完成 {msg.progress.length} 步 · {msg.progressExpanded ? '收起' : '展开'}
+                                </button>
+                                {msg.progressExpanded && (
+                                  <div className="mt-1 flex flex-col gap-0.5">
+                                    {msg.progress.map((s, si) => (
+                                      <div
+                                        key={`${msg.id}-p-${si}`}
+                                        className="flex items-center gap-1.5 text-[12px] leading-[18px] text-[var(--label-tertiary)]"
+                                      >
+                                        <Check className="h-3 w-3 shrink-0" />
+                                        <span>{s.step}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </>
+                            ) : (
+                              /* 进行态：已完成步骤前置 ✓，当前步骤前置旋转 Loader */
+                              <div className="flex flex-col gap-0.5">
+                                {msg.progress.map((s, si) => (
+                                  <div
+                                    key={`${msg.id}-p-${si}`}
+                                    className="flex items-center gap-1.5 text-[12px] leading-[18px] text-[var(--label-tertiary)]"
+                                  >
+                                    {s.done ? (
+                                      <Check className="h-3 w-3 shrink-0" />
+                                    ) : (
+                                      <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                                    )}
+                                    <span>{s.step}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {msg.pending ? (
+                          <p className="whitespace-pre-wrap text-[16px] leading-6 text-[var(--label-tertiary)]">
+                            {msg.text}
+                          </p>
+                        ) : (
+                          <div className="text-[16px] leading-6 text-[var(--label-primary)]">
+                            <MarkdownContent text={msg.text} />
+                          </div>
+                        )}
                         <span className="mt-1 text-[12px] leading-[18px] text-[var(--label-tertiary)]">
                           Nolan · {msg.time}
                         </span>
@@ -682,7 +770,7 @@ export default function ChatApp() {
 
       {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
       <span className="pointer-events-none absolute bottom-1 right-3 text-[10px] leading-[14px] tracking-widest text-[var(--label-quaternary)]">
-        build 0805-2
+        build 0805-3
       </span>
     </div>
   )

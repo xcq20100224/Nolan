@@ -14,8 +14,8 @@
        --label-quaternary  ← color.labels.quaternary
        --separator         ← color.separator.s1
        --fill-f1 / --fill-f2 ← color.fills.f1 / f2
-       --bubble-user-bg    ← color.others.bubbleBlue（暗色用 background.tertiary #292929）
-       --bubble-user-text  ← color.always.white / always.whiteSecondary
+       --bubble-user-bg    ← 黑白配色：亮 = btn-primary 同款 rgba(0,0,0,0.9)，暗 = rgba(255,255,255,0.84)
+       --bubble-user-text  ← 亮 = always.white，暗 = labels.primary 反色 rgba(0,0,0,0.9)
        --btn-primary-bg    ← color.brand.kimiDark
        --btn-primary-text  ← color.always.white / labels.primary 反色
        --kimi-blue         ← color.status.kimiBlue
@@ -39,7 +39,7 @@
     --separator: rgba(0, 0, 0, 0.13);
     --fill-f1: rgba(0, 0, 0, 0.03);
     --fill-f2: rgba(0, 0, 0, 0.05);
-    --bubble-user-bg: #1783ff;
+    --bubble-user-bg: rgba(0, 0, 0, 0.9);
     --bubble-user-text: #ffffff;
     --btn-primary-bg: rgba(0, 0, 0, 0.9);
     --btn-primary-text: #ffffff;
@@ -65,8 +65,8 @@
     --separator: rgba(255, 255, 255, 0.12);
     --fill-f1: rgba(255, 255, 255, 0.05);
     --fill-f2: rgba(255, 255, 255, 0.1);
-    --bubble-user-bg: #292929;
-    --bubble-user-text: rgba(255, 255, 255, 0.84);
+    --bubble-user-bg: rgba(255, 255, 255, 0.84);
+    --bubble-user-text: rgba(0, 0, 0, 0.9);
     --btn-primary-bg: rgba(255, 255, 255, 0.84);
     --btn-primary-text: rgba(0, 0, 0, 0.9);
     --kimi-blue: #1783ff;

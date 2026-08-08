@@ -59,6 +59,23 @@ try:
 except Exception:
     _research_topic = None
 
+# ---- 进度总线（实时进度推送）：防御式导入。缺席时 _emit 为空操作，
+#      生成管线行为与接入前完全一致；任何异常静默，绝不影响主流程。
+try:
+    import progress as _progress
+except Exception:
+    _progress = None
+
+
+def _emit(step: str, i=None, n=None) -> None:
+    """往进度总线发一条进度（人话短文案 ≤30 字；任何失败静默）。"""
+    if _progress is None:
+        return
+    try:
+        _progress.emit(step, i, n)
+    except Exception:
+        pass
+
 MODULE_DIR = Path(__file__).resolve().parent
 FILES_DIR = MODULE_DIR / "files"
 
@@ -806,6 +823,10 @@ def _gen_page(topic: str, deck_title: str, style: str, item: dict,
     candidates = []   # 历次有效候选：(content, note, 是否达标)
     feedback = ""
     for attempt in range(1 + MAX_REWRITES):
+        if attempt > 0:
+            # 质量闸未过、进入重写：让前端看到「还在打磨」而不是卡死
+            _emit(f"第 {idx}/{total} 页没过质量闸，重写第 {attempt} 次",
+                  idx, total)
         this_prompt = prompt if attempt == 0 else _PAGE_REWRITE_PROMPT.format(
             feedback=feedback, original_prompt=prompt)
         try:
@@ -1002,21 +1023,29 @@ def _attach_images(deck: dict, outline: dict, enabled: bool = True) -> int:
         seq = 0
         # 封面背景图
         cover_prompt = str(outline.get("cover_image_prompt") or "").strip()
+        # 内容页配图候选先算出来：进度总线需要「第 j/M 张」的总数 M
+        cands = []
+        for item, pg in zip(outline["pages"], deck["pages"]):
+            prompt = str(item.get("image_prompt") or "").strip()
+            if prompt and pg["layout"] == "bullets":
+                cands.append((pg, prompt))
+        todo = cands[:MAX_IMAGE_PAGES]
+        total_img = (1 if cover_prompt else 0) + len(todo)
+        j = 0
         if cover_prompt:
             seq += 1
+            j += 1
+            _emit(f"正在生成配图 {j}/{total_img}：封面", j, total_img)
             path = _gen_one_image(cover_prompt, base, key, assets_dir, seq,
                                   size="1344x768")  # 近 16:9，封面铺屏不形变
             if path:
                 deck["cover_image"] = path
                 made += 1
         # 内容页配图：zip 大纲与契约页（同序），非 bullets 页的 image_prompt 静默丢弃
-        cands = []
-        for item, pg in zip(outline["pages"], deck["pages"]):
-            prompt = str(item.get("image_prompt") or "").strip()
-            if prompt and pg["layout"] == "bullets":
-                cands.append((pg, prompt))
-        for pg, prompt in cands[:MAX_IMAGE_PAGES]:
+        for pg, prompt in todo:
             seq += 1
+            j += 1
+            _emit(f"正在生成配图 {j}/{total_img}", j, total_img)
             path = _gen_one_image(prompt, base, key, assets_dir, seq)
             if path:
                 pg["image"] = path
@@ -1263,22 +1292,29 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
     #      大纲与精写自动降级为纯模型记忆，行为与接入前一致）
     research = ""
     if with_research and _research_topic is not None:
+        _emit("正在联网查资料…")
         try:
             research = _research_topic(topic) or ""
         except Exception:
             research = ""
+        _emit(f"资料就绪（{len(research)} 字）" if research
+              else "没查到资料，凭储备来写")
     stats["research_chars"] = len(research)
 
     # ---- 阶段 1：大纲（失败即整单失败，没有大纲就没有弹药）
+    _emit("正在设计大纲…")
     outline, err = _gen_outline(topic, pages, style, caller, research)
     if outline is None:
         return {"ok": False, "error": err}
+    _emit(f"大纲好了，共 {len(outline['pages'])} 页，逐页精写")
 
     # ---- 阶段 2：逐页精写（串行；单页失败只影响单页，兜底页顶上）
     deck_pages = outline["pages"]
     titles = [p["page_title"] for p in deck_pages]
     contents = []
     for i, item in enumerate(deck_pages):
+        _emit(f"正在精写第 {i + 1}/{len(deck_pages)} 页："
+              f"{item['page_title'][:12]}", i + 1, len(deck_pages))
         prev_t = titles[i - 1] if i > 0 else "（封面）"
         next_t = titles[i + 1] if i + 1 < len(titles) else "（结束页）"
         page = _gen_page(topic, outline["title"], style, item,
@@ -1301,6 +1337,7 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
 
     try:
         out_path = _alloc_path(topic)
+        _emit("正在排版渲染…")
         _build_pptx(deck, style, out_path)
     except Exception as e:
         return {"ok": False, "error": f"PPT 文件生成失败：{e}"}
@@ -1318,6 +1355,7 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
     except Exception:
         pass
 
+    _emit("PPT 做好了，存档完成")
     return {
         "ok": True,
         "path": str(out_path.resolve()),
