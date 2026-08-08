@@ -14,7 +14,7 @@ const js = ts.transpileModule(src, {
 const m = new Module('markdown.tsx', module)
 m.paths = module.paths
 m._compile(js, path.join(__dirname, 'markdown.tsx'))
-const { parseMarkdown, parseInline } = m.exports
+const { parseMarkdown, parseInline, normalizeStructure } = m.exports
 
 let passed = 0
 let failed = 0
@@ -104,6 +104,26 @@ check('段落与换行', parseMarkdown('第一行\n第二行\n\n第二段'), [
 check('纯文本', parseMarkdown('先生，Nolan 在线，请讲。'), [
   { t: 'para', lines: [[{ t: 'text', s: '先生，Nolan 在线，请讲。' }]] },
 ])
+
+// 9. 结构规范化：单行挤在一起的「--- **短标题** 内容」断行成多段
+check(
+  '伪标题断行（截图病例）',
+  normalizeStructure('先生，以下是总结。--- **官僚主义概述** 官僚主义是一种现象。**历史源流** 官僚一词源自法语。'),
+  '先生，以下是总结。\n\n**官僚主义概述**\n官僚主义是一种现象。\n\n**历史源流**\n官僚一词源自法语。',
+)
+check('不误伤行内粗体', normalizeStructure('这是**重点**内容，请注意。'), '这是**重点**内容，请注意。')
+check(
+  '规范化后解析出粗体 lead-in',
+  parseMarkdown(normalizeStructure('总结。**概述** 内容。')),
+  [
+    { t: 'para', lines: [[{ t: 'text', s: '总结。' }]] },
+    {
+      t: 'para',
+      lines: [[{ t: 'bold', s: '概述' }], [{ t: 'text', s: '内容。' }]],
+    },
+  ],
+)
+check('代码围栏内不规范化', normalizeStructure('```\na---b\n```'), '```\na---b\n```')
 
 console.log(`\n${passed} passed, ${failed} failed`)
 process.exit(failed === 0 ? 0 : 1)

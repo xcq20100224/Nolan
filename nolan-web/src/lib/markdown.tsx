@@ -41,6 +41,25 @@ export function parseInline(line: string): InlineToken[] {
 const RE_UL = /^[-*]\s+/
 const RE_OL = /^\d+\.\s+/
 
+/**
+ * 结构规范化：模型有时把「--- **短标题** 内容。**短标题2** 内容2」挤在一行。
+ * 规则（保守，只在证据充分时动刀）：
+ *   1) `---` 分隔符 → 换行；
+ *   2) 句末标点（。！？；）后紧跟的「**短标题**」（≤20 字、内部无句号）→ 独立成行。
+ * 不误伤：「这是**重点**内容」（前字非句末标点）不动；代码围栏内不动。
+ */
+export function normalizeStructure(src: string): string {
+  const parts = src.split(/(```[\s\S]*?(?:```|$))/)
+  return parts
+    .map((p, idx) => {
+      if (idx % 2 === 1) return p // 代码围栏段原样保留
+      return p
+        .replace(/\s*-{3,}\s*/g, '\n\n')
+        .replace(/(^|[。！？；])\s*\*\*([^*\n。]{1,20})\*\*\s*/g, '$1\n\n**$2**\n')
+    })
+    .join('')
+}
+
 /** 块级解析：逐行扫描，围栏代码块优先，其次标题 / 列表，最后段落（空行分段） */
 export function parseMarkdown(src: string): Block[] {
   const lines = src.split('\n')
@@ -156,10 +175,21 @@ function isPlain(blocks: Block[]): boolean {
  * 流式期间只有正在增长的最后一条消息会重复解析（每 delta 一次，可接受）。
  */
 export const MarkdownContent = memo(function MarkdownContent({ text }: { text: string }) {
-  const blocks = parseMarkdown(text)
+  const blocks = parseMarkdown(normalizeStructure(text))
   if (isPlain(blocks)) {
-    // 纯文本：保持旧版 pre-wrap 观感
-    return <span className="whitespace-pre-wrap">{text}</span>
+    // 纯文本：保持旧版 pre-wrap 观感，但仍渲染行内标记（**粗体** 等不得原样露出）
+    const para = blocks[0]
+    if (!para || para.t !== 'para') return <span className="whitespace-pre-wrap">{text}</span>
+    return (
+      <span className="whitespace-pre-wrap">
+        {para.lines.map((line, li) => (
+          <span key={li}>
+            {li > 0 && <br />}
+            {renderInline(line, `plain-${li}`)}
+          </span>
+        ))}
+      </span>
+    )
   }
   return (
     <div className="flex flex-col">
