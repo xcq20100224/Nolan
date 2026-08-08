@@ -45,6 +45,13 @@ try:
 except Exception:  # noqa: BLE001
     _wechat_send = None
 
+# PPT 对话式编辑（说改就改）：同为防御式降级——
+# 模块缺席时 edit_ppt 工具仍注册，调用时礼貌说明不可用。
+try:
+    import ppt_editor as _ppt_editor
+except Exception:  # noqa: BLE001
+    _ppt_editor = None
+
 # ---------------------------------------------------------------------------
 # 常量与边界
 # ---------------------------------------------------------------------------
@@ -1388,6 +1395,21 @@ def _make_ppt(topic: str, pages: int = 8, style: str = "工作汇报") -> str:
     )
 
 
+def _edit_ppt(file_name: str, instruction: str) -> str:
+    """
+    PPT 对话式修改（说改就改）：按自然语言指令改文件柜里已生成的 PPT，
+    重写内容/换版式/换图/改标题，同名覆盖原文件。
+    ppt_editor.edit_ppt 返回的就是定型话术，直接播报；永不抛异常。
+    """
+    if _ppt_editor is None:
+        return "抱歉先生，PPT 修改模块现在不可用。"
+    try:
+        return _ppt_editor.edit_ppt(
+            file_name=str(file_name or ""), instruction=str(instruction or ""))
+    except Exception:
+        return "抱歉先生，修改 PPT 时出了点意外，请让我重试。"
+
+
 def _wechat_send_file(file_name: str, target: str = "文件传输助手") -> str:
     """
     微信交付：技能库复用 / GUI 自动化闭环 / 诚实指引 三段降级。
@@ -1497,6 +1519,15 @@ _TOOLS = {
         "做好之后可以接着用 wechat_send_file 把文件发到微信完成交付",
         {"topic": "PPT 主题", "pages": "内容页数，3 到 20，默认 8",
          "style": "风格：工作汇报 / 课堂讲解 / 科普分享，默认工作汇报"},
+    ),
+    "edit_ppt": (
+        _edit_ppt,
+        "修改文件柜里已生成的 PPT：按自然语言指令改某一页——重写内容、换版式、换图、改标题，"
+        "改完同名覆盖原文件，文件柜里打开就是新版；"
+        "只能改带编辑存档的 PPT（新生成的都有，旧版没有会提示重新做）",
+        {"file_name": "文件柜里的 PPT 文件名",
+         "instruction": "修改要求，如：把第3页换成两栏版式 / 给第5页换张图 / "
+                        "把第2页标题改成… / 重写第4页内容"},
     ),
     "wechat_send_file": (
         _wechat_send_file,

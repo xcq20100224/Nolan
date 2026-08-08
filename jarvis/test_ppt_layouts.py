@@ -10,7 +10,10 @@ jarvis/test_ppt_layouts.py —— ppt_layouts 版式引擎的验收测试（不�
   5. 缺字段页不抛异常、未知 layout 降级 bullets、chart 数据缺失降级；
   6. toc 超 8 条分两栏（仅冒烟，不断言坐标）；
   7. AI 配图扩展（路 B 契约）：bullets 带图左文右图、cover_image 封面背景图
-     + 蒙层 z-order、无效图片路径静默降级。
+     + 蒙层 z-order、无效图片路径静默降级；
+  8. 要点符号精修：页内统一圆点，颜色按 赭红→暖灰→陶棕 三态轮转（4 要点验证回绕）；
+  9. 圆角精修：带图页配图 Picture XML 含 roundRect、浅金衬底为圆角矩形；
+  10. 节奏精修：连续 bullets 段偶数张有浅金侧缘带、奇数张无，段被打断后重新计数。
 
 运行：python jarvis/test_ppt_layouts.py（全部断言通过即全绿）
 """
@@ -259,7 +262,7 @@ def test_unknown_layout_falls_back_to_bullets():
     assert _bg_hex(slide) == "FAF7F2", "未知 layout 降级后应走浅色 bullets 版式"
     all_text = "\n".join(sh.text_frame.text for sh in slide.shapes if sh.has_text_frame)
     assert "这一页用了未知版式" in all_text, "降级页应保留页标题"
-    assert "第一条要点" in all_text and "▪" in all_text, "降级页应按要点版式渲染符号与内容"
+    assert "第一条要点" in all_text and "●" in all_text, "降级页应按要点版式渲染符号与内容"
 
     print("[PASS] test_unknown_layout_falls_back_to_bullets: 未知版式正确降级为要点页")
 
@@ -405,6 +408,128 @@ def test_missing_image_degrades():
     print("[PASS] test_missing_image_degrades: 无效图片路径静默降级，无异常，文字完整")
 
 
+# ---------------------------------------------------------------- 精修测试项
+
+def test_marker_color_rotation():
+    """要点符号轮转：页内形状统一为圆点「●」，颜色按 赭红→暖灰→陶棕 三态轮转，
+    第 4 个要点回绕到赭红。"""
+    deck = {"title": "符号轮转测试", "subtitle": "",
+            "pages": [{"layout": "bullets", "page_title": "四要点页",
+                       "bullets": ["要点一", "要点二", "要点三", "要点四"],
+                       "speaker_note": "备注。"}]}
+    prs = _new_prs()
+    render_deck(prs, deck)
+    prs = _reopen(prs)
+    slide = prs.slides[1]
+
+    # 收集所有「符号 run」（段首 run 文本为圆点符号）
+    markers = []
+    for sh in slide.shapes:
+        if not sh.has_text_frame:
+            continue
+        for p in sh.text_frame.paragraphs:
+            if p.runs and p.runs[0].text.strip() == "●":
+                markers.append(p.runs[0])
+
+    assert len(markers) == 4, f"应有 4 个要点符号，实际 {len(markers)}"
+    # 颜色轮转序列：赭红 → 暖灰 → 陶棕 → 回绕赭红
+    expected = ["C0604A", "8A8578", "A87B5F", "C0604A"]
+    for k, (m, exp) in enumerate(zip(markers, expected)):
+        actual = str(m.font.color.rgb)
+        assert actual == exp, \
+            f"第 {k + 1} 个符号颜色应为 {exp}，实际 {actual}"
+    # 形状统一：全部为同一圆点符号
+    assert all(m.text.startswith("●") for m in markers), "页内符号形状应统一为实心圆点"
+
+    print("[PASS] test_marker_color_rotation: 4 要点符号 圆点统一 / "
+          "颜色 赭红→暖灰→陶棕→回绕 正确")
+
+
+def test_image_rounded_corners():
+    """圆角精修：带图页配图 Picture 的 XML 含 roundRect，浅金衬底同为圆角矩形；
+    缺图降级页不受影响（无 Picture、不抛异常）。"""
+    imgs = _make_test_images()
+    bogus = os.path.join(tempfile.gettempdir(), "nolan_圆角测试不存在图_x7q.png")
+    deck = {
+        "title": "圆角测试", "subtitle": "",
+        "pages": [
+            {"layout": "bullets", "page_title": "带图页",
+             "bullets": ["要点一", "要点二"],
+             "image": imgs["img_4_3"],
+             "speaker_note": "带图备注。"},
+            {"layout": "bullets", "page_title": "缺图降级页",
+             "bullets": ["要点甲", "要点乙"],
+             "image": bogus,
+             "speaker_note": "降级备注。"},
+        ],
+    }
+    prs = _new_prs()
+    render_deck(prs, deck)
+    prs = _reopen(prs)
+
+    # 1) 配图 Picture 的裁切几何为 roundRect
+    slide = prs.slides[1]
+    pics = _pictures(slide)
+    assert len(pics) == 1, f"带图页应有 1 张配图，实际 {len(pics)}"
+    assert 'prst="roundRect"' in pics[0]._element.xml, \
+        "配图 Picture XML 应含 roundRect 圆角裁切"
+
+    # 2) 浅金衬底色块同步圆角（ROUNDED_RECTANGLE 的 XML 同样含 roundRect）
+    gold = next((sh for sh in slide.shapes
+                 if sh.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE
+                 and _fill_hex(sh) == "D9C9A3"), None)
+    assert gold is not None, "配图外应有浅金衬底色块"
+    assert 'prst="roundRect"' in gold._element.xml, "衬底色块应为圆角矩形"
+
+    # 3) 缺图降级不受影响：无 Picture、文字完整
+    slide2 = prs.slides[2]
+    assert not _pictures(slide2), "缺图页不应有 Picture"
+    t2 = "\n".join(sh.text_frame.text for sh in slide2.shapes if sh.has_text_frame)
+    assert "缺图降级页" in t2 and "要点甲" in t2
+
+    print("[PASS] test_image_rounded_corners: 配图与衬底均 roundRect / 缺图降级不受影响")
+
+
+def _gold_shapes(slide):
+    """页面上浅金 #D9C9A3 实心填充的自选形状列表（节奏缘带/衬底检测用）。"""
+    return [sh for sh in slide.shapes
+            if sh.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE
+            and _fill_hex(sh) == "D9C9A3"]
+
+
+def test_bullets_rhythm():
+    """节奏精修：连续 bullets 段内偶数张有浅金侧缘带（差异点）、奇数张无；
+    段被其他版式打断后重新计数。"""
+    def bp(title):
+        return {"layout": "bullets", "page_title": title,
+                "bullets": ["要点一", "要点二"], "speaker_note": "备注。"}
+    deck = {"title": "节奏测试", "subtitle": "",
+            "pages": [bp("连续段第 1 张"), bp("连续段第 2 张"), bp("连续段第 3 张"),
+                      {"layout": "section", "page_title": "打断章节",
+                       "speaker_note": "打断备注。"},
+                      bp("新段第 1 张")]}
+    prs = _new_prs()
+    render_deck(prs, deck)
+    prs = _reopen(prs)
+
+    # 物理页：1 封面 / 2,3,4 连续 bullets / 5 章节 / 6 新段 bullets
+    s1, s2, s3, s_new = prs.slides[1], prs.slides[2], prs.slides[3], prs.slides[5]
+    assert not _gold_shapes(s1), "连续段第 1 张（奇）不应有节奏缘带"
+    bands2 = _gold_shapes(s2)
+    assert len(bands2) == 1, "连续段第 2 张（偶）应有 1 条浅金节奏缘带"
+    assert not _gold_shapes(s3), "连续段第 3 张（奇）不应有节奏缘带"
+    assert not _gold_shapes(s_new), "被打断后的新段第 1 张不应有节奏缘带"
+
+    # 缘带透明度断言：12% 不透明（alpha val=12000），存在感极低
+    srgb = bands2[0]._element.spPr.find(qn("a:solidFill")).find(qn("a:srgbClr"))
+    alpha = srgb.find(qn("a:alpha")) if srgb is not None else None
+    assert alpha is not None and alpha.get("val") == "12000", \
+        f"节奏缘带 alpha 应为 12000，实际 {alpha.get('val') if alpha is not None else None}"
+
+    print("[PASS] test_bullets_rhythm: 连续段 素-饰-素 节奏正确 / "
+          "段打断后重新计数 / 缘带 alpha 12000")
+
+
 # ---------------------------------------------------------------- 入口
 
 if __name__ == "__main__":
@@ -414,4 +539,7 @@ if __name__ == "__main__":
     test_bullets_with_image()
     test_cover_image()
     test_missing_image_degrades()
+    test_marker_color_rotation()
+    test_image_rounded_corners()
+    test_bullets_rhythm()
     print("\n全部测试通过 ✔")

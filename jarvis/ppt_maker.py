@@ -240,6 +240,8 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
 - "toc"：目录页，当总页数 ≥8 时在 pages 数组首部插入一页，
   附加 "entries": ["各页标题", ...]，不计入 {pages} 页正文页数；
 - "closing"：收尾页（行动建议/总结要点），最后一页用它，无需附加字段。
+- 版式节奏：同一种版式不得连续出现超过 2 页（bullets 除外但也应穿插变化），
+  用 two_column / big_number / chart / quote 打散连续感，全篇读起来有呼吸。
 
 要求：
 - pages 数组恰好 {pages} 项正文页（toc 另算），对应 {pages} 页内容；
@@ -317,7 +319,7 @@ def _gen_outline(topic: str, pages: int, style: str, caller, research: str = "")
                 for e in item["entries"][:24]:
                     e = str(e).strip()
                     if e:
-                        entries.append(e[:20])
+                        entries.append(e[:22])
             entry["entries"] = entries
         elif layout == "two_column":
             left = item.get("left") if isinstance(item.get("left"), dict) else {}
@@ -427,6 +429,7 @@ _TWO_COLUMN_TASK = """本页版式：双栏对比页（two_column）。左栏主
 - 两栏要形成鲜明对照：同一维度上左说左的、右说右的，不要各说各话；
 - 每条要点必须承载具体信息：真实数据、具体案例、机制解释或可操作结论，禁止空话套话；
 - 两栏合计总字数不少于 {min_chars} 字；
+- 两栏内容必须共同论证本页断言式标题（标题是论点，两栏对照是它的论据）；
 - 风格要求：{style_hint}；
 - speaker_note 为 150-250 字的口语化演讲稿：怎么开场、两栏怎么对照着讲、如何过渡到下一页。"""
 
@@ -442,6 +445,7 @@ _BIG_NUMBER_TASK = """本页版式：大数字页（big_number）。大纲草稿
 - stats 1 到 3 个，每个 number 非空：必须是带单位或百分号的震撼数字，要真实、有出处感；
 - caption 20-50 字：说清数字的口径、年份与来源类型；
 - 几个数字之间要有分工（规模/增速/占比），不要同义反复；
+- 数字必须直接论证本页断言式标题（标题是论点，数字是它的论据）；
 - 风格要求：{style_hint}；
 - speaker_note 为 150-250 字的口语化演讲稿：数字怎么抛、怎么解释意义、如何过渡。"""
 
@@ -464,6 +468,7 @@ _CHART_TASK = """本页版式：图表页（chart）。大纲草稿（数据需�
 - values 必须是纯数字（不要带单位/百分号），每个系列的 values 长度与 categories 完全一致；
 - 数据要合理可信：量级、趋势符合真实世界常识，在大纲草稿基础上校准；
 - bullets 是图解读，2 到 3 条，每条 30 到 60 字：说趋势、说拐点、说含义，禁止复述数字；
+- 图表与解读必须直接论证本页断言式标题（标题是论点，数据是它的论据）；
 - 风格要求：{style_hint}；
 - speaker_note 为 150-250 字的口语化演讲稿：图怎么看、结论是什么、如何过渡。"""
 
@@ -1299,6 +1304,19 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
         _build_pptx(deck, style, out_path)
     except Exception as e:
         return {"ok": False, "error": f"PPT 文件生成失败：{e}"}
+
+    # ---- 存档（R3 对话式编辑的弹药库）：渲染成功后把完整中间态落在 pptx 旁边，
+    #      之后的「说改就改」靠它读档局部重生成。存档失败不影响主交付。
+    try:
+        archive = {
+            "topic": topic, "style": style, "pages": pages,
+            "research": research, "outline": outline, "deck": deck,
+            "pptx_name": out_path.name,
+        }
+        (FILES_DIR / (out_path.stem + ".deck.json")).write_text(
+            json.dumps(archive, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
 
     return {
         "ok": True,

@@ -27,6 +27,16 @@ Nolan · PPT 版式引擎（ppt_layouts.py）—— 成熟产品级版式渲染
   - 每页（含封面）都把 speaker_note 物理写进 notes_slide（PPT/WPS 备注窗格可见）；
   - 缺字段给安全默认，未知 layout 按 bullets 降级渲染，绝不抛异常；
   - chart 版式用 python-pptx 原生图表（GraphicFrame，PPT 内可编辑），不是贴图。
+
+精修层（视觉细节，不改契约、不改公开签名）：
+  - 要点符号：页内统一实心圆点「●」，颜色按 赭红→暖灰→陶棕 三态轮转
+    （弃用浅金：在米白底上对比度仅约 1.3:1，近乎不可见；陶棕取自既有图表色板，
+    全套色彩体系保持自洽）。形状全局统一而非轮转——形状差异会暗示不存在的
+    语义层级，颜色轮转只贡献「细节的密度」，符合克制哲学；
+  - bullets 配图与浅金衬底色块做 8% 圆角裁切（a:prstGeom roundRect），失败静默
+    回退直角；封面全屏出血图保持直角——出血版式圆角会露出底色边角，破坏满铺感；
+  - 连续 bullets 段内偶数张（无配图时）在正文右缘加 12% 不透明浅金竖缘带，
+    奇数张无，形成「素-饰-素」的翻页节奏防疲劳；段被其他版式打断即重新计数。
 """
 from __future__ import annotations
 
@@ -41,6 +51,11 @@ COLOR_ACCENT = "C0604A"      # 赭红：强调（标题侧条、要点符号、�
 COLOR_BG = "FAF7F2"          # 米白：浅色版式底 / 深色版式上的浅字
 COLOR_WARMGREY = "8A8578"    # 暖灰：辅助文字、页脚、次要信息
 COLOR_GOLD = "D9C9A3"        # 浅金：装饰线、深色底上的点缀
+COLOR_TAN = "A87B5F"         # 陶棕：要点符号轮转第三色（取自图表色板，全套色系自洽）
+
+# ---- 要点符号（精修：页内形状统一为实心圆点，颜色按要点序号三态轮转）
+MARKER_GLYPH = "●  "                                        # 实心圆点 + 两空格
+MARKER_ROTATION = (COLOR_ACCENT, COLOR_WARMGREY, COLOR_TAN)  # 赭红 → 暖灰 → 陶棕
 
 # ---- 图表系列配色（暖色系轮转：赭红 -> 暖灰 -> 浅金 -> 墨灰 -> 陶棕）
 CHART_PALETTE = ["C0604A", "8A8578", "D9C9A3", "4A4440", "A87B5F"]
@@ -188,6 +203,50 @@ def _add_accent_bar(slide, left, top, width, height):
     return _add_rect(slide, left, top, width, height, COLOR_ACCENT)
 
 
+def _add_round_rect(slide, left, top, width, height, color_hex, adj=0.08):
+    """圆角实心矩形（衬底色块用），圆角半径 adj 为短边比例（默认 8%）。
+    adjustments 失败静默回退默认圆角，不致命。"""
+    from pptx.util import Inches
+    from pptx.enum.shapes import MSO_SHAPE
+    shp = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE,
+        Inches(left), Inches(top), Inches(width), Inches(height))
+    try:
+        shp.adjustments[0] = adj
+    except Exception:
+        pass   # 圆角半径设置失败用默认值，不致命
+    shp.fill.solid()
+    shp.fill.fore_color.rgb = _rgb(color_hex)
+    shp.line.fill.background()
+    shp.shadow.inherit = False
+    return shp
+
+
+def _round_picture(pic, adj_pct=8):
+    """把 Picture 的裁切几何改为圆角矩形：a:prstGeom prst="roundRect"，adj 8%。
+    OOXML 形状调整值单位是千分之一百分比（8% = 8000）。
+    任何失败静默回退直角（不改 prstGeom 就是默认 rect），绝不抛异常。"""
+    from pptx.oxml.ns import qn
+    try:
+        spPr = pic._element.spPr
+        prst = spPr.find(qn("a:prstGeom"))
+        if prst is None:
+            return
+        prst.set("prst", "roundRect")
+        avLst = prst.find(qn("a:avLst"))
+        if avLst is None:
+            avLst = prst.makeelement(qn("a:avLst"), {})
+            prst.append(avLst)
+        for gd in list(avLst):   # 清掉 rect 默认参数，只留我们的 adj
+            avLst.remove(gd)
+        gd = avLst.makeelement(qn("a:gd"), {})
+        gd.set("name", "adj")
+        gd.set("fmla", f"val {int(adj_pct * 1000)}")
+        avLst.append(gd)
+    except Exception:
+        pass   # 圆角失败静默回退直角，不致命
+
+
 # ================================================================ 防溢出：正文三档缩字号
 
 def _fit_body_font(bullets, chars_per_line=None):
@@ -197,7 +256,7 @@ def _fit_body_font(bullets, chars_per_line=None):
     cpl = chars_per_line or _BODY_CHARS_PER_LINE
     total = sum(len(b) for b in bullets)
     lines = sum(max(1, (len(b) + 3 + cpl - 1) // cpl)
-                for b in bullets)   # +3 是「▪  」符号前缀
+                for b in bullets)   # +3 是「●  」符号前缀
     if cpl < _BODY_CHARS_PER_LINE:        # 半宽（图文）模式阈值
         if total <= 180 and lines <= 12:
             return SIZE_BODY, 0.18
@@ -299,21 +358,25 @@ def _write_note(slide, page, page_no):
         pass   # 备注写入失败不致命，绝不中断渲染
 
 
-def _write_bullet_paras(tf, bullets, color_hex=COLOR_INK, marker_color=COLOR_ACCENT,
-                        base_size=None, marker="▪  ", gap_in=None, chars_per_line=None):
-    """写一串要点段落：赭红小方块符号 + 正文文字（符号与文字分 run，符号单独上色）。
-    base_size 为 None 时自动三档缩字号；chars_per_line 传半宽估值时按半宽重估。"""
+def _write_bullet_paras(tf, bullets, color_hex=COLOR_INK,
+                        base_size=None, gap_in=None, chars_per_line=None):
+    """写一串要点段落：实心圆点符号 + 正文文字（符号与文字分 run，符号单独上色）。
+    符号精修：页内形状统一为「●」，颜色按要点序号在 MARKER_ROTATION 三态轮转；
+    符号字号比正文小 2pt，圆点视觉比重更克制。base_size 为 None 时自动三档缩字号；
+    chars_per_line 传半宽估值时按半宽重估。"""
     if base_size is None:
         size, gap = _fit_body_font(bullets, chars_per_line=chars_per_line)
     else:
         size, gap = base_size, (gap_in if gap_in is not None else 0.14)
     from pptx.util import Inches
+    marker_size = max(size - 2, SIZE_NOTE)   # 圆点略小于正文，比重更精致
     for j, bullet in enumerate(bullets):
         p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
         p.space_after = Inches(gap)
         rm = p.add_run()
-        rm.text = marker
-        _set_run_font(rm, size, marker_color, bold=True)
+        rm.text = MARKER_GLYPH
+        _set_run_font(rm, marker_size,
+                      MARKER_ROTATION[j % len(MARKER_ROTATION)], bold=True)
         rt = p.add_run()
         rt.text = bullet
         _set_run_font(rt, size, color_hex)
@@ -332,6 +395,7 @@ def _render_cover(prs, title, subtitle, style, cover_image=None):
     _set_bg(s, COLOR_DARK)
 
     # 封面背景图（路 B 交接契约）：先铺图、再蒙层，后续装饰与文字自然在其上
+    # 精修决策：封面全屏出血图刻意保持直角——出血版式圆角会露出底色边角，破坏满铺感
     bg_img = _valid_image_path(cover_image)
     if bg_img:
         try:
@@ -448,17 +512,30 @@ def _render_section(slide, page, page_no, style):
 
 # ================================================================ 版式 4：bullets 标准要点页
 
-def _render_bullets(slide, page, page_no, style):
-    """米白底：色条标题 + 赭红方块符号要点列，正文三档缩字号防溢出。
+def _add_rhythm_band(slide):
+    """连续 bullets 段偶数页的节奏微变化：正文区右缘一条 12% 不透明浅金竖缘带。
+    设计意图：翻页时「素-饰-素」交替，给眼睛一个极轻的节拍点，防止多页要点
+    连续出现的视觉疲劳；12% 不透明度做到「说不出哪里变了，但感觉不闷」。"""
+    band = _add_rect(slide, SLIDE_W - 0.24, BODY_Y - 0.25, 0.24,
+                     FOOTER_Y - BODY_Y + 0.25, COLOR_GOLD)
+    _set_fill_alpha(band, 12)   # 12% 不透明：存在感极低的浅金呼吸带
+
+
+def _render_bullets(slide, page, page_no, style, _alt=False):
+    """米白底：色条标题 + 圆点符号要点列，正文三档缩字号防溢出。
     page["image"] 有效时切换「左文右图」：文字区收窄到左 55%（半宽阈值重估
-    缩档），右侧放等比配图 + 浅金衬底色块；无图或图片缺失时与原版式一致。"""
+    缩档），右侧放等比圆角配图 + 浅金圆角衬底色块；无图或图片缺失时与原版式一致。
+    _alt=True（连续 bullets 段偶数张、由 render_deck 按页序注入）且无配图时，
+    右缘加浅金节奏缘带；有配图页本身已有视觉变化，不再叠加。"""
     _set_bg(slide, COLOR_BG)
     _add_page_header(slide, _safe_str(page.get("page_title"), "（无标题）"))
     bullets = _safe_bullets(page)
 
     img = _valid_image_path(page.get("image"))
     if not img:
-        # 无图：与既有版式完全一致
+        # 无图：与既有版式一致；连续段偶数页加节奏缘带（唯一的微变化点）
+        if _alt:
+            _add_rhythm_band(slide)
         tf = _add_textbox(slide, CONTENT_LEFT + 0.2, BODY_Y, CONTENT_W - 0.2, 5.1)
         _write_bullet_paras(tf, bullets)
         return
@@ -472,6 +549,7 @@ def _render_bullets(slide, page, page_no, style):
 def _place_side_image(slide, img_path, left, top):
     """右图区配图：先按区宽等比铺图，超高则按高度回缩并水平居中；
     图下垫一圈浅金衬底色块（成熟产品手法，z-order 衬底在图之下）。
+    精修：图片与衬底同步 8% 圆角，观感从「贴上去」变「嵌进去」；失败静默回退直角。
     任何失败都静默降级为纯文字页，绝不抛异常。"""
     from pptx.util import Inches, Emu
     try:
@@ -483,12 +561,13 @@ def _place_side_image(slide, img_path, left, top):
             pic.width = Emu(int(pic.width * ratio))
         # 在图区内水平居中
         pic.left = Emu(int(Inches(left) + (Inches(IMG_ZONE_W) - pic.width) / 2))
-        # 浅金衬底色块：比图大一圈，垫在图下
+        _round_picture(pic, 8)                    # 图片圆角裁切（失败静默回退直角）
+        # 浅金衬底色块：比图大一圈，垫在图下，同步圆角
         pad = Inches(IMG_PAD)
-        backing = _add_rect(slide,
-                            (pic.left - pad) / 914400, (pic.top - pad) / 914400,
-                            (pic.width + 2 * pad) / 914400, (pic.height + 2 * pad) / 914400,
-                            COLOR_GOLD)
+        backing = _add_round_rect(slide,
+                                  (pic.left - pad) / 914400, (pic.top - pad) / 914400,
+                                  (pic.width + 2 * pad) / 914400, (pic.height + 2 * pad) / 914400,
+                                  COLOR_GOLD, adj=0.08)
         pic._element.addprevious(backing._element)   # z-order：衬底挪到图片之下
     except Exception:
         pass   # 配图失败静默降级，绝不中断渲染
@@ -827,12 +906,21 @@ def render_deck(prs, deck: dict, style: str = "工作汇报") -> None:
     total = len(pages) + 1   # 物理总页数（含封面），页脚用
 
     # ---- 内容页
+    consec_bullets = 0   # 连续 bullets 段计数：段内偶数张注入节奏缘带（精修 3）
     for i, page in enumerate(pages, start=1):
         slide = prs.slides.add_slide(blank)
         layout = _safe_str(page.get("layout"), "bullets").lower()
         render_fn = _LAYOUTS.get(layout, _render_bullets)   # 未知 layout 降级 bullets
+        # 只按「声明的 bullets 版式」计数；被其他版式（含降级）打断即归零重数
+        if layout == "bullets":
+            consec_bullets += 1
+        else:
+            consec_bullets = 0
         try:
-            render_fn(slide, page, i, style)
+            if layout == "bullets":
+                render_fn(slide, page, i, style, _alt=(consec_bullets % 2 == 0))
+            else:
+                render_fn(slide, page, i, style)
         except Exception:
             _render_safe_fallback(slide, page, i, style)
         _add_footer(slide, i + 1, total, dark=(layout in DARK_LAYOUTS))
