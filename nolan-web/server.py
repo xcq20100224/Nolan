@@ -136,7 +136,7 @@ except Exception:
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-08-pptfix"
+_VERSION = "2026-08-11-memory"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -1181,6 +1181,51 @@ _brain_lock = threading.Lock()   # brain 调用与 mouth 播报共用同一把�
 _history = []                    # 服务端维护的对话历史，裁剪到 20 轮（40 条）
 _HISTORY_MAX_TURNS = 20
 
+# == 历史持久化（重启不失忆）==
+# 根因（2026-08-11 真机病例）：主人刚让 Nolan 写的作文还显示在屏幕对话记录里，
+# 一句「生动形象一些」，Nolan 却答「我这边没有看到之前的文稿」——
+# 对话记录是前端状态，_history 是内存态；server 一旦重启（部署/预览重启/休眠恢复），
+# 大脑失忆，屏幕上的对话成了只有主人记得的单向记忆。伙伴的第一条纪律：
+# 你记得的事，我必须也记得。
+# 对策——写穿式落盘 jarvis/files/web_chat_history.json（原子替换，防爆写），
+# 启动时恢复；存的已是 _slim_for_history 后的存根版，附件全文不进盘。
+_HISTORY_FILE = os.path.normpath(os.path.join(_FILES_DIR, "web_chat_history.json"))
+
+
+def _save_history() -> None:
+    """把 _history 原子写盘；失败只记日志，绝不影响对话主流程。调用方须持 _brain_lock。"""
+    try:
+        tmp = _HISTORY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_history, f, ensure_ascii=False)
+        os.replace(tmp, _HISTORY_FILE)
+    except Exception as e:  # noqa: BLE001 - 落盘失败下轮再试
+        print(f"[server] 对话历史落盘失败（下轮再试）：{e}")
+
+
+def _load_history() -> None:
+    """启动时恢复对话历史；文件缺席/损坏一律从零开始，不阻断服务。"""
+    global _history
+    try:
+        with open(_HISTORY_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return
+        turns = [
+            t for t in data
+            if isinstance(t, dict)
+            and t.get("role") in ("user", "assistant")
+            and isinstance(t.get("content"), str)
+        ]
+        _history = turns[-_HISTORY_MAX_TURNS * 2:]
+        if _history:
+            print(f"[server] 对话历史已恢复：{len(_history) // 2} 轮（重启不失忆）")
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001 - 损坏文件不阻断启动
+        print(f"[server] 对话历史恢复失败（从零开始）：{e}")
+
+
 # == 历史瘦身（上下文工程）：附件全文只活在当前轮，历史里只留紧凑存根 ==
 # 根因——前端把附件抽取全文（≤8000 字）拼进用户消息（标记块
 # [附件《存储名》内容开始]…[附件内容结束，请基于以上内容回答]），若原样写入
@@ -1372,6 +1417,7 @@ def _chat(user_text: str) -> dict:
             _history.append({"role": "assistant", "content": reply})
             if len(_history) > _HISTORY_MAX_TURNS * 2:
                 _history = _history[-_HISTORY_MAX_TURNS * 2:]
+            _save_history()  # 写穿落盘：server 重启后大脑仍记得这轮对话
 
     if reply == "__EXIT__":
         farewell = "好的先生，我先去休息了，随时叫我的名字就能唤醒我。"
@@ -2099,6 +2145,7 @@ class NolanHandler(BaseHTTPRequestHandler):
                 _history.append({"role": "assistant", "content": reply})
                 if len(_history) > _HISTORY_MAX_TURNS * 2:
                     _history = _history[-_HISTORY_MAX_TURNS * 2:]
+                _save_history()  # 写穿落盘：server 重启后大脑仍记得这轮对话
             self._sse_send({"type": "done", "reply": reply})
         except (BrokenPipeError, ConnectionResetError):
             cancel.set()  # 客户端断开：止损，LLM/TTS 线程各自退出
@@ -2334,6 +2381,7 @@ def main() -> None:
     atexit.register(_cleanup_pidfile)
 
     _preload_whisper()  # 后台预加载语音模型，避免第一次录音等待
+    _load_history()     # 恢复对话历史：server 重启不失忆（伙伴纪律）
     threading.Thread(target=_trigger_loop, daemon=True,
                      name="trigger-checker").start()  # P4 条件触发后台检查
     if _wake_load_state():  # 唤醒词开关状态落盘：上次开启过则自动恢复耳蜗
