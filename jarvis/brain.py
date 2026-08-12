@@ -71,6 +71,16 @@ except ImportError:  # pragma: no cover
     episodic = None
 
 try:
+    import journeys  # T2 共同经历簿（共同作品/长期关系记忆）
+except ImportError:  # pragma: no cover
+    journeys = None
+
+try:
+    import debrief  # T1 主动交代（长任务后附「做了什么 + 去哪验证」）
+except ImportError:  # pragma: no cover
+    debrief = None
+
+try:
     import reminders  # 阶段四「主动提醒」模块（由并行工程师编写，按契约调用）
 except ImportError:  # pragma: no cover - reminders 未就绪时大脑仍可降级运行
     reminders = None
@@ -421,14 +431,19 @@ def _parse_intent(text: str) -> tuple | None:
     """
     # 时间 / 日期 / 星期
     if any(k in text for k in _TIME_KEYS):
+        _NOW_WORDS = ("现在", "今天", "明天", "后天", "昨天", "当前", "这会儿", "此刻")
+        # 任务句防劫持：句中带明确任务词时，「时间/日期」只是话题不是意图
+        # （实测病例：「做一份关于时间管理的PPT」被报时劫持，PPT 没做成）
+        _TASK_HINTS = ("做", "写", "搜", "打开", "播放", "提醒", "ppt",
+                       "文件", "文章", "作文", "总结", "管理", "计划", "安排", "介绍")
+        if any(w in text.lower() for w in _TASK_HINTS):
+            pass  # 放行给后续意图/大模型层
         # 排除「我一般几点起床」类：疑问主体是用户自身习惯/属性，不是问当下时间，
         # 放行给记忆/大模型层（长期记忆已注入系统提示，LLM 能据记忆回答）。
         # 含「现在/今天」等时间副词的一定是当下时间查询，优先报时。
-        _NOW_WORDS = ("现在", "今天", "明天", "后天", "昨天", "当前", "这会儿", "此刻")
-        if (any(w in text for w in _NOW_WORDS)
+        elif (any(w in text for w in _NOW_WORDS)
                 or not re.search(r"我[^，。！？]{0,10}(一般|通常|平时|习惯|生日|电话|地址|名字|喜欢|几|什么|哪|多少)", text)):
             return ("get_time", {})
-
     # 媒体控制（播放/暂停/切歌/音量/静音）
     # 注意：「播放」单独出现不在此映射——「播放某首歌」类指令交给大模型判断，
     # 规则层只接管不含具体曲目的控制类指令，避免劫持。
@@ -597,7 +612,7 @@ def _execute_tool(tool: str, args: dict) -> str:
         这是默认零回退死契约）。
     安全边界：分级授权只管「确认流程」，绝不解除 hands/VLM 硬编码的安全禁令。
     """
-    global _pending_shell
+    global _pending_shell, _debrief_stash
     args = args or {}
     # H3 黑名单前置闸：已带 confirmed=True 的重放不再重复判定
     if auth_policy is not None and not args.get("confirmed"):
@@ -610,6 +625,13 @@ def _execute_tool(tool: str, args: dict) -> str:
             _pending_shell = {"tool": tool, "args": dict(args)}
             return _confirm_prompt(tool, args)
     result = hands.execute(tool, args)
+    # T2 共同经历簿：成功工具结果沉淀为关系记忆（失败/无关工具内部自动跳过）；
+    # 只记首次执行，gui_control 重放与白名单重放不重复记
+    if journeys is not None:
+        try:
+            journeys.record_for_tool(tool, args, result)
+        except Exception:  # noqa: BLE001 - 经历簿故障不影响主流程
+            pass
     # 失败自动换路（gui_control 专用）：眼睛报告「目标应用缺失」时，
     # 自动提取应用名 -> open_app 打开（其内置窗口等待）-> 原任务重放一次，
     # 返回第二次的结果。视觉模块断连 / 安全中止 / 步数超限一律不重试。
@@ -644,6 +666,13 @@ def _execute_tool(tool: str, args: dict) -> str:
         _pending_shell = {"tool": tool, "args": dict(args)}
         return _confirm_prompt(tool, args) if tool in ("run_shell", "gui_control") else result
     _record_ppt_context(tool, args, result)
+    # T1 主动交代：长任务成功后附「我做了什么 + 您可以去哪验证」，
+    # 失败/非长任务/待确认路径一律静默（note 内部已判），信任来自主动递上证据
+    if debrief is not None:
+        note = debrief.note(tool, args, result)
+        if note:
+            _debrief_stash = note  # 出口兜底用：防 Agent 循环里被 LLM 复述吃掉
+            result = result + "\n" + note
     return result
 
 
@@ -656,6 +685,7 @@ def _execute_tool(tool: str, args: dict) -> str:
 # 绕过 LLM 的自由裁量。
 _LAST_PPT: dict | None = None   # {'topic','pages','style','file','ts'}
 _LAST_PPT_TTL = 2 * 3600        # 上下文保鲜期：2 小时
+_debrief_stash: str | None = None  # T1 交代暂存（本轮长任务的交代话术，出口兜底补挂）
 
 _PPT_CORRECT_STRONG = (
     "不对", "不是", "错了", "重来", "重做", "重新做", "重新生成",
@@ -760,6 +790,14 @@ def _build_system_prompt() -> str:
             epi = ""
         if epi:
             prompt += "\n" + epi
+    # T2 共同经历簿注入：近 30 天共同作品（PPT/文件，可在合适时机自然提起）
+    if journeys is not None:
+        try:
+            jny = journeys.brief_for_prompt().strip()
+        except Exception:  # pragma: no cover
+            jny = ""
+        if jny:
+            prompt += "\n" + jny
     if hands is None:
         return prompt
     tool_lines = "\n".join(
@@ -1527,7 +1565,13 @@ def think(user_text: str, history: list[dict]) -> str:
     代码、工具 JSON、命令行、路径是 Nolan 的思考不是台词，
     原始 JSON/代码永远不许成为 think() 的返回值（可见与可念同一标准）。
     """
+    global _debrief_stash
+    _debrief_stash = None  # 每轮清零：交代只挂在本轮长任务之后
     reply = _speak_guard(_think_impl(user_text, history))
+    # T1 交代兜底：规则路径下交代已在结果文本里；Agent 循环路径下 LLM 复述
+    # 工具结果时会把交代吃掉——最终回复里没有就在出口补挂，主动交代必达
+    if _debrief_stash and reply and reply != EXIT_SIGNAL and _debrief_stash not in reply:
+        reply = reply + "\n" + _debrief_stash
     # 记忆萃取/情景记录同样只吃指令（附件全文不该进记忆库）；
     # 纯附件消息（无指令）用占位语记一笔，不录附件原文
     instr = _split_attachment(user_text.strip())[0] if isinstance(user_text, str) else ""

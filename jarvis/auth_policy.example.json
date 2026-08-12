@@ -1,24 +1,19 @@
 {
-  "_说明": "H3 分级授权示例配置。把本文件复制为同目录的 auth_policy.json 即生效；删除 auth_policy.json 则恢复「一律走确认流程」的默认行为。判定优先级：黑名单 > 白名单 > 默认。注意：本策略只管「确认流程」，VLM 里硬编码的密码/支付/删除安全禁令在任何策略下都不会被解除。",
-  "_whitelist说明": "白名单：命中后免确认直接执行（白名单自主）。只放你真正信任的低风险操作。",
-  "whitelist": [
+  "_说明": "T3 确认梯度示例配置。自 T3 起，三档梯度（直接做/做完汇报/先问一句）已内置在 auth_policy.py 的代码数据表中，策略文件缺失也照常生效；同目录的 auth_policy.json 是内置梯度的镜像，可直接在其上追加自定义规则。本示例演示如何追加：用户黑名单优先级最高，其次内置 confirm，再是用户白名单，最后内置 auto，未命中一律 default。注意：本策略只管「确认流程」，hands/VLM 里硬编码的密码/支付/删除安全禁令在任何策略下都不会被解除。",
+  "_whitelist示例": "在 auth_policy.json 的 whitelist 数组里追加如下规则即可扩展「直接做」范围（只放你真正信任的低风险操作）：",
+  "whitelist追加示例": [
     {
       "_注释": "记事本里的界面操作（打字、保存等）免确认",
       "tool": "gui_control",
       "app_pattern": "记事本|notepad"
-    },
-    {
-      "_注释": "dir 列目录这类只读命令免确认",
-      "tool": "run_shell",
-      "cmd_pattern": "^dir\\b"
     }
   ],
-  "_blacklist说明": "黑名单：命中后必须亲口确认（黑名单必确认），即使该操作原本不需要确认。黑名单优先级高于白名单。",
-  "blacklist": [
+  "_blacklist示例": "在 auth_policy.json 的 blacklist 数组里追加如下规则即可扩展「先问一句」范围（黑名单优先级恒高于一切白名单）：",
+  "blacklist追加示例": [
     {
-      "_注释": "删除/格式化/关机/支付/密码相关命令永远要确认",
+      "_注释": "涉及密码的任何 shell 命令永远确认",
       "tool": "run_shell",
-      "cmd_pattern": "rm |del |format |shutdown |pay|支付|密码"
+      "cmd_pattern": "密码|password"
     }
   ]
 }

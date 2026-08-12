@@ -1,0 +1,40 @@
+{
+  "_说明": "T3 确认梯度默认策略。本文件与 auth_policy.py 内置梯度数据表保持同步：即使删除本文件，内置梯度照常生效；本文件的意义是让用户可以直观看到并追加自定义规则。判定优先级：用户黑名单 > 内置 confirm > 用户白名单 > 内置 auto > default（黑名单恒高于白名单）。注意：本策略只管「确认流程」，hands/VLM 里硬编码的密码/支付/删除安全禁令在任何策略下都不会被解除。",
+  "_whitelist说明": "白名单：命中后免确认直接执行（直接做）。以下为内置 auto 梯度的镜像，可在此追加你自己的低风险规则。",
+  "whitelist": [
+    {
+      "_注释": "纯读取/可逆工具族：搜索、读文件、查时间、截屏、做/改 PPT、写沙盒文件、打开应用",
+      "tool": "search_web"
+    },
+    { "tool": "read_file" },
+    { "tool": "get_time" },
+    { "tool": "capture_screen" },
+    { "tool": "make_ppt" },
+    { "tool": "edit_ppt" },
+    { "tool": "write_file" },
+    { "tool": "open_app" },
+    {
+      "_注释": "run_shell 只读命令族（dir/echo/type/where/whoami/ver/ipconfig 只读开关/date 查看）免确认",
+      "tool": "run_shell",
+      "cmd_pattern": "^\\s*(?:dir|echo|type|where|whoami|ver)\\b|^\\s*ipconfig(?:\\s+/(?:all|displaydns))?\\s*$|^\\s*date(?:\\s+/t)?\\s*$"
+    }
+  ],
+  "_blacklist说明": "黑名单：命中后必须亲口确认（先问一句），即使该操作原本不需要确认。以下为内置 confirm 梯度的镜像。",
+  "blacklist": [
+    {
+      "_注释": "删除/格式化/关机重启/注册表/杀进程/账户服务变更/沙盒外写入/下载与脚本执行/重定向，一律确认",
+      "tool": "run_shell",
+      "cmd_pattern": "\\b(?:del|erase|rd|rmdir|rm|format|shutdown|restart|reboot|logoff|taskkill|tskill|reg|regedit|diskpart|bcdedit|takeown|icacls|cipher)\\b|\\bnet\\s+(?:user|localgroup|share)\\b|\\bsc\\s+(?:delete|stop|config)\\b|\\bschtasks\\s+/delete\\b|\\b(?:copy|move|xcopy|robocopy|ren|rename|mkdir|md)\\b|\\b(?:curl|wget|bitsadmin|certutil|powershell|pwsh)\\b|\\bipconfig\\s+/(?:flushdns|release|renew|registerdns|setclassid)\\b|[>]"
+    },
+    {
+      "_注释": "界面操作涉及支付/转账/发红包/发给真人/删除好友，一律确认",
+      "tool": "gui_control",
+      "task_pattern": "支付|付款|转账|发红包|发送给|删除好友|删除联系人"
+    },
+    {
+      "_注释": "微信发文件给真人（非文件传输助手）一律确认",
+      "tool": "wechat_send_file",
+      "target_pattern": "(?i)^(?!filehelper$|文件传输助手$).+"
+    }
+  ]
+}

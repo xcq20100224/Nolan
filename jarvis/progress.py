@@ -23,6 +23,8 @@ API 契约：
     drain() -> list[dict]  原子地取出全部待发事件（按 emit 先后排序），
                            元素形如 {"step": str, "i"?: int, "n"?: int}
     is_active() -> bool    当前是否处于订阅态（测试/调试辅助）
+    run_steps() -> list[str]  本次 run 已 emit 的步骤文本副本（begin 时重置、
+                           end 后仍可读），供「主动交代」复盘；异常静默返回 []
 """
 from __future__ import annotations
 
@@ -36,6 +38,11 @@ _q: "queue.Queue" = queue.Queue()
 _lock = threading.Lock()
 # 订阅态标志：模块级布尔赋值/读取在 CPython 下原子，热路径无锁快判
 _active = False
+
+# 本次 run 的步骤文本流水（供「主动交代」复盘用）：
+# begin() 时重置，emit() 时追加；与事件队列同一把锁保护，线程安全。
+# 无订阅时 emit 在 _active 快判处直接返回，不会触碰本列表——零开销成立。
+_run_steps: list = []
 
 # step 文案防御性截断上限（契约 ≤30 字，总线侧留一倍余量兜底）
 _MAX_STEP_CHARS = 60
@@ -51,6 +58,7 @@ def begin() -> None:
                     _q.get_nowait()
                 except queue.Empty:
                     break
+            _run_steps.clear()  # 新一轮 run：步骤流水一并重置
             _active = True
     except Exception:
         pass
@@ -97,6 +105,7 @@ def emit(step: str, i=None, n=None) -> None:
                 except (TypeError, ValueError):
                     pass
             _q.put(ev)
+            _run_steps.append(ev["step"])  # 步骤流水与事件同生同灭（同锁内）
     except Exception:
         pass
 
@@ -114,3 +123,16 @@ def drain() -> list:
     except Exception:
         pass
     return out
+
+
+def run_steps() -> list:
+    """返回本次 run 已 emit 的步骤文本副本（begin 时重置、end 后仍可读）。
+
+    供「主动交代」复盘：工具执行结束后，调用方仍可拿到这轮 run 的完整
+    步骤链路。返回的是副本，调用方改动不会污染总线；任何异常静默返回 []。
+    """
+    try:
+        with _lock:
+            return list(_run_steps)
+    except Exception:
+        return []
