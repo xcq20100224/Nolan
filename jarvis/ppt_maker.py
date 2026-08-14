@@ -21,7 +21,7 @@ Nolan · PPT 引擎（ppt_maker.py）——意图解析 + 两阶段精写 + 自�
     每页过对应版式的质量闸，不达标重写（最多 2 次），仍不达标取历次最好；
     某页彻底失败时非常规版式降级为 bullets 兜底页，页数永不缺斤短两；
   - 生图（路 B）：大纲阶段 LLM 同时产出 cover_image_prompt（封面背景）与各页可选
-    image_prompt（内容页配图，全篇最多 4 页，只给真正需要画面感的页）；
+    image_prompt（内容页配图，全篇最多 8 页，只给真正需要画面感的页）；
     排版前统一批量串行调 CogView 生图并下载落盘 files/ppt_assets/，
     成功才把绝对路径写进 page["image"]/deck["cover_image"]；
     单张任何失败只置 None 降级无图版式，配置缺失整条链静默跳过，绝不整单失败；
@@ -99,7 +99,7 @@ MAX_BULLETS = 6
 MAX_BULLET_LEN = 80       # 防御性截断（要求 LLM 30-60 字，留余量）
 
 # ---- CogView AI 配图（路 B·生图篇）----
-MAX_IMAGE_PAGES = 4       # 全篇内容页配图上限：按页序保留前 4 页
+MAX_IMAGE_PAGES = 8       # 全篇内容页配图上限：按页序保留前 8 页（N2 扩面：4→8）
 IMG_API_TIMEOUT = 30      # 生图 API 单张预算（秒）
 IMG_DL_TIMEOUT = 20       # 图片下载单张预算（秒）
 # 全套配图统一风格后缀：由代码拼接到每条画面描述之后，保证整套图风格一致
@@ -350,7 +350,7 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
 【配图规则】
 - 顶层 "cover_image_prompt" 必填：封面背景图，画面要宏大或抽象、有氛围感，
   暖色调，绝不包含任何文字、字母、数字，也不含人脸特写；
-- 内容页的 "image_prompt"：本套 PPT 应配 3 到 4 页图（上限 4 页），凡是
+- 内容页的 "image_prompt"：本套 PPT 应配 4 到 8 页图（上限 8 页），凡是
   bullets 版式且有画面感的页（产品、场景、工艺、概念可视化）默认都应该配图；
   只有数据页、对比页、金句页才明确不配图；
 - 画面描述必须具体：写清主体 + 场景 + 色调，中英文均可；只描述画面内容，
@@ -1280,7 +1280,8 @@ def _attach_images(deck: dict, outline: dict, enabled: bool = True) -> int:
             seq += 1
             j += 1
             _emit(f"正在生成配图 {j}/{total_img}", j, total_img)
-            path = _gen_one_image(prompt, base, key, assets_dir, seq)
+            path = _gen_one_image(prompt, base, key, assets_dir, seq,
+                                  size="1344x768")  # 宽幅：右图区宽大于高，宽图视觉填充更满
             if path:
                 pg["image"] = path
                 made += 1

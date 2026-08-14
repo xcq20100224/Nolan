@@ -813,24 +813,24 @@ class PptMakerTest(unittest.TestCase):
         self.assertTrue(deck["pages"][1]["image"])
         self.assertEqual(ppt_maker.last_run["images"], 2)
 
-    # 22. 配图页数 >4 -> 钳制到 4（按页序保留前 4）
-    def test_image_pages_clamped_to_four(self):
+    # 22. 配图页数 >8 -> 钳制到 8（按页序保留前 8；N2 扩面后上限 4→8）
+    def test_image_pages_clamped_to_eight(self):
         render = _MockRender()
         ppt_maker._render_deck = render
         http = _MockHTTP()
         self._enable_images(http)
-        # 6 页全 bullets：末页升级 closing -> 5 个候选，钳到前 4
-        script = [_image_outline_json(6)] + [_page_json(f"P{i}") for i in range(1, 7)]
-        r = ppt_maker.make_ppt("人工智能简介", pages=6, llm_caller=_MockLLM(script))
+        # 10 页全 bullets：末页升级 closing -> 9 个候选，钳到前 8
+        script = [_image_outline_json(10)] + [_page_json(f"P{i}") for i in range(1, 11)]
+        r = ppt_maker.make_ppt("人工智能简介", pages=10, llm_caller=_MockLLM(script))
         self.assertTrue(r["ok"], r.get("error"))
         deck = render.calls[0][1]
-        # API 调用 = 1 封面 + 恰好 4 内容页
-        self.assertEqual(len(http.api_bodies()), 5)
-        for pg in deck["pages"][:4]:
+        # API 调用 = 1 封面 + 恰好 8 内容页
+        self.assertEqual(len(http.api_bodies()), 9)
+        for pg in deck["pages"][:8]:
             self.assertTrue(pg["image"], f"{pg['page_title']} 应有图")
-        self.assertIsNone(deck["pages"][4]["image"])      # 第 5 页被钳掉
-        self.assertEqual(deck["pages"][5]["layout"], "closing")
-        self.assertEqual(ppt_maker.last_run["images"], 5)  # 封面 + 4 页
+        self.assertIsNone(deck["pages"][8]["image"])      # 第 9 页被钳掉
+        self.assertEqual(deck["pages"][9]["layout"], "closing")
+        self.assertEqual(ppt_maker.last_run["images"], 9)  # 封面 + 8 页
 
     # 23. 非 bullets 页的 image_prompt 被静默丢弃
     def test_non_bullets_image_prompt_dropped(self):
