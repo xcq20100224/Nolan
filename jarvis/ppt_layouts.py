@@ -28,50 +28,69 @@ Nolan · PPT 版式引擎（ppt_layouts.py）—— 成熟产品级版式渲染
   - 缺字段给安全默认，未知 layout 按 bullets 降级渲染，绝不抛异常；
   - chart 版式用 python-pptx 原生图表（GraphicFrame，PPT 内可编辑），不是贴图。
 
-精修层（视觉细节，不改契约、不改公开签名）：
+精修层（视觉细节，不改契约、不改公开签名）—— Gamma 式精品默认主题：
+  - 设计 tokens：全部版式统一引用顶部 token 常量区（主色/辅助/强调/纸面/墨色/
+    浅灰分隔线），禁止散落硬编码；验收冻结值（深棕底 3B322C、米白纸面 FAF7F2、
+    符号轮转三色、节奏缘带浅金 D9C9A3 alpha 12000、封面蒙层 alpha 30000）保持不变；
+  - 字体层级：标题/副题/正文/注释四级字号字重体系，注释级更灰更轻
+    （页脚 10pt 浅暖灰），封面主标加字距（rPr spc）；
+  - 封面：无图时为编辑部式左对齐构图——风格胶囊 + 大号加字距主标 + 细线装饰 +
+    底部细信息行；有图时全出血 + 30% 均匀蒙层（验收契约）+ 底部二次渐变蒙层
+    （上浅下深）+ 左下角标题块；
   - 要点符号：页内统一实心圆点「●」，颜色按 赭红→暖灰→陶棕 三态轮转
-    （弃用浅金：在米白底上对比度仅约 1.3:1，近乎不可见；陶棕取自既有图表色板，
-    全套色彩体系保持自洽）。形状全局统一而非轮转——形状差异会暗示不存在的
-    语义层级，颜色轮转只贡献「细节的密度」，符合克制哲学；
+    （形状全局统一而非轮转——形状差异会暗示不存在的语义层级，颜色轮转只贡献
+    「细节的密度」，符合克制哲学）；
   - bullets 配图与浅金衬底色块做 8% 圆角裁切（a:prstGeom roundRect），失败静默
     回退直角；封面全屏出血图保持直角——出血版式圆角会露出底色边角，破坏满铺感；
   - 连续 bullets 段内偶数张（无配图时）在正文右缘加 12% 不透明浅金竖缘带，
-    奇数张无，形成「素-饰-素」的翻页节奏防疲劳；段被其他版式打断即重新计数。
+    奇数张无，形成「素-饰-素」的翻页节奏防疲劳；段被其他版式打断即重新计数；
+  - closing 页居中仪式感：短细线 + 谢谢聆听 + 落款，取代大色带收尾。
 """
 from __future__ import annotations
 
 import os
 import time
 
-# ================================================================ 设计 token
-# ---- 配色（NEGA 暖色系，低饱和；深色版式与浅色版式交替出节奏）
-COLOR_DARK = "3B322C"        # 深棕：深色版式底 / 浅色版式标题
-COLOR_INK = "4A4440"         # 墨灰：正文
-COLOR_ACCENT = "C0604A"      # 赭红：强调（标题侧条、要点符号、大数字、图表主色）
-COLOR_BG = "FAF7F2"          # 米白：浅色版式底 / 深色版式上的浅字
-COLOR_WARMGREY = "8A8578"    # 暖灰：辅助文字、页脚、次要信息
-COLOR_GOLD = "D9C9A3"        # 浅金：装饰线、深色底上的点缀
-COLOR_TAN = "A87B5F"         # 陶棕：要点符号轮转第三色（取自图表色板，全套色系自洽）
+# ================================================================ 设计 tokens
+# 一套精品默认主题的 token 常量区：全部版式统一引用此处，禁止散落硬编码。
+# 色系：NEGA 暖色系·低饱和（无蓝紫渐变、无高饱和背景），深色/浅色版式交替出节奏。
+# 注：以下五行十六进制值为验收测试冻结值（test_ppt_layouts.py 硬断言），只准引用、不准改值。
+COLOR_DARK = "3B322C"        # token·墨色底：深色版式底 / 浅色版式标题
+COLOR_INK = "4A4440"         # token·墨灰：正文
+COLOR_ACCENT = "C0604A"      # token·赭红（主强调）：色块、要点符号、大数字、图表主色
+COLOR_BG = "FAF7F2"          # token·纸面：浅色版式底 / 深色版式上的浅字
+COLOR_WARMGREY = "8A8578"    # token·暖灰（辅助）：次要文字、图表辅色
+COLOR_GOLD = "D9C9A3"        # token·浅金（装饰）：细线、衬底、深色底上的点缀
+COLOR_TAN = "A87B5F"         # token·陶棕：要点符号轮转第三色（取自图表色板，色系自洽）
 
-# ---- 要点符号（精修：页内形状统一为实心圆点，颜色按要点序号三态轮转）
+# ---- 派生 tokens（精修新增，非冻结）
+COLOR_DEEP = "2A231E"        # token·深墨：封面渐变蒙层底部收深色（比墨色底再深一档）
+COLOR_CAPTION = "ABA394"     # token·浅暖灰：页脚/落款/注释（比暖灰更轻，四级层级最弱档）
+COLOR_HAIRLINE = "E3DACA"    # token·浅灰分隔线：页眉下细线、页脚细线（纸面上的呼吸缝）
+
+# ---- 要点符号（页内形状统一为实心圆点，颜色按要点序号三态轮转；值为验收冻结）
 MARKER_GLYPH = "●  "                                        # 实心圆点 + 两空格
 MARKER_ROTATION = (COLOR_ACCENT, COLOR_WARMGREY, COLOR_TAN)  # 赭红 → 暖灰 → 陶棕
 
 # ---- 图表系列配色（暖色系轮转：赭红 -> 暖灰 -> 浅金 -> 墨灰 -> 陶棕）
-CHART_PALETTE = ["C0604A", "8A8578", "D9C9A3", "4A4440", "A87B5F"]
+CHART_PALETTE = [COLOR_ACCENT, COLOR_WARMGREY, COLOR_GOLD, COLOR_INK, COLOR_TAN]
 
-# ---- 字体与字号阶梯
+# ---- 字体与四级字号阶梯（标题大胆 / 副题 / 正文三档缩 / 注释更灰更轻）
 FONT_NAME = "微软雅黑"
-SIZE_COVER_TITLE = 40        # 封面主标
+SIZE_COVER_TITLE = 44        # 封面主标（40 -> 44，配合字距更有排面）
+SIZE_COVER_SUB = 17          # 封面副标（副题级）
 SIZE_SECTION_TITLE = 34      # 章节页标题
 SIZE_PAGE_TITLE = 26         # 页标题
 SIZE_BODY = 18               # 正文基准（按密度三档缩：18 -> 16 -> 14）
 SIZE_BODY_MID = 16
 SIZE_BODY_MIN = 14
-SIZE_NOTE = 12               # 注释 / 页脚 / 图表标签
+SIZE_NOTE = 12               # 注释 / 图表标签 / 胶囊标签
+SIZE_CAPTION = 10            # 页脚 / 落款（注释级再降一档，更灰更轻）
 SIZE_BIG_NUMBER = 66         # 大数字页数字（60pt+）
 SIZE_SECTION_NO = 150        # 章节页超大半透明序号
 SIZE_QUOTE_MARK = 150        # 金句页大号引号装饰
+SPACING_COVER_TITLE = 2.0    # 封面主标字距（磅；OOXML rPr spc 单位 1/100 磅）
+SPACING_KICKER = 1.5         # 小标签/章节导引字距
 
 # ---- 网格（16:9：13.333 x 7.5 英寸）
 SLIDE_W = 13.333
@@ -115,8 +134,10 @@ def _rgb(hex_str: str):
     return RGBColor.from_string(hex_str)
 
 
-def _set_run_font(run, size_pt, color_hex, bold=False):
-    """设置 run 字号/颜色/字体；中文字形必须显式写 East Asian typeface。"""
+def _set_run_font(run, size_pt, color_hex, bold=False, spacing=None):
+    """设置 run 字号/颜色/字体/字重/字距；中文字形必须显式写 East Asian typeface。
+    spacing 为可选字距（磅），OOXML rPr spc 属性单位是 1/100 磅——用于封面主标、
+    小标签这类「排面文字」，拉开字距立刻脱离程序生成感。"""
     from pptx.util import Pt
     from pptx.oxml.ns import qn
     f = run.font
@@ -130,6 +151,8 @@ def _set_run_font(run, size_pt, color_hex, bold=False):
         ea = rPr.makeelement(qn("a:ea"), {})
         rPr.append(ea)
     ea.set("typeface", FONT_NAME)
+    if spacing:
+        rPr.set("spc", str(int(spacing * 100)))   # 字距：2pt -> spc="200"
 
 
 def _set_run_alpha(run, alpha_pct):
@@ -169,6 +192,37 @@ def _set_fill_alpha(shape, alpha_pct):
         srgb.append(alpha)
     except Exception:
         pass   # 蒙层透明失败退化为实色，不致命
+
+
+def _set_gradient_fill(shape, color_hex, top_alpha_pct, bottom_alpha_pct):
+    """把形状填充改为垂直渐变蒙层：顶部 top_alpha% 不透明 -> 底部 bottom_alpha% 不透明。
+    用于封面背景图「上浅下深」的二次收深——均匀蒙层保住全图可读性，
+    底部渐变再压暗一层，给左下角标题块腾出稳定的明度对比。
+    OOXML：gradFill/gsLst，lin ang 5400000 = 90°（自上而下）。失败静默，不致命。"""
+    from pptx.oxml.ns import qn
+    try:
+        spPr = shape._element.spPr
+        solid = spPr.find(qn("a:solidFill"))
+        if solid is not None:
+            spPr.remove(solid)   # 渐变取代实色（调用方先用 _add_rect 建实色形状）
+        grad = spPr.makeelement(qn("a:gradFill"), {})
+        gsLst = grad.makeelement(qn("a:gsLst"), {})
+        for pos, alpha_pct in ((0, top_alpha_pct), (100000, bottom_alpha_pct)):
+            gs = grad.makeelement(qn("a:gs"), {"pos": str(pos)})
+            clr = grad.makeelement(qn("a:srgbClr"), {"val": color_hex})
+            a = grad.makeelement(qn("a:alpha"), {"val": str(int(alpha_pct * 1000))})
+            clr.append(a)
+            gs.append(clr)
+            gsLst.append(gs)
+        grad.append(gsLst)
+        grad.append(grad.makeelement(qn("a:lin"), {"ang": "5400000", "scaled": "1"}))
+        ln = spPr.find(qn("a:ln"))
+        if ln is not None:
+            ln.addprevious(grad)   # gradFill 必须在 a:ln 之前（OOXML 序列约束）
+        else:
+            spPr.append(grad)
+    except Exception:
+        pass   # 渐变失败则保留原实色，不致命
 
 
 def _set_bg(slide, color_hex):
@@ -310,20 +364,45 @@ def _valid_image_path(v):
 
 # ================================================================ 共享装饰件
 
+def _add_capsule(slide, left, top, text, fill_hex, text_hex, size=None):
+    """风格标签胶囊：圆角拉满（adj 50% 成药丸）的小色块内嵌加粗小字。
+    封面/章节页的「排面小件」——一个胶囊就能把「程序默认模板」感拉低一档。"""
+    from pptx.util import Inches
+    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+    text = _safe_str(text, "标签")
+    w = 0.36 + len(text) * 0.19          # 中文字宽经验估算（12pt 约 0.17"/字 + 两侧留白）
+    cap = _add_round_rect(slide, left, top, w, 0.36, fill_hex, adj=0.5)
+    tf = cap.text_frame
+    tf.word_wrap = False
+    tf.margin_left = tf.margin_right = Inches(0.05)
+    tf.margin_top = tf.margin_bottom = 0
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    p = tf.paragraphs[0]
+    p.alignment = PP_ALIGN.CENTER
+    r = p.add_run()
+    r.text = text
+    _set_run_font(r, size or SIZE_NOTE, text_hex, bold=True, spacing=0.5)
+    return cap
+
+
 def _add_page_header(slide, page_title):
-    """浅色内容页统一头部：左侧赭红色条 + 26pt 深棕标题，左对齐到网格线。"""
-    _add_accent_bar(slide, MARGIN, 0.62, 0.09, 0.62)
-    tf = _add_textbox(slide, MARGIN + 0.28, HEADER_Y, CONTENT_W - 0.28, 0.9)
+    """浅色内容页统一头部：左侧赭红小色块 + 26pt 墨色标题 + 页眉下浅灰细线。
+    精修：色条改色块（比重更克制）、标题下加一道呼吸缝细线，版面骨架立刻清晰。"""
+    _add_accent_bar(slide, MARGIN, 0.68, 0.16, 0.16)      # 小色块（原为 0.09x0.62 长条）
+    tf = _add_textbox(slide, MARGIN + 0.32, HEADER_Y, CONTENT_W - 0.32, 0.9)
     p = tf.paragraphs[0]
     r = p.add_run()
     r.text = _safe_str(page_title, "（无标题）")
     _set_run_font(r, SIZE_PAGE_TITLE, COLOR_DARK, bold=True)
+    # 页眉下浅灰分隔细线：内容区从这条线以下开始，层级一目了然
+    _add_rect(slide, MARGIN, HEADER_Y + 0.82, CONTENT_W, 0.008, COLOR_HAIRLINE)
 
 
 def _add_footer(slide, page_no, total, dark=False):
-    """页脚：细线 + 右侧页码。深色版式换浅金线、浅金字。"""
-    line_color = COLOR_GOLD if dark else "E3DACA"
-    text_color = COLOR_GOLD if dark else COLOR_WARMGREY
+    """页脚：细线 + 右侧页码「03 / 11」。深色版式换浅金线、浅金字。
+    精修：页码降到 10pt 浅暖灰——保留导航功能，视觉上退到最弱一档。"""
+    line_color = COLOR_GOLD if dark else COLOR_HAIRLINE
+    text_color = COLOR_GOLD if dark else COLOR_CAPTION
     _add_rect(slide, MARGIN, FOOTER_Y, CONTENT_W, 0.012, line_color)
     tf = _add_textbox(slide, SLIDE_W - MARGIN - 2.0, FOOTER_Y + 0.06, 2.0, 0.32)
     p = tf.paragraphs[0]
@@ -331,7 +410,7 @@ def _add_footer(slide, page_no, total, dark=False):
     p.alignment = PP_ALIGN.RIGHT
     r = p.add_run()
     r.text = f"{page_no:02d} / {total:02d}"
-    _set_run_font(r, SIZE_NOTE, text_color)
+    _set_run_font(r, SIZE_CAPTION, text_color)
 
 
 def _write_note(slide, page, page_no):
@@ -384,57 +463,91 @@ def _write_bullet_paras(tf, bullets, color_hex=COLOR_INK,
 
 # ================================================================ 版式 1：封面（render_deck 自动生成）
 
-def _render_cover(prs, title, subtitle, style, cover_image=None):
-    """深棕底浅字：居中 40pt 主标 + 赭红短色条 + 副标题 + 底部风格/日期行。
-    cover_image 有效时：全屏铺图（按 slide 宽高铺满）+ 深棕半透明蒙层，
-    文字层保持在蒙层之上，排版与无图时完全一致。"""
+def _render_cover(prs, title, subtitle, style, cover_image=None, page_total=None):
+    """封面双构图（共用一套 tokens，按有无背景图分流）：
+
+    无图 · 编辑部式左对齐：风格胶囊 + 赭红小方块 + 44pt 加字距主标 + 副标 +
+    顶部/底部浅金细线 + 底部细信息行（风格 · 日期 · 页数）。
+    有图 · 全出血：满铺背景图（直角，出血版式不圆角）+ 30% 均匀深棕蒙层
+    （验收契约，保全图可读性）+ 底部二次渐变蒙层（上浅下深，给标题块压出明度差）
+    + 左下角标题块（色条 + 主标 + 副标 + 信息行）。
+    """
     from pptx.enum.text import PP_ALIGN
     from pptx.util import Inches
     blank = prs.slide_layouts[6]
     s = prs.slides.add_slide(blank)
     _set_bg(s, COLOR_DARK)
 
-    # 封面背景图（路 B 交接契约）：先铺图、再蒙层，后续装饰与文字自然在其上
-    # 精修决策：封面全屏出血图刻意保持直角——出血版式圆角会露出底色边角，破坏满铺感
+    # 底部细信息行文案（两种构图共用）：风格 · 日期 · 总页数
+    date_str = time.strftime("%Y年%m月%d日")
+    info = f"{style} · {date_str}"
+    if page_total:
+        info += f" · 共 {page_total} 页"
+
     bg_img = _valid_image_path(cover_image)
     if bg_img:
+        # ---- 有图构图：先铺图、再均匀蒙层、再底部渐变，文字层最上
         try:
             s.shapes.add_picture(
                 bg_img, Inches(0), Inches(0),
                 width=Inches(SLIDE_W), height=Inches(SLIDE_H))   # 16:9 全屏铺满
             overlay = _add_rect(s, 0, 0, SLIDE_W, SLIDE_H, COLOR_DARK)
-            _set_fill_alpha(overlay, 30)   # 深棕蒙层 70% 透明（30% 不透明），压图保可读性
+            _set_fill_alpha(overlay, 30)   # 均匀蒙层 30% 不透明（验收冻结契约）
+            # 底部二次渐变：上浅下深，左下角标题块的明度底座
+            grad = _add_rect(s, 0, SLIDE_H * 0.35, SLIDE_W, SLIDE_H * 0.65, COLOR_DEEP)
+            _set_gradient_fill(grad, COLOR_DEEP, 0, 82)
         except Exception:
             pass   # 铺图失败退化为纯色封面，不致命
 
-    # 顶部与底部浅金细线，框出仪式感
-    _add_rect(s, MARGIN, 0.7, CONTENT_W, 0.014, COLOR_GOLD)
-    _add_rect(s, MARGIN, SLIDE_H - 0.7, CONTENT_W, 0.014, COLOR_GOLD)
+        # 左下角标题块：赭红色条 + 主标 + 副标 + 细信息行
+        _add_accent_bar(s, MARGIN, 4.42, 1.6, 0.06)
+        tf = _add_textbox(s, MARGIN, 4.62, CONTENT_W, 1.5)
+        p = tf.paragraphs[0]
+        r = p.add_run()
+        r.text = title
+        _set_run_font(r, SIZE_COVER_TITLE, COLOR_BG, bold=True,
+                      spacing=SPACING_COVER_TITLE)
+        if subtitle:
+            tf2 = _add_textbox(s, MARGIN, 6.0, CONTENT_W, 0.5)
+            p2 = tf2.paragraphs[0]
+            r2 = p2.add_run()
+            r2.text = subtitle
+            _set_run_font(r2, SIZE_COVER_SUB, COLOR_GOLD)
+        tf3 = _add_textbox(s, MARGIN, 6.62, CONTENT_W, 0.4)
+        p3 = tf3.paragraphs[0]
+        r3 = p3.add_run()
+        r3.text = info
+        _set_run_font(r3, SIZE_NOTE, COLOR_CAPTION)
+    else:
+        # ---- 无图构图：编辑部式左对齐，细线与胶囊撑出设计感
+        # 顶部与底部浅金细线（极细，框出呼吸边界而非「边框」）
+        _add_rect(s, MARGIN, 0.72, CONTENT_W, 0.01, COLOR_GOLD)
+        _add_rect(s, MARGIN, SLIDE_H - 0.72, CONTENT_W, 0.01, COLOR_GOLD)
 
-    # 主标上方居中的赭红短色条
-    _add_accent_bar(s, SLIDE_W / 2 - 1.0, 2.5, 2.0, 0.07)
+        _add_capsule(s, MARGIN, 2.05, style, COLOR_ACCENT, COLOR_BG)
 
-    tf = _add_textbox(s, MARGIN, 2.85, CONTENT_W, 1.6)
-    p = tf.paragraphs[0]
-    p.alignment = PP_ALIGN.CENTER
-    r = p.add_run()
-    r.text = title
-    _set_run_font(r, SIZE_COVER_TITLE, COLOR_BG, bold=True)
+        # 赭红小方块 + 44pt 加字距主标（左对齐到网格线）
+        _add_accent_bar(s, MARGIN, 2.72, 0.16, 0.16)
+        tf = _add_textbox(s, MARGIN, 3.0, CONTENT_W, 1.7)
+        p = tf.paragraphs[0]
+        r = p.add_run()
+        r.text = title
+        _set_run_font(r, SIZE_COVER_TITLE, COLOR_BG, bold=True,
+                      spacing=SPACING_COVER_TITLE)
 
-    if subtitle:
-        tf2 = _add_textbox(s, MARGIN, 4.35, CONTENT_W, 0.7)
-        p2 = tf2.paragraphs[0]
-        p2.alignment = PP_ALIGN.CENTER
-        r2 = p2.add_run()
-        r2.text = subtitle
-        _set_run_font(r2, SIZE_BODY, COLOR_GOLD)
+        if subtitle:
+            tf2 = _add_textbox(s, MARGIN, 4.85, CONTENT_W, 0.6)
+            p2 = tf2.paragraphs[0]
+            r2 = p2.add_run()
+            r2.text = subtitle
+            _set_run_font(r2, SIZE_COVER_SUB, COLOR_GOLD)
 
-    tf3 = _add_textbox(s, MARGIN, 5.5, CONTENT_W, 0.5)
-    p3 = tf3.paragraphs[0]
-    p3.alignment = PP_ALIGN.CENTER
-    r3 = p3.add_run()
-    r3.text = f"{style} · {time.strftime('%Y年%m月%d日')}"
-    _set_run_font(r3, SIZE_NOTE + 2, COLOR_WARMGREY)
+        # 底部细信息行：贴底线上方，最弱一档
+        tf3 = _add_textbox(s, MARGIN, SLIDE_H - 1.25, CONTENT_W, 0.4)
+        p3 = tf3.paragraphs[0]
+        r3 = p3.add_run()
+        r3.text = info
+        _set_run_font(r3, SIZE_NOTE, COLOR_CAPTION)
 
     s.notes_slide.notes_text_frame.text = (
         f"开场白：各位好，今天分享的主题是「{title}」"
@@ -482,20 +595,30 @@ def _render_toc(slide, page, page_no, style):
 # ================================================================ 版式 3：section 章节过渡页
 
 def _render_section(slide, page, page_no, style):
-    """深棕底：超大半透明序号 + 34pt 浅标题 + 赭红色条 + 浅金核心句。"""
+    """深棕底：右侧超大半透明序号水印 + 导引小标签 + 34pt 浅标题 + 赭红色条 + 浅金核心句。
+    精修：序号挪到右侧避免压字，新增「PART 02」导引行（字距拉开），层级更像画册章节页。"""
     _set_bg(slide, COLOR_DARK)
 
-    # 超大半透明序号（水印式装饰，15% 透明度）
-    tf_no = _add_textbox(slide, MARGIN, 1.2, 6.0, 3.0)
+    # 超大半透明序号水印：靠右侧，15% 透明度，不与标题抢左侧视觉起点
+    tf_no = _add_textbox(slide, SLIDE_W - MARGIN - 5.2, 0.9, 5.2, 3.0)
     p_no = tf_no.paragraphs[0]
+    from pptx.enum.text import PP_ALIGN
+    p_no.alignment = PP_ALIGN.RIGHT
     r_no = p_no.add_run()
     r_no.text = f"{page_no:02d}"
     _set_run_font(r_no, SIZE_SECTION_NO, COLOR_BG, bold=True)
     _set_run_alpha(r_no, 15)
 
+    # 导引小标签（kicker）：拉开字距的小号浅金字，画册式章节引子
+    tf_k = _add_textbox(slide, MARGIN, 4.0, CONTENT_W, 0.4)
+    p_k = tf_k.paragraphs[0]
+    r_k = p_k.add_run()
+    r_k.text = f"PART {page_no:02d}"
+    _set_run_font(r_k, SIZE_NOTE, COLOR_GOLD, bold=True, spacing=SPACING_KICKER)
+
     # 赭红色条 + 章节标题
-    _add_accent_bar(slide, MARGIN, 4.35, 1.6, 0.07)
-    tf_t = _add_textbox(slide, MARGIN, 4.6, CONTENT_W, 1.0)
+    _add_accent_bar(slide, MARGIN, 4.42, 1.6, 0.06)
+    tf_t = _add_textbox(slide, MARGIN, 4.62, CONTENT_W, 1.0)
     p_t = tf_t.paragraphs[0]
     r_t = p_t.add_run()
     r_t.text = _safe_str(page.get("page_title"), f"第 {page_no} 部分")
@@ -503,7 +626,7 @@ def _render_section(slide, page, page_no, style):
 
     core = _safe_str(page.get("core_point"))
     if core:
-        tf_c = _add_textbox(slide, MARGIN, 5.7, CONTENT_W, 0.8)
+        tf_c = _add_textbox(slide, MARGIN, 5.72, CONTENT_W, 0.8)
         p_c = tf_c.paragraphs[0]
         r_c = p_c.add_run()
         r_c.text = core
@@ -648,7 +771,7 @@ def _render_big_number(slide, page, page_no, style):
             pc.alignment = PP_ALIGN.CENTER
             rc = pc.add_run()
             rc.text = caption
-            _set_run_font(rc, SIZE_BODY_MIN, COLOR_INK)
+            _set_run_font(rc, SIZE_BODY_MIN, COLOR_WARMGREY)   # 注释退到暖灰，不抢数字
 
 
 # ================================================================ 版式 7：quote 金句引用页
@@ -820,23 +943,30 @@ def _render_chart(slide, page, page_no, style):
 # ================================================================ 版式 9：closing 结尾行动页
 
 def _render_closing(slide, page, page_no, style):
-    """米白底：色条标题 + 行动要点 + 底部赭红色带收尾（浅字致谢行）。"""
+    """米白底：色块标题 + 行动要点 + 居中仪式感收尾（短细线 + 谢谢聆听 + 落款）。
+    精修：弃用底部大色带（工程感重），改用画册尾页式的居中三段式。"""
     from pptx.enum.text import PP_ALIGN
     _set_bg(slide, COLOR_BG)
     _add_page_header(slide, _safe_str(page.get("page_title"), "总结与行动"))
 
     bullets = _safe_bullets(page)
-    tf = _add_textbox(slide, CONTENT_LEFT + 0.2, BODY_Y, CONTENT_W - 0.2, 3.9)
+    tf = _add_textbox(slide, CONTENT_LEFT + 0.2, BODY_Y, CONTENT_W - 0.2, 3.3)
     _write_bullet_paras(tf, bullets)
 
-    # 底部赭红色带 + 浅金致谢行动行
-    _add_rect(slide, 0, SLIDE_H - 1.15, SLIDE_W, 1.15, COLOR_ACCENT)
-    tf_b = _add_textbox(slide, MARGIN, SLIDE_H - 0.95, CONTENT_W, 0.6)
+    # 居中仪式感三段：短细线 -> 谢谢聆听 -> 落款（风格 · 期待行动）
+    _add_rect(slide, SLIDE_W / 2 - 0.7, 5.35, 1.4, 0.014, COLOR_GOLD)
+    tf_t = _add_textbox(slide, MARGIN, 5.55, CONTENT_W, 0.7)
+    pt = tf_t.paragraphs[0]
+    pt.alignment = PP_ALIGN.CENTER
+    rt = pt.add_run()
+    rt.text = "谢谢聆听"
+    _set_run_font(rt, SIZE_PAGE_TITLE, COLOR_DARK, bold=True, spacing=SPACING_KICKER)
+    tf_b = _add_textbox(slide, MARGIN, 6.35, CONTENT_W, 0.4)
     pb = tf_b.paragraphs[0]
     pb.alignment = PP_ALIGN.CENTER
     rb = pb.add_run()
-    rb.text = f"谢谢聆听 · {style} · 期待行动"
-    _set_run_font(rb, SIZE_BODY_MID, COLOR_BG, bold=True)
+    rb.text = f"{style} · 期待行动"
+    _set_run_font(rb, SIZE_NOTE, COLOR_CAPTION)
 
 
 # ================================================================ 降级兜底页
@@ -867,6 +997,14 @@ _LAYOUTS = {
     "chart": _render_chart,
     "closing": _render_closing,
 }
+
+# ---- 图示版式（ppt_diagrams：timeline/process/pyramid）：防御式导入，
+# 模块缺席时这三种 layout 经「未知 layout 降级 bullets」路径自动兜底
+try:
+    from ppt_diagrams import DIAGRAM_RENDERERS as _DIAGRAM_RENDERERS
+except Exception:  # noqa: BLE001 - 缺席不阻断，降级即可
+    _DIAGRAM_RENDERERS = {}
+_LAYOUTS.update(_DIAGRAM_RENDERERS)
 
 
 # ================================================================ 公开 API
@@ -900,8 +1038,9 @@ def render_deck(prs, deck: dict, style: str = "工作汇报") -> None:
 
     blank = prs.slide_layouts[6]
 
-    # ---- 封面（深底浅字，自动开场备注；cover_image 有效时铺背景图 + 蒙层）
-    _render_cover(prs, title, subtitle, style, cover_image=cover_image)
+    # ---- 封面（无图编辑部式 / 有图全出血双构图；cover_image 无效自动降级无图）
+    _render_cover(prs, title, subtitle, style, cover_image=cover_image,
+                  page_total=len(pages) + 1)   # 底部信息行「共 N 页」用
 
     total = len(pages) + 1   # 物理总页数（含封面），页脚用
 

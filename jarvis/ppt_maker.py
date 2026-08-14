@@ -105,11 +105,18 @@ IMG_DL_TIMEOUT = 20       # 图片下载单张预算（秒）
 # 全套配图统一风格后缀：由代码拼接到每条画面描述之后，保证整套图风格一致
 IMAGE_STYLE_SUFFIX = "，极简扁平插画风格，暖色调，赭红与米白配色，无文字无水印"
 
-# ---- 版式词汇表（路 A 交接契约，八种）----
+# ---- 版式词汇表（路 A 交接契约，八种基础版式 + 三种图示版式）----
 LAYOUTS = {"toc", "section", "bullets", "two_column",
-           "big_number", "quote", "chart", "closing"}
+           "big_number", "quote", "chart", "closing",
+           "timeline", "process", "pyramid"}       # 图示版式（ppt_diagrams 渲染）
 NO_DETAIL_LAYOUTS = {"toc", "section"}      # 不需要精写：大纲字段直接用
 CHART_TYPES = {"bar", "pie", "line"}        # chart.type 合法值
+
+# ---- 图示版式（路 A 扩展：ppt_diagrams.DIAGRAM_RENDERERS 渲染）----
+# 讲历史演进/时间节点 -> timeline；讲步骤/流程/做法 -> process；讲层级/优先级/递进 -> pyramid
+DIAGRAM_LAYOUTS = {"timeline", "process", "pyramid"}
+DIAGRAM_KEYS = {"timeline": "events", "process": "steps", "pyramid": "levels"}
+DIAGRAM_MAX_ITEMS = {"timeline": 6, "process": 5, "pyramid": 5}   # 节点数上限
 
 # ---- 质量闸（逐页验收）----
 GATE_MIN_BULLETS = 4                 # bullets 系每页至少 4 条要点
@@ -323,7 +330,7 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
   "cover_image_prompt": "封面背景图的画面描述（必需，见下方配图规则）",
   "pages": [
     {{
-      "layout": "本页版式（八种之一，见下方选版式规则）",
+      "layout": "本页版式（十一种之一，见下方选版式规则）",
       "page_title": "本页核心断言（≤22字，见下方标题规则）",
       "core_point": "本页核心论点，一句话（30-50字）：必须具体、有信息量，是本页正文要论证的靶心",
       "keywords": ["本页 3-5 个关键词：具体的技术名词、数据点、案例名或机制名"],
@@ -349,7 +356,7 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
 - 画面描述必须具体：写清主体 + 场景 + 色调，中英文均可；只描述画面内容，
   统一风格由系统拼接，不要自己写风格词或「插画」「无文字」这类指令。
 
-【选版式规则】为每页从以下八种版式中选最合适的一种，写进 "layout"，并按需附加字段：
+【选版式规则】为每页从以下十一种版式中选最合适的一种，写进 "layout"，并按需附加字段：
 - "bullets"：默认形态，绝大多数内容页用它，无需附加字段；
 - "two_column"：内容天然有对比/对立结构（利弊、前后、中外）时选用，
   附加 "left": {{"heading": "左栏标题"}} 和 "right": {{"heading": "右栏标题"}}；
@@ -360,6 +367,12 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
     "categories": ["类别1", "类别2", "类别3"],
     "series": [{{"name": "系列名", "values": [数值1, 数值2, 数值3]}}]}}，
   values 先给合理估计值（后续精写阶段会校准），数量与 categories 一致；
+- "timeline"：时间轴图示。讲历史演进/发展阶段/关键时间节点时选用，
+  附加 "events": [{{"label": "节点标题（≤12字）", "desc": "一句话说明（≤40字）"}}]（2-6 个，按时间先后排列）；
+- "process"：流程步骤图示。讲步骤/流程/做法/实施路径时选用，
+  附加 "steps": [{{"label": "步骤名（≤12字）", "desc": "一句话说明（≤40字）"}}]（2-5 个，按执行顺序排列）；
+- "pyramid"：金字塔层级图示。讲层级/优先级/递进关系（如需求层次、能力分层）时选用，
+  附加 "levels": [{{"label": "层级名（≤12字）", "desc": "一句话说明（≤40字）"}}]（2-5 层，自顶层向下排列）；
 - "quote"：金句/名言点题页，附加 "quote": "金句原文" 和 "attribution": "出处"，
   全篇至多 1 页，可以没有；
 - "section"：章节分隔页，仅当总页数 ≥12 时才允许插入，可以没有；
@@ -367,7 +380,8 @@ _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」�
   附加 "entries": ["各页标题", ...]，不计入 {pages} 页正文页数；
 - "closing"：收尾页（行动建议/总结要点），最后一页用它，无需附加字段。
 - 版式节奏：同一种版式不得连续出现超过 2 页（bullets 除外但也应穿插变化），
-  用 two_column / big_number / chart / quote 打散连续感，全篇读起来有呼吸。
+  用 two_column / big_number / chart / timeline / process / pyramid / quote 打散连续感，
+  全篇读起来有呼吸。
 
 要求：
 - pages 数组恰好 {pages} 项正文页（toc 另算），对应 {pages} 页内容；
@@ -461,6 +475,10 @@ def _gen_outline(topic: str, pages: int, style: str, caller, research: str = "",
         elif layout == "quote":
             entry["quote"] = str(item.get("quote") or "").strip()[:150]
             entry["attribution"] = str(item.get("attribution") or "").strip()[:40]
+        elif layout in DIAGRAM_LAYOUTS:
+            # 图示版式草稿：events/steps/levels 先收大纲草稿，精写阶段校准
+            key = DIAGRAM_KEYS[layout]
+            entry[key] = _norm_diagram_items(item.get(key), DIAGRAM_MAX_ITEMS[layout])
         outline_pages.append(entry)
 
     if not outline_pages:
@@ -600,6 +618,54 @@ _CHART_TASK = """本页版式：图表页（chart）。大纲草稿（数据需�
 - 风格要求：{style_hint}；
 - speaker_note 为 150-250 字的口语化演讲稿：图怎么看、结论是什么、如何过渡。"""
 
+_TIMELINE_TASK = """本页版式：时间轴图示页（timeline）。大纲草稿节点（可校准改写）：{draft}
+
+只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
+{{
+  "events": [{{"label": "节点标题", "desc": "一句话说明"}}],
+  "speaker_note": "本页演讲稿"
+}}
+
+硬性要求（验收线，达不到会被退回重写）：
+- events 2 到 6 个，按时间先后排列；每个 label ≤12 字、desc ≤40 字；
+- 节点必须是真实、具体的时间节点或阶段（带年份/时期/阶段名），禁止空泛分期；
+- desc 说清该节点发生了什么、为什么是关键拐点，必须承载具体事实，禁止空话套话；
+- 所有节点合起来必须直接论证本页断言式标题（标题是论点，时间线是它的论据）；
+- 风格要求：{style_hint}；
+- speaker_note 为 150-250 字的口语化演讲稿：沿时间线怎么串讲、拐点在哪、如何过渡。"""
+
+_PROCESS_TASK = """本页版式：流程步骤图示页（process）。大纲草稿步骤（可校准改写）：{draft}
+
+只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
+{{
+  "steps": [{{"label": "步骤名", "desc": "一句话说明"}}],
+  "speaker_note": "本页演讲稿"
+}}
+
+硬性要求（验收线，达不到会被退回重写）：
+- steps 2 到 5 个，按执行顺序排列；每个 label ≤12 字、desc ≤40 字；
+- 每一步必须是可执行、可检验的动作或阶段，步骤之间要有真实的先后依赖；
+- desc 说清这一步做什么、做到什么程度算完成，必须具体可操作，禁止空话套话；
+- 整条流程合起来必须直接论证本页断言式标题（标题是论点，流程是它的论据）；
+- 风格要求：{style_hint}；
+- speaker_note 为 150-250 字的口语化演讲稿：流程怎么走、哪步最容易出错、如何过渡。"""
+
+_PYRAMID_TASK = """本页版式：金字塔层级图示页（pyramid）。大纲草稿层级（可校准改写）：{draft}
+
+只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
+{{
+  "levels": [{{"label": "层级名", "desc": "一句话说明"}}],
+  "speaker_note": "本页演讲稿"
+}}
+
+硬性要求（验收线，达不到会被退回重写）：
+- levels 2 到 5 层，自顶层（最高级/最终目标）向下排列；每个 label ≤12 字、desc ≤40 字；
+- 层与层之间必须有真实的递进/支撑关系：下层是上层的基础或前提；
+- desc 说清该层包含什么、为什么处在这个位置，必须具体，禁止空话套话；
+- 整个层级结构必须直接论证本页断言式标题（标题是论点，分层是它的论据）；
+- 风格要求：{style_hint}；
+- speaker_note 为 150-250 字的口语化演讲稿：从哪层讲起、层间怎么递进、如何过渡。"""
+
 _QUOTE_TASK = """本页版式：金句页（quote）。
 
 只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
@@ -668,6 +734,21 @@ def _norm_stats(raw) -> list:
     return stats
 
 
+def _norm_diagram_items(raw, max_items: int = 5) -> list:
+    """归一图示节点列表（timeline.events / process.steps / pyramid.levels）：
+    label 截 16 字、desc 截 60 字（契约要求 ≤12/≤40，这里留防御余量），空壳丢弃。"""
+    items = []
+    if isinstance(raw, list):
+        for it in raw[:max_items]:
+            if not isinstance(it, dict):
+                continue
+            label = str(it.get("label") or "").strip()[:16]
+            desc = str(it.get("desc") or "").strip()[:60]
+            if label or desc:
+                items.append({"label": label, "desc": desc})
+    return items
+
+
 def _coerce_float(v) -> float:
     """chart values 强制转 float：字符串数字、千分位逗号、百分号都能吃，转不动补 0.0。"""
     try:
@@ -720,6 +801,9 @@ def _extract_content(layout: str, data: dict, item: dict) -> dict:
     if layout == "quote":
         return {"quote": str(data.get("quote") or "").strip()[:150],
                 "attribution": str(data.get("attribution") or "").strip()[:40]}
+    if layout in DIAGRAM_LAYOUTS:
+        key = DIAGRAM_KEYS[layout]
+        return {key: _norm_diagram_items(data.get(key), DIAGRAM_MAX_ITEMS[layout])}
     # bullets / closing 及任何漏网版式
     return {"bullets": _norm_bullets(data.get("bullets"))}
 
@@ -772,6 +856,17 @@ def _quality_check_page(layout: str, content: dict, style: str):
         if len(q) < GATE_QUOTE_MIN_CHARS:
             return False, f"金句只有 {len(q)} 字（要求 ≥{GATE_QUOTE_MIN_CHARS} 字），太短、撑不起一页"
         return True, ""
+    if layout in DIAGRAM_LAYOUTS:
+        items = content[DIAGRAM_KEYS[layout]]
+        if len(items) < 2:
+            return False, f"图示只有 {len(items)} 个节点（要求至少 2 个），撑不起一页图示"
+        empty = [i + 1 for i, it in enumerate(items) if not it["label"]]
+        if empty:
+            return False, f"第 {empty} 个节点的 label 为空，图示节点标题必须非空"
+        chars = sum(len(it["label"]) + len(it["desc"]) for it in items)
+        if chars < 40:
+            return False, f"图示节点说明合计只有 {chars} 字（要求 ≥40 字），节点说明太浅、缺具体信息"
+        return True, ""
     # bullets / closing
     return _quality_check(content["bullets"], style)
 
@@ -786,6 +881,8 @@ def _content_nonempty(layout: str, content: dict) -> bool:
         return bool(content["chart"]["categories"] or content["bullets"])
     if layout == "quote":
         return bool(content["quote"])
+    if layout in DIAGRAM_LAYOUTS:
+        return bool(content[DIAGRAM_KEYS[layout]])
     return bool(content["bullets"])
 
 
@@ -800,6 +897,9 @@ def _content_chars(layout: str, content: dict) -> int:
         return sum(len(b) for b in content["bullets"])
     if layout == "quote":
         return len(content["quote"])
+    if layout in DIAGRAM_LAYOUTS:
+        return sum(len(it["label"]) + len(it["desc"])
+                   for it in content[DIAGRAM_KEYS[layout]])
     return sum(len(b) for b in content["bullets"])
 
 
@@ -828,6 +928,9 @@ def _synthesize_note_for(layout: str, item: dict, content: dict) -> str:
         return (f"这一页是金句页。先平稳念出这句话：「{content['quote']}」（{content['attribution']}），"
                 f"停顿两秒让它沉下去，再用一两句话点明它与「{item['core_point'][:30]}」的关系，"
                 "然后自然过渡到下一页。建议用时约 1 分钟。")
+    if layout in DIAGRAM_LAYOUTS:
+        flat = [f"{it['label']}：{it['desc']}" for it in content[DIAGRAM_KEYS[layout]]]
+        return _synthesize_note(title, flat) if flat else _synthesize_note(title, [item["core_point"]])
     return _synthesize_note(title, content.get("bullets") or [item["core_point"]])
 
 
@@ -896,6 +999,13 @@ def _page_prompt(layout: str, style: str, idx: int, total: int, topic: str,
     if layout == "chart":
         draft = json.dumps(item.get("chart") or {}, ensure_ascii=False) or "（无草稿）"
         return ctx + _CHART_TASK.format(draft=draft, style_hint=style_hint) + intent_block
+    if layout in DIAGRAM_LAYOUTS:
+        # 图示版式：让 LLM 产出 events/steps/levels（注入大纲草稿与意图硬约束）
+        key = DIAGRAM_KEYS[layout]
+        draft = json.dumps(item.get(key) or [], ensure_ascii=False) or "（无草稿）"
+        task = {"timeline": _TIMELINE_TASK, "process": _PROCESS_TASK,
+                "pyramid": _PYRAMID_TASK}[layout]
+        return ctx + task.format(draft=draft, style_hint=style_hint) + intent_block
     # quote
     return ctx + _QUOTE_TASK.format(style_hint=style_hint) + intent_block
 
@@ -1018,6 +1128,15 @@ def _normalize_page(item: dict, page: dict) -> dict:
                   "chart": chart, "bullets": content["bullets"][:3]}
     elif layout == "closing":
         pg = {"layout": "closing", "page_title": title, "bullets": content["bullets"]}
+    elif layout in DIAGRAM_LAYOUTS:
+        key = DIAGRAM_KEYS[layout]
+        items = [it for it in content[key][:DIAGRAM_MAX_ITEMS[layout]] if it["label"]]
+        if len(items) < 2:                   # 防御：节点不足的图示页降级 bullets
+            fb = _fallback_page(item)
+            pg = {"layout": "bullets", "page_title": title, "bullets": fb["bullets"]}
+            content = {"bullets": fb["bullets"]}
+        else:
+            pg = {"layout": layout, "page_title": title, key: items}
     else:                                    # bullets 及未知降级
         pg = {"layout": "bullets", "page_title": title,
               "bullets": content.get("bullets") or []}
@@ -1276,6 +1395,11 @@ def _flatten_page(pg: dict) -> list:
         return [pg["core_point"]]
     if layout == "toc":
         return [f"{i + 1}. {e}" for i, e in enumerate(pg["entries"])]
+    if layout in ("timeline", "process", "pyramid"):
+        key = {"timeline": "events", "process": "steps", "pyramid": "levels"}[layout]
+        lines = [f"{i + 1}. {it['label']} —— {it['desc']}"
+                 for i, it in enumerate(pg.get(key) or [])]
+        return lines or [pg.get("page_title") or "本页内容筹备中"]
     return []
 
 
