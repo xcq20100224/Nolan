@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Nolan · PPT 引擎（ppt_maker.py）——两阶段精写 + 自动选版式版
+Nolan · PPT 引擎（ppt_maker.py）——意图解析 + 两阶段精写 + 自动选版式版
 一句话生成带演讲稿的真 .pptx 文件：
+  - 阶段 0 之前 · 意图解析：先从 topic（含 brain 纠正路由合并进来的修正要求）
+    解析意图四要素——audience（谁听）、perspective（谁在说/口吻）、purpose（目的）、
+    content_type（讲话动员型 | 分析报告型）；规则先行分类，讲话型补一次轻量 LLM 精修，
+    任何失败回退规则结果，绝不阻断制作；讲话动员型跳过联网市场研究（讲话稿不需要
+    行业数据，查回来的市场材料会把内容拖向宏大叙事），大纲与逐页精写 prompt
+    注入四要素硬约束（标题是对听众说的话、备注以讲话者口吻对听众讲话）；
   - 阶段 1 · 大纲：1 次 LLM 调用产出 总标题 + 副标题 + 每页
     {layout, page_title, core_point, keywords, ...版式草稿字段}；
     标题规则为结论式标题（action title）：page_title 必须是带数字/比较级的断言句，
@@ -203,6 +209,109 @@ def _call_json(prompt: str, caller, repair_once: bool = True):
     return data
 
 
+# ---------------------------------------------------------------- 阶段 0 之前：意图四要素解析
+# 第一性原理：先理解「谁听、谁在说、为什么说、写什么型」，再决定要不要联网研究、
+# 用什么内容类型。讲话动员型跳过市场研究、走讲话稿约束；分析报告型维持研究。
+
+SPEECH = "讲话动员型"
+REPORT = "分析报告型"
+
+# 讲话动员型判定信号：topic（含 brain 纠正路由合并进来的修正要求）命中即讲话型
+_SPEECH_SIGNALS = ("站在", "视角", "口吻", "告诉", "致辞", "动员",
+                   "讲话", "发言", "演讲", "寄语", "叮嘱")
+_SPEECH_RE = re.compile(r"(?:对|向)[^，。,.]{1,12}?(?:讲|致辞|发言)")
+
+_INTENT_PROMPT = """从下面这个 PPT 需求里提取意图四要素。只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
+{{
+  "content_type": "讲话动员型 或 分析报告型",
+  "audience": "谁听（如：同学们）",
+  "perspective": "谁在说/什么口吻（如：班主任对同学们讲话）",
+  "purpose": "目的（如：收心、告知开学安排、鼓劲）"
+}}
+
+判定规则：需求里出现「站在…视角/口吻」「告诉…」「对…讲」「致辞」「动员」「讲话」等，
+是要一个具体的人对一群人讲话 -> 讲话动员型；否则默认分析报告型。
+
+需求：「{topic}」"""
+
+
+def _rule_intent(topic: str) -> dict:
+    """规则兜底意图解析：关键词命中即讲话动员型并做正则提取，否则分析报告型。
+    纯本地、零调用、零异常；LLM 失败/缺席时的保底答案。"""
+    is_speech = any(k in topic for k in _SPEECH_SIGNALS) or bool(_SPEECH_RE.search(topic))
+    if not is_speech:
+        return {"content_type": REPORT,
+                "audience": "行业从业者与决策者",
+                "perspective": "分析师",
+                "purpose": "呈现事实与趋势判断，辅助决策"}
+    # 视角/口吻提取：「站在班主任的视角」「以老班长的口吻」
+    perspective = ""
+    m = re.search(r"(?:站在|以)([^，。,.、（）()]{1,10}?)的(?:视角|口吻|角度|立场|身份)", topic)
+    if m:
+        perspective = m.group(1).strip()
+    # 听众提取：「告诉同学们」「对同学们讲」「向同学们」
+    audience = ""
+    m = re.search(r"(?:告诉|告知)([^，。,.、（）()]{1,10}?)(?:要|说|讲|，|,|。|$)", topic)
+    if not m:
+        m = re.search(r"(?:对|向)([^，。,.、（）()]{1,10}?)(?:讲|说|致辞|发言|，|,|。|$)", topic)
+    if m:
+        audience = m.group(1).strip()
+    return {"content_type": SPEECH,
+            "audience": audience or "听众",
+            "perspective": perspective or "主讲人",
+            "purpose": "收心聚力、告知事项、鼓劲加油"}
+
+
+def _parse_intent(topic: str, caller) -> dict:
+    """意图四要素解析：规则先行分类；讲话动员型再补一次轻量 LLM 提取做精修
+    （视角/听众/目的的措辞与遗漏补齐）。LLM 任何失败静默回退规则结果，
+    永不抛异常、不阻断制作；分析报告型不烧这次调用。"""
+    intent = _rule_intent(topic)
+    if intent["content_type"] != SPEECH or caller is None:
+        return intent
+    try:
+        data = _call_json(_INTENT_PROMPT.format(topic=topic), caller, repair_once=False)
+    except Exception:
+        return intent
+    if not isinstance(data, dict):
+        return intent
+    ct = str(data.get("content_type") or "").strip()
+    if ct in (SPEECH, REPORT):
+        intent["content_type"] = ct
+    for key in ("audience", "perspective", "purpose"):
+        v = str(data.get(key) or "").strip()[:30]
+        if v:
+            intent[key] = v
+    return intent
+
+
+def _intent_block(intent: dict) -> str:
+    """把意图四要素写成注入大纲/精写 prompt 的硬约束块（拼在 prompt 尾部）。"""
+    if not intent:
+        return ""
+    audience = intent.get("audience") or "听众"
+    perspective = intent.get("perspective") or "主讲人"
+    purpose = intent.get("purpose") or ""
+    if intent.get("content_type") == SPEECH:
+        return (
+            "\n\n【讲话意图 · 硬约束】\n"
+            f"- 这是一份讲话动员型 PPT：{perspective}对{audience}讲话，"
+            f"目的是：{purpose or '动员与告知'}；\n"
+            "- 所有标题必须是「对听众说的话」：温暖、直接、可行动，像一句叮嘱或提醒；"
+            "本条优先于上文「带数字/比较级的断言」规则；\n"
+            "- 严禁「X亿市场」「全景解析」「产业格局」「消费趋势」「从业者」这类行业报告式"
+            "宏大断言，严禁把讲话稿写成市场分析；\n"
+            "- 内容落在听众自己身上：他们要做的事、要记住的时间与安排、要调整的状态；\n"
+            f"- 每页 speaker_note 必须是演讲稿：以{perspective}的口吻直接称呼听众"
+            f"（如「{audience}，…」），口语化、上台能照着念。")
+    return (
+        "\n\n【受众意图 · 硬约束】\n"
+        f"- 这是一份分析报告型 PPT：受众是{audience}，目的是：{purpose}；\n"
+        "- 材料取舍：只保留与主题直接相关、对受众有意义的事实与数据，"
+        "明显串题、与主题无关的内容一律丢弃；\n"
+        f"- 每页 speaker_note 是面向{audience}的口语化讲解稿。")
+
+
 # ---------------------------------------------------------------- 阶段 1：大纲
 
 _OUTLINE_PROMPT = """你是资深演示文稿策划。请为主题「{topic}」设计一份 {pages} 页的{style} PPT 大纲。
@@ -276,12 +385,14 @@ def _norm_layout(raw) -> str:
     return layout if layout in LAYOUTS else "bullets"
 
 
-def _gen_outline(topic: str, pages: int, style: str, caller, research: str = ""):
+def _gen_outline(topic: str, pages: int, style: str, caller, research: str = "",
+                 intent: dict = None):
     """阶段 1：拿大纲。返回 (规范化大纲 dict, None) 或 (None, 人话错误)。
     大纲页除 page_title/core_point/keywords 外，还带 layout 与版式草稿字段。
-    research：R1 联网研究材料（空串=无，纯模型记忆）。"""
+    research：R1 联网研究材料（空串=无，纯模型记忆）。
+    intent：意图四要素（None=未解析，prompt 不注入意图块）。"""
     prompt = _OUTLINE_PROMPT.format(topic=topic, pages=pages, style=style) \
-        + _research_block(research)
+        + _research_block(research) + _intent_block(intent)
     try:
         data = _call_json(prompt, caller, repair_once=True)
     except Exception:
@@ -756,8 +867,8 @@ def _fallback_page(item: dict) -> dict:
 
 def _page_prompt(layout: str, style: str, idx: int, total: int, topic: str,
                  deck_title: str, prev_title: str, next_title: str,
-                 item: dict, style_hint: str) -> str:
-    """按版式组装逐页精写 prompt。"""
+                 item: dict, style_hint: str, intent_block: str = "") -> str:
+    """按版式组装逐页精写 prompt。intent_block：意图四要素硬约束块（空串=未解析）。"""
     if layout in ("bullets", "closing"):
         prompt = _PAGE_PROMPT.format(
             style=style, idx=idx, total=total, topic=topic, deck_title=deck_title,
@@ -768,7 +879,7 @@ def _page_prompt(layout: str, style: str, idx: int, total: int, topic: str,
         if layout == "closing":
             prompt += ("\n- 本页是全篇收尾页：要点以总结结论与可执行的行动建议为主，"
                        "每条行动建议要有主语、有抓手，不要空喊口号。")
-        return prompt
+        return prompt + intent_block
     ctx = _PAGE_CONTEXT.format(
         style=style, idx=idx, total=total, topic=topic, deck_title=deck_title,
         prev_title=prev_title, next_title=next_title,
@@ -778,15 +889,15 @@ def _page_prompt(layout: str, style: str, idx: int, total: int, topic: str,
         return ctx + _TWO_COLUMN_TASK.format(
             left_heading=item.get("left_heading") or "左栏",
             right_heading=item.get("right_heading") or "右栏",
-            min_chars=_gate_min_chars(style), style_hint=style_hint)
+            min_chars=_gate_min_chars(style), style_hint=style_hint) + intent_block
     if layout == "big_number":
         draft = json.dumps(item.get("stats") or [], ensure_ascii=False) or "（无草稿）"
-        return ctx + _BIG_NUMBER_TASK.format(draft=draft, style_hint=style_hint)
+        return ctx + _BIG_NUMBER_TASK.format(draft=draft, style_hint=style_hint) + intent_block
     if layout == "chart":
         draft = json.dumps(item.get("chart") or {}, ensure_ascii=False) or "（无草稿）"
-        return ctx + _CHART_TASK.format(draft=draft, style_hint=style_hint)
+        return ctx + _CHART_TASK.format(draft=draft, style_hint=style_hint) + intent_block
     # quote
-    return ctx + _QUOTE_TASK.format(style_hint=style_hint)
+    return ctx + _QUOTE_TASK.format(style_hint=style_hint) + intent_block
 
 
 def _research_block(research: str) -> str:
@@ -798,15 +909,18 @@ def _research_block(research: str) -> str:
     return (
         "\n\n【真实研究材料】以下是联网检索到的与主题相关的最新事实、数据与案例"
         "（附来源与年份；方括号引文编号请忽略）：大纲设计、标题断言、正文数据与"
-        "图表数值必须优先采用这些材料，且不得与材料中的事实矛盾：\n" + research + "\n")
+        "图表数值必须优先采用这些材料，且不得与材料中的事实矛盾；"
+        "只采用与主题直接相关、对受众有意义的材料，明显串题、与主题无关的内容"
+        "一律忽略：\n" + research + "\n")
 
 
 def _gen_page(topic: str, deck_title: str, style: str, item: dict,
               idx: int, total: int, prev_title: str, next_title: str,
-              caller, research: str = "") -> dict:
+              caller, research: str = "", intent: dict = None) -> dict:
     """阶段 2 单页：按版式精写 -> 版式质量闸 -> 不达标重写（最多 2 次）-> 取历次最好 -> 兜底。
     返回 {layout, content, speaker_note, rewrites, fallback}。
-    toc/section 不烧调用；彻底失败时非常规版式降级为 bullets 兜底页。"""
+    toc/section 不烧调用；彻底失败时非常规版式降级为 bullets 兜底页。
+    intent：意图四要素（None=未解析，prompt 不注入意图块）。"""
     layout = item.get("layout", "bullets")
 
     # toc/section：大纲字段直接用，演讲稿模板合成，零 LLM 调用
@@ -817,7 +931,8 @@ def _gen_page(topic: str, deck_title: str, style: str, item: dict,
 
     style_hint = _STYLE_HINTS.get(style, _STYLE_HINTS["科普分享"])
     prompt = _page_prompt(layout, style, idx, total, topic, deck_title,
-                          prev_title, next_title, item, style_hint) \
+                          prev_title, next_title, item, style_hint,
+                          intent_block=_intent_block(intent)) \
         + _research_block(research)   # 研究材料拼一次，重写 prompt 引用 original_prompt 自动带上
 
     candidates = []   # 历次有效候选：(content, note, 是否达标)
@@ -1288,10 +1403,23 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
     stats = {"outline_retries": 0, "page_stats": [], "llm_calls": 0}
     last_run = stats
 
+    # ---- 意图解析步：先从 topic（含 brain 纠正路由合并进来的修正要求）解析
+    #      意图四要素（audience/perspective/purpose/content_type），
+    #      决定要不要联网研究、走讲话稿还是分析报告的内容约束。
+    #      规则先行，讲话型补一次轻量 LLM 精修；任何失败回退规则结果，绝不阻断
+    intent = _parse_intent(topic, caller)
+    stats["intent"] = dict(intent)
+    if intent["content_type"] == SPEECH:
+        _emit(f"明白了：以{intent['perspective']}口吻对{intent['audience']}讲话")
+
     # ---- 阶段 0：联网研究（R1，25s 硬预算；失败/关闭返回空串，
     #      大纲与精写自动降级为纯模型记忆，行为与接入前一致）
+    #      讲话动员型跳过市场研究：讲话稿不需要行业数据，查回来的市场材料
+    #      反而会把内容拖向宏大叙事（开学季串出动力电池的病例）
     research = ""
-    if with_research and _research_topic is not None:
+    if intent["content_type"] == SPEECH:
+        _emit("讲话稿凭储备来写，不查市场资料")
+    elif with_research and _research_topic is not None:
         _emit("正在联网查资料…")
         try:
             research = _research_topic(topic) or ""
@@ -1303,7 +1431,7 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
 
     # ---- 阶段 1：大纲（失败即整单失败，没有大纲就没有弹药）
     _emit("正在设计大纲…")
-    outline, err = _gen_outline(topic, pages, style, caller, research)
+    outline, err = _gen_outline(topic, pages, style, caller, research, intent)
     if outline is None:
         return {"ok": False, "error": err}
     _emit(f"大纲好了，共 {len(outline['pages'])} 页，逐页精写")
@@ -1318,7 +1446,8 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
         prev_t = titles[i - 1] if i > 0 else "（封面）"
         next_t = titles[i + 1] if i + 1 < len(titles) else "（结束页）"
         page = _gen_page(topic, outline["title"], style, item,
-                         i + 1, len(deck_pages), prev_t, next_t, caller, research)
+                         i + 1, len(deck_pages), prev_t, next_t, caller,
+                         research, intent)
         contents.append(page)
 
     # ---- 归一化成路 A 契约 deck，并登记运行统计
