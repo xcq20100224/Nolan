@@ -2,6 +2,10 @@
 @tailwind components;
 @tailwind utilities;
 
+/* 首帧兜底底色（原 index.html 内联 style，vite7 构建期 html-proxy bug 迁此） */
+html { background: #ffffff; }
+html[data-theme='dark'] { background: #121212; }
+
 @layer base {
   /* ============================================================
      Kimi 双主题变量（亮色默认 / [data-theme="dark"] 暗色）

@@ -13,11 +13,7 @@
         document.documentElement.dataset.theme = 'light'
       }
     </script>
-    <style>
-      /* CSS 变量加载前的兜底底色，杜绝主题闪烁 */
-      html { background: #ffffff; }
-      html[data-theme='dark'] { background: #121212; }
-    </style>
+    <!-- 兜底底色已迁入 src/index.css 顶部（内联 style 会触发 vite7 构建期 html-proxy bug） -->
   </head>
   <body>
     <div id="root"></div>

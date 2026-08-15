@@ -136,7 +136,7 @@ except Exception:
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-12-trust"
+_VERSION = "2026-08-15-standalone"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -174,6 +174,24 @@ _EXCERPT_CHARS = 8000                      # 响应 excerpt 带上前 8000 字
                                            # （与前端附件拼接上限一致；超出部分
                                            #  由 read_file 工具经 uploads/ 子目录的
                                            #  .extracted.txt 落盘全文回读）
+
+# ---- 静态托管（软件形态）：vite 构建产物 dist/ 由后端直接服务，
+# 双击 bat 即可用，不再依赖 vite dev server；SPA 路径回退 index.html
+_DIST_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist"))
+_STATIC_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".json": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json",
+}
 
 # /api/files 下载白名单（图片之外的扩展；下载统一带 Content-Disposition: attachment）
 _DOWNLOAD_MIME = {
@@ -2165,6 +2183,45 @@ class NolanHandler(BaseHTTPRequestHandler):
         """CORS 预检。"""
         self._send_json(200, {"ok": True})
 
+    def _serve_static(self, path: str) -> bool:
+        """托管 vite 构建产物 dist/（软件形态）。命中返回 True，未命中/越界返回 False。
+
+        - 路径穿越一律不服务（realpath 必须落在 dist 内）；
+        - 无扩展名或目录路径按 SPA 回退 index.html（前端路由）；
+        - 带 hash 的 assets 长缓存，index.html 不缓存（发版即生效）；
+        - dist 不存在（未构建）时返回 False，调用方走 404，绝不影响 /api。
+        """
+        try:
+            rel = path.lstrip("/")
+            full = os.path.normpath(os.path.join(_DIST_DIR, rel))
+            if os.path.commonpath([os.path.abspath(full), os.path.abspath(_DIST_DIR)]
+                                  ) != os.path.abspath(_DIST_DIR):
+                return False
+            if not os.path.isfile(full):
+                if "." in os.path.basename(rel):   # 有扩展名的缺失文件：真 404
+                    return False
+                full = os.path.join(_DIST_DIR, "index.html")  # SPA 回退
+                if not os.path.isfile(full):
+                    return False
+            ext = os.path.splitext(full)[1].lower()
+            mime = _STATIC_MIME.get(ext)
+            if mime is None:
+                return False
+            with open(full, "rb") as f:
+                blob = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(blob)))
+            if os.path.basename(full) == "index.html" or "/assets/" not in full.replace(os.sep, "/"):
+                self.send_header("Cache-Control", "no-cache")
+            else:
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.end_headers()
+            self.wfile.write(blob)
+            return True
+        except Exception:
+            return False
+
     def do_GET(self):
         path = urlparse(self.path).path
         try:
@@ -2266,7 +2323,9 @@ class NolanHandler(BaseHTTPRequestHandler):
             elif path.startswith("/api/files/"):
                 self._serve_file(path[len("/api/files/"):])
             else:
-                self._send_error_json(404, f"未知路径：{path}")
+                # 非 /api 路径：尝试静态托管（dist/ 软件形态），未命中才 404
+                if not self._serve_static(path):
+                    self._send_error_json(404, f"未知路径：{path}")
         except Exception as e:
             self._send_error_json(500, f"服务器处理请求时出错了：{e}")
 
