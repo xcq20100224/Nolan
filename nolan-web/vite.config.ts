@@ -8,11 +8,12 @@ export default defineConfig({
   base: './',
   plugins: [inspectAttr(), react()],
   server: {
-    // 网页版统一预览端口；host: true 允许局域网访问。
-    // 注意：Windows 排除端口段 5573~7631 几乎连续（netsh excludedportrange 实测），
-    // 7000 系全部不可用（EACCES），故固定用 8600；CLI --port 传入时优先于本值
-    port: 8600,
-    strictPort: false,
+    // Kimi 预览认准 7100（实测不重映射、不透传 --port），必须固定 7100。
+    // strictPort: 若 7100 被 Windows 排除段锁死（EACCES/10013），
+    // 宁可大声失败也不悄悄挪端口——挪了 Kimi 照样探测 7100 扑空，故障更难查。
+    // host: true 允许局域网访问。
+    port: 7100,
+    strictPort: true,
     host: true,
     // 把 /api 代理到 Python 标准库后端（监听 7901）
     proxy: {
