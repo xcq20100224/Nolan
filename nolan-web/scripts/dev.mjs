@@ -122,11 +122,13 @@ backend.on("exit", (code, signal) => {
   }
 });
 
-// Ctrl+C / 终止信号 → 先清理后端再退出
+// Ctrl+C / 终止信号 → 只收前端，后端保活。
+// 为什么不连带杀后端：预览启动失败时 Kimi 会反复拉起/终止本脚本，
+// 每次连杀都把唯一可用的 7901 入口打没（真实事故，一天发生三次）；
+// server.py 自带单实例守护，重复启动无副作用，保活的代价远小于死掉的代价。
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
-    cleanup();
-    frontend.kill(sig);
+    frontend?.kill(sig);
     process.exit(0);
   });
 }
