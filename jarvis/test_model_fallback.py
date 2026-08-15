@@ -230,6 +230,27 @@ class ModelFallbackTest(unittest.TestCase):
         sleep_mock.assert_called_once_with(1)
         self.assertNotIn("glm-5.3", brain._thinking_unsupported_models)
 
+    def test_glm_web_search_inherits_demotion(self):
+        """P0 第 8/76 题病例：联网搜索通道曾直连 httpx 绕过降级，
+        glm-5.3 未授权时搜索静默哑掉。契约：走 _request_llm，403 自动降级。"""
+        calls = []
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            calls.append(dict(json))
+            if json["model"] == "glm-5.3":
+                raise _http_err(_resp_403_1220())
+            return _resp_ok("今天人工智能领域有三件事……")
+
+        cfg = {"base_url": "https://open.bigmodel.cn/api/paas/v4",
+               "api_key": "x", "model": "glm-5.3"}
+        with mock.patch.object(brain.httpx, "post", side_effect=fake_post), \
+                mock.patch.object(brain.time, "sleep"):
+            reply = brain._glm_web_search("今天的人工智能新闻", cfg)
+        self.assertEqual(reply, "今天人工智能领域有三件事……")
+        self.assertEqual([c["model"] for c in calls], ["glm-5.3", brain._MODEL_FALLBACK])
+        self.assertIn("tools", calls[1])  # 降级不丢 web_search 工具参数
+        self.assertTrue(brain._model_demoted)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

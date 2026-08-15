@@ -1416,15 +1416,13 @@ def _glm_web_search(query: str, cfg: dict) -> str | None:
     }
     headers = {"Authorization": "Bearer " + cfg["api_key"],
                "Content-Type": "application/json"}
-    try:
-        resp = httpx.post(base_url.rstrip("/") + "/chat/completions",
-                          json=payload, headers=headers, timeout=_API_TIMEOUT)
-        resp.raise_for_status()
-        reply = resp.json()["choices"][0]["message"]["content"].strip()
-        return reply or None
-    except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
-        print("[brain] 智谱联网搜索失败，降级本地抓取: %s" % e)
-        return None
+    # 走 _request_llm 而非直连：模型未授权（403/1220，如 glm-5.3 权限未开）时
+    # 自动降级 _MODEL_FALLBACK，联网搜索通道才不会随新模型配置一起哑掉
+    # （P0 第 8/76 题真实病例：直连绕过了降级，搜索长期静默退化到本地抓取）
+    reply = _request_llm(base_url.rstrip("/") + "/chat/completions", payload, headers)
+    if reply is None:
+        print("[brain] 智谱联网搜索失败，降级本地抓取")
+    return reply
 
 
 def _answer_from_search(query: str) -> str:

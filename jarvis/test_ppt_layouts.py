@@ -269,7 +269,7 @@ def test_unknown_layout_falls_back_to_bullets():
 
 def test_bullets_with_image():
     """bullets 带图页：左文右图 —— 有 Picture、浅金衬底在图下、文字仍在；
-    two_column 携带 image 字段应被忽略（保持纯文字）。"""
+    two_column 带图页：双栏文字保留 + 底部横图（限高居中、衬底在图下）。"""
     imgs = _make_test_images()
     deck = {
         "title": "配图版式测试", "subtitle": "",
@@ -282,11 +282,11 @@ def test_bullets_with_image():
              "image": imgs["img_4_3"],
              "speaker_note": "带图要点页：先讲左侧三条要点，再点右侧配图。"},
             {"layout": "two_column",
-             "page_title": "带 image 字段的两栏页（应忽略）",
+             "page_title": "双栏底部横图页",
              "left": {"heading": "左栏", "points": ["要点一"]},
              "right": {"heading": "右栏", "points": ["要点二"]},
-             "image": imgs["img_4_3"],   # two_column 不响应 image
-             "speaker_note": "两栏页应保持纯文字。"},
+             "image": imgs["img_16_9"],   # two_column 响应 image：底部横图
+             "speaker_note": "两栏对照讲完，点一下底部配图。"},
         ],
     }
     prs = _new_prs()
@@ -315,14 +315,86 @@ def test_bullets_with_image():
     # 4) 图高不超过正文区（5.1 英寸）
     assert pics[0].height <= Inches(5.11), f"图高超限：{pics[0].height}"
 
-    # 5) two_column 携带 image 字段被忽略：无 Picture
+    # 5) two_column 携带 image：底部横图渲染出来，双栏文字完整保留
     tc_slide = prs.slides[2]
-    assert not _pictures(tc_slide), "two_column 应忽略 image 字段，保持纯文字"
+    tc_pics = _pictures(tc_slide)
+    assert len(tc_pics) == 1, f"two_column 带图页应有 1 张底部横图，实际 {len(tc_pics)}"
     tc_text = "\n".join(sh.text_frame.text for sh in tc_slide.shapes if sh.has_text_frame)
-    assert "左栏" in tc_text and "右栏" in tc_text
+    assert "左栏" in tc_text and "右栏" in tc_text, "带图两栏页栏题应保留"
+    assert "要点一" in tc_text and "要点二" in tc_text, "带图两栏页要点应保留"
+    # 横图限高 2.15 英寸、压在正文区下方（正文区顶 1.7 + 让位 3.0 = 4.7 起）
+    assert tc_pics[0].height <= Inches(2.16), f"底部横图超高：{tc_pics[0].height}"
+    assert tc_pics[0].top >= Inches(4.69), "底部横图应位于双栏正文之下"
+    # 横图衬底同样在图片之下
+    tc_shapes = list(tc_slide.shapes)
+    tc_pic_idx = tc_shapes.index(tc_pics[0])
+    tc_gold = next((i for i, sh in enumerate(tc_shapes)
+                    if sh.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE
+                    and _fill_hex(sh) == "D9C9A3"), None)
+    assert tc_gold is not None and tc_gold < tc_pic_idx, "底部横图衬底应在图片之下"
 
     print("[PASS] test_bullets_with_image: 左文右图（配图+浅金衬底 z-order 正确）/ "
-          "two_column 忽略 image")
+          "two_column 底部横图（限高居中+双栏文字保留）")
+
+
+def test_two_column_without_image_unchanged():
+    """two_column 无图/图路径无效：与原版式逐像素一致（正文区高 4.1、无 Picture）。"""
+    deck = {
+        "title": "两栏无图回归", "subtitle": "",
+        "pages": [
+            {"layout": "two_column",
+             "page_title": "纯文字两栏页",
+             "left": {"heading": "左栏", "points": ["要点一", "要点二"]},
+             "right": {"heading": "右栏", "points": ["要点三", "要点四"]},
+             "speaker_note": "无图两栏页回归验证。"},
+            {"layout": "two_column",
+             "page_title": "图路径失效的两栏页",
+             "left": {"heading": "左栏", "points": ["要点一"]},
+             "right": {"heading": "右栏", "points": ["要点二"]},
+             "image": "C:/__nolan_no_such_dir__/no_such_img.png",   # 无效路径静默降级
+             "speaker_note": "无效图路径降级验证。"},
+        ],
+    }
+    prs = _new_prs()
+    render_deck(prs, deck)
+    prs = _reopen(prs)
+    for idx in (1, 2):
+        slide = prs.slides[idx]
+        assert not _pictures(slide), f"第 {idx + 1} 页无图/图失效时不应有 Picture"
+        texts = "\n".join(sh.text_frame.text for sh in slide.shapes if sh.has_text_frame)
+        assert "左栏" in texts and "右栏" in texts, f"第 {idx + 1} 页栏题应完整"
+
+    print("[PASS] test_two_column_without_image_unchanged: 无图/图失效时版式不变、零异常")
+
+
+def test_content_type_tone():
+    """content_type 口吻：教学课件型封面备注为教师开课口吻、结尾落款「温故知新」；
+    缺省/其他类型保持通用分享口吻与「期待行动」落款。"""
+    closing_page = {"layout": "closing", "page_title": "课堂小结",
+                    "bullets": ["回顾降次思想这个核心"], "speaker_note": "小结。"}
+    # 教学课件型
+    deck_cw = {"title": "一元二次方程", "subtitle": "初三数学", "content_type": "教学课件型",
+               "pages": [dict(closing_page)]}
+    prs = _new_prs()
+    render_deck(prs, deck_cw)
+    prs = _reopen(prs)
+    cover_note = _note_text(prs.slides[0])
+    assert "同学们好" in cover_note and "上课" in cover_note, \
+        f"课件型封面备注应为教师口吻，实际：{cover_note[:40]}"
+    cl_text = "\n".join(sh.text_frame.text for sh in prs.slides[1].shapes if sh.has_text_frame)
+    assert "温故知新" in cl_text, "课件型结尾落款应为「温故知新」"
+    assert "期待行动" not in cl_text, "课件型不应出现「期待行动」"
+
+    # 缺省（无 content_type）：通用口吻 + 期待行动（既有行为冻结）
+    deck_default = {"title": "工作汇报", "subtitle": "", "pages": [dict(closing_page)]}
+    prs = _new_prs()
+    render_deck(prs, deck_default)
+    prs = _reopen(prs)
+    assert "分享的主题" in _note_text(prs.slides[0]), "缺省封面备注应保持分享口吻"
+    cl_text2 = "\n".join(sh.text_frame.text for sh in prs.slides[1].shapes if sh.has_text_frame)
+    assert "期待行动" in cl_text2, "缺省结尾落款应保持「期待行动」"
+
+    print("[PASS] test_content_type_tone: 课件型教师口吻/温故知新，缺省保持分享口吻/期待行动")
 
 
 def test_cover_image():
@@ -537,6 +609,8 @@ if __name__ == "__main__":
     test_fault_tolerance()
     test_unknown_layout_falls_back_to_bullets()
     test_bullets_with_image()
+    test_two_column_without_image_unchanged()
+    test_content_type_tone()
     test_cover_image()
     test_missing_image_degrades()
     test_marker_color_rotation()

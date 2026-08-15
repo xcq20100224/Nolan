@@ -832,8 +832,8 @@ class PptMakerTest(unittest.TestCase):
         self.assertEqual(deck["pages"][9]["layout"], "closing")
         self.assertEqual(ppt_maker.last_run["images"], 9)  # 封面 + 8 页
 
-    # 23. 非 bullets 页的 image_prompt 被静默丢弃
-    def test_non_bullets_image_prompt_dropped(self):
+    # 23. 可配图版式 = {bullets, two_column}；其余版式的 image_prompt 被静默丢弃
+    def test_non_image_layouts_image_prompt_dropped(self):
         render = _MockRender()
         ppt_maker._render_deck = render
         http = _MockHTTP()
@@ -845,14 +845,14 @@ class PptMakerTest(unittest.TestCase):
         r = ppt_maker.make_ppt("人工智能简介", pages=4, llm_caller=_MockLLM(script))
         self.assertTrue(r["ok"], r.get("error"))
         deck = render.calls[0][1]
-        # 只有 bullets 页（第 3 页）配图：API = 1 封面 + 1 内容页
-        self.assertEqual(len(http.api_bodies()), 2)
+        # two_column（第 1 页）与 bullets（第 3 页）配图：API = 1 封面 + 2 内容页
+        self.assertEqual(len(http.api_bodies()), 3)
         self.assertEqual(deck["pages"][0]["layout"], "two_column")
-        self.assertNotIn("image", deck["pages"][0])
+        self.assertTrue(deck["pages"][0]["image"])         # two_column 现在响应配图（底部横图）
         self.assertEqual(deck["pages"][1]["layout"], "quote")
-        self.assertNotIn("image", deck["pages"][1])
+        self.assertNotIn("image", deck["pages"][1])        # quote 仍不配图
         self.assertTrue(deck["pages"][2]["image"])
-        self.assertNotIn("image", deck["pages"][3])       # closing 不配图
+        self.assertNotIn("image", deck["pages"][3])        # closing 不配图
 
     # 24. with_images=False -> 零 HTTP 调用，契约键初始化为 None
     def test_with_images_false_zero_http(self):
@@ -955,6 +955,57 @@ class PptMakerTest(unittest.TestCase):
         self.assertTrue(r["ok"], r.get("error"))
         self.assertNotIn("真实研究材料", mock.calls[0])
         self.assertEqual(ppt_maker.last_run["research_chars"], 0)
+
+    # ================================================================ 新增：LaTeX 公式清洗（病例转断言）
+    # 病例：教学课件《一元二次方程》第 5 页，LLM 输出 $(x+m)^2=n$ / \pm\sqrt{n} / x_1
+    # 等 LaTeX 源码直接打在幻灯片与备注上（python-pptx 不做公式排版）。
+
+    # 31. _latex_to_unicode 单元行为：定界符、符号命令、上下标、根号、分数
+    def test_latex_to_unicode_unit(self):
+        f = ppt_maker._latex_to_unicode
+        # 病例原文（生成样本第 5 页真实要点）
+        self.assertEqual(f("方程已呈 $(x+m)^2=n$ 的平方形式，其中 $n \\geq 0$。"),
+                         "方程已呈 (x+m)²=n 的平方形式，其中 n ≥ 0。")
+        self.assertEqual(f("转化为 $x+m=\\pm\\sqrt{n}$ 两个一元一次方程"),
+                         "转化为 x+m=±√(n) 两个一元一次方程")
+        self.assertEqual(f("解得 $x_1=5, x_2=-1$。"), "解得 x₁=5, x₂=-1。")
+        self.assertEqual(f("移项得 $x^2+4x=-1$，两边加 $2^2=4$"),
+                         "移项得 x²+4x=-1，两边加 2²=4")
+        self.assertEqual(f("$\\frac{-b}{2a}$"), "-b/2a")
+        self.assertEqual(f("$\\Delta=b^2-4ac$"), "Δ=b²-4ac")
+        # 无 LaTeX 的普通文本原样保留
+        self.assertEqual(f("普通要点：没有错别字。"), "普通要点：没有错别字。")
+        self.assertEqual(f(""), "")
+
+    # 32. 集成：LaTeX 要点/备注经 make_ppt 落盘后，deck 文本无一残留 $ 与 \\命令
+    def test_latex_sanitized_before_render(self):
+        render = _MockRender()
+        ppt_maker._render_deck = render
+        latex_bullets = [
+            "适用对象：方程已呈 $(x+m)^2=n$ 的平方形式，其中 $n \\geq 0$，可直接开平方降次，无需配方。",
+            "解题机制：直接对两边开平方降次，转化为 $x+m=\\pm\\sqrt{n}$ 两个一元一次方程，分别求解即得两根。",
+            "具体案例：解 $(x-2)^2=9$，开方得 $x-2=\\pm3$，解得 $x_1=5, x_2=-1$，两根均需代回检验。",
+            "局限性：若方程带一次项与常数项混杂，如 $x^2+4x+1=0$，则无法直接开方，须先配方化为平方形式。",
+        ]
+        page = json.dumps({
+            "bullets": latex_bullets,
+            "speaker_note": "同学们看 $(x-2)^2=9$ 这个例子，开方得 $x-2=\\pm3$，所以 $x_1=5$ 或 $x_2=-1$。" * 3,
+        }, ensure_ascii=False)
+        script = [_outline_json(3), page, _page_json("P2"), _page_json("P3")]
+        r = ppt_maker.make_ppt("一元二次方程", pages=3, llm_caller=_MockLLM(script))
+        self.assertTrue(r["ok"], r.get("error"))
+        deck = render.calls[0][1]
+        pg = deck["pages"][0]
+        joined = "\n".join(pg["bullets"]) + "\n" + pg["speaker_note"]
+        self.assertNotIn("$", joined)                      # 定界符全清
+        self.assertNotIn("\\", joined)                     # 命令反斜杠全清
+        self.assertIn("±", joined)                         # \\pm -> ±
+        self.assertIn("√(n)", joined)                      # \\sqrt{n} -> √(n)
+        self.assertIn("x₁", joined)                        # x_1 -> x₁
+        self.assertIn("²", joined)                         # ^2 -> ²
+        # deck 顶层的口吻字段也已注入（版式引擎据此调封面备注/结尾落款）
+        self.assertIn(deck["content_type"],
+                      ("讲话动员型", "教学课件型", "分析报告型"))
 
 
 if __name__ == "__main__":

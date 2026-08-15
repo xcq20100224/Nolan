@@ -104,6 +104,7 @@ MAX_BULLET_LEN = 80       # 防御性截断（要求 LLM 30-60 字，留余量�
 
 # ---- CogView AI 配图（路 B·生图篇）----
 MAX_IMAGE_PAGES = 8       # 全篇内容页配图上限：按页序保留前 8 页（N2 扩面：4→8）
+IMAGE_LAYOUTS = {"bullets", "two_column"}   # 响应配图的版式（bullets 左文右图 / two_column 底部横图）
 IMG_API_TIMEOUT = 30      # 生图 API 单张预算（秒）
 IMG_DL_TIMEOUT = 20       # 图片下载单张预算（秒）
 # 全套配图统一风格后缀：由代码拼接到每条画面描述之后，保证整套图风格一致
@@ -1245,6 +1246,107 @@ def _normalize_deck(outline: dict, contents: list, style: str) -> dict:
     return {"title": outline["title"], "subtitle": subtitle, "pages": pages}
 
 
+# ---------------------------------------------------------------- 数学公式清洗（LaTeX -> Unicode 纯文本）
+# 病例：数学/物理类课件里 LLM 习惯输出 LaTeX 源码（$(x+m)^2=n$、\pm\sqrt{n}、x_1），
+# python-pptx 不做公式排版，源码直接打在幻灯片上是事故。这里在落盘前统一把
+# LaTeX 片段降级为人可读的 Unicode 数学文本（(x+m)²=n、±√(n)、x₁）。
+
+_LATEX_SYMBOLS = {     # 常见命令 -> Unicode（先长后短替换，防 \le 吃掉 \left）
+    "\\geq": "≥", "\\ge": "≥", "\\leq": "≤", "\\le": "≤",
+    "\\neq": "≠", "\\ne": "≠", "\\approx": "≈", "\\equiv": "≡",
+    "\\pm": "±", "\\mp": "∓", "\\times": "×", "\\div": "÷",
+    "\\cdot": "·", "\\cdots": "…", "\\ldots": "…",
+    "\\infty": "∞", "\\propto": "∝", "\\partial": "∂",
+    "\\Delta": "Δ", "\\delta": "δ", "\\pi": "π", "\\Pi": "Π",
+    "\\alpha": "α", "\\beta": "β", "\\gamma": "γ", "\\lambda": "λ",
+    "\\mu": "μ", "\\sigma": "σ", "\\Sigma": "Σ", "\\theta": "θ",
+    "\\phi": "φ", "\\omega": "ω", "\\Omega": "Ω",
+    "\\left": "", "\\right": "", "\\quad": " ", "\\qquad": "  ",
+    "\\,": " ", "\\;": " ", "\\!": "", "\\ ": " ",
+    "\\%": "%", "\\{": "{", "\\}": "}", "\\_": "_",
+}
+
+_SUP_MAP = {"0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵",
+            "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻",
+            "n": "ⁿ", "i": "ⁱ"}
+_SUB_MAP = {"0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅",
+            "6": "₆", "7": "₇", "8": "₈", "9": "₉", "+": "₊", "-": "₋"}
+
+
+def _sup_sub(text: str, ch: str, table: dict) -> str:
+    """把 x^2 / x^{12} / x_1 / x_{12} 的上下标折成 Unicode 字符；映射不了的保留原样。"""
+    def braced(m):
+        body = m.group(2)
+        conv = "".join(table.get(c, "") for c in body)
+        return conv if conv and all(c in table for c in body) else m.group(0)
+
+    def single(m):
+        c = m.group(1)
+        return table.get(c, m.group(0))
+
+    esc = r"\^" if ch == "^" else r"_"
+    text = re.sub(esc + r"\{([^{}]*)\}", braced, text)
+    text = re.sub(esc + r"([0-9+\-ni])", single, text)
+    return text
+
+
+def _latex_to_unicode(text: str) -> str:
+    """把文本里的 LaTeX 数学片段降级为 Unicode 纯文本。
+    只动 $...$/$$...$$ 数学环境与独立的 \\命令；普通中文、标点原样保留。"""
+    if not text or ("$" not in text and "\\" not in text):
+        return text
+    s = text
+
+    def convert(math: str) -> str:
+        m = math
+        # 先处理带参数的复合命令
+        m = re.sub(r"\\(?:d?frac|tfrac)\{([^{}]*)\}\{([^{}]*)\}",
+                   lambda g: f"{g.group(1)}/{g.group(2)}", m)
+        m = re.sub(r"\\sqrt\{([^{}]*)\}", lambda g: f"√({g.group(1)})", m)
+        m = re.sub(r"\\sqrt\s*([A-Za-z0-9])", lambda g: f"√{g.group(1)}", m)
+        # 符号命令：按键长降序替换，避免短键前缀误伤长键
+        for cmd in sorted(_LATEX_SYMBOLS, key=len, reverse=True):
+            m = m.replace(cmd, _LATEX_SYMBOLS[cmd])
+        # 上下标
+        m = _sup_sub(m, "^", _SUP_MAP)
+        m = _sup_sub(m, "_", _SUB_MAP)
+        # 兜底：剥掉未知命令的反斜杠、清理花括号
+        m = re.sub(r"\\([A-Za-z]+)", r"\1", m)
+        m = m.replace("{", "").replace("}", "")
+        return re.sub(r"\s{2,}", " ", m).strip()
+
+    s = re.sub(r"\$\$(.+?)\$\$", lambda g: convert(g.group(1)), s, flags=re.S)
+    s = re.sub(r"\$([^$]+?)\$", lambda g: convert(g.group(1)), s)
+    return s
+
+
+def _sanitize_deck_text(deck: dict) -> dict:
+    """落盘前对整副 deck 做 LaTeX->Unicode 清洗：标题/副标题/每页所有文本字段
+    （含 speaker_note 演讲稿）都过一遍；任何异常静默跳过，绝不阻断制作。"""
+    try:
+        deck["title"] = _latex_to_unicode(str(deck.get("title") or ""))
+        deck["subtitle"] = _latex_to_unicode(str(deck.get("subtitle") or ""))
+        for pg in deck.get("pages") or []:
+            if not isinstance(pg, dict):
+                continue
+            for key, val in list(pg.items()):
+                if isinstance(val, str):
+                    pg[key] = _latex_to_unicode(val)
+                elif isinstance(val, list):
+                    pg[key] = [_latex_to_unicode(v) if isinstance(v, str) else v
+                               for v in val]
+                elif isinstance(val, dict):
+                    for k2, v2 in list(val.items()):
+                        if isinstance(v2, str):
+                            val[k2] = _latex_to_unicode(v2)
+                        elif isinstance(v2, list):
+                            val[k2] = [_latex_to_unicode(x) if isinstance(x, str) else x
+                                       for x in v2]
+    except Exception:
+        pass
+    return deck
+
+
 # ---------------------------------------------------------------- 生图阶段（路 B：CogView 配图）
 
 def _load_image_config():
@@ -1322,11 +1424,11 @@ def _gen_one_image(prompt: str, base: str, key: str, assets_dir: Path, seq: int,
 def _attach_images(deck: dict, outline: dict, enabled: bool = True) -> int:
     """生图阶段总入口（排版前统一批量生成，串行）。
     先把契约键初始化成 None（路 A 可依赖键存在），enabled=False 或配置缺失直接返回。
-    内容页配图候选：最终版式为 bullets 且大纲给了 image_prompt 的页，按页序钳前 4。
-    返回成功落盘的图片张数。绝不抛异常。"""
+    内容页配图候选：最终版式为 bullets/two_column 且大纲给了 image_prompt 的页，
+    按页序钳前 MAX_IMAGE_PAGES 张。返回成功落盘的图片张数。绝不抛异常。"""
     deck["cover_image"] = None
     for pg in deck["pages"]:
-        if pg["layout"] == "bullets":
+        if pg["layout"] in IMAGE_LAYOUTS:
             pg["image"] = None
     if not enabled:
         return 0
@@ -1344,7 +1446,7 @@ def _attach_images(deck: dict, outline: dict, enabled: bool = True) -> int:
         cands = []
         for item, pg in zip(outline["pages"], deck["pages"]):
             prompt = str(item.get("image_prompt") or "").strip()
-            if prompt and pg["layout"] == "bullets":
+            if prompt and pg["layout"] in IMAGE_LAYOUTS:
                 cands.append((pg, prompt))
         todo = cands[:MAX_IMAGE_PAGES]
         total_img = (1 if cover_prompt else 0) + len(todo)
@@ -1358,7 +1460,7 @@ def _attach_images(deck: dict, outline: dict, enabled: bool = True) -> int:
             if path:
                 deck["cover_image"] = path
                 made += 1
-        # 内容页配图：zip 大纲与契约页（同序），非 bullets 页的 image_prompt 静默丢弃
+        # 内容页配图：zip 大纲与契约页（同序），不可配图版式的 image_prompt 静默丢弃
         for pg, prompt in todo:
             seq += 1
             j += 1
@@ -1666,6 +1768,8 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
 
     # ---- 归一化成路 A 契约 deck，并登记运行统计
     deck = _normalize_deck(outline, contents, style)
+    deck["content_type"] = intent["content_type"]   # 版式引擎据此调口吻（封面备注/结尾落款）
+    _sanitize_deck_text(deck)   # LaTeX 公式 -> Unicode 纯文本（数学课件防源码上屏）
     for i, (item, pg) in enumerate(zip(deck_pages, deck["pages"])):
         n_bullets, n_chars = _stat_counts(pg)
         stats["page_stats"].append({

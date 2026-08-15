@@ -463,7 +463,8 @@ def _write_bullet_paras(tf, bullets, color_hex=COLOR_INK,
 
 # ================================================================ 版式 1：封面（render_deck 自动生成）
 
-def _render_cover(prs, title, subtitle, style, cover_image=None, page_total=None):
+def _render_cover(prs, title, subtitle, style, cover_image=None, page_total=None,
+                  content_type=""):
     """封面双构图（共用一套 tokens，按有无背景图分流）：
 
     无图 · 编辑部式左对齐：风格胶囊 + 赭红小方块 + 44pt 加字距主标 + 副标 +
@@ -471,6 +472,7 @@ def _render_cover(prs, title, subtitle, style, cover_image=None, page_total=None
     有图 · 全出血：满铺背景图（直角，出血版式不圆角）+ 30% 均匀深棕蒙层
     （验收契约，保全图可读性）+ 底部二次渐变蒙层（上浅下深，给标题块压出明度差）
     + 左下角标题块（色条 + 主标 + 副标 + 信息行）。
+    content_type：教学课件型时封面备注换教师开课口吻，其余保持通用分享口吻。
     """
     from pptx.enum.text import PP_ALIGN
     from pptx.util import Inches
@@ -549,11 +551,18 @@ def _render_cover(prs, title, subtitle, style, cover_image=None, page_total=None
         r3.text = info
         _set_run_font(r3, SIZE_NOTE, COLOR_CAPTION)
 
-    s.notes_slide.notes_text_frame.text = (
-        f"开场白：各位好，今天分享的主题是「{title}」"
-        f"{('，' + subtitle) if subtitle else ''}。"
-        "先用一句话点明这次分享的核心价值，再交代整体结构，"
-        "语速放慢，与听众做一次眼神交流。建议用时约 30 秒。")
+    if content_type == "教学课件型":
+        s.notes_slide.notes_text_frame.text = (
+            f"开场白：同学们好，我们开始上课。今天我们学习「{title}」"
+            f"{('，' + subtitle) if subtitle else ''}。"
+            "先用一句话点明这节课的核心目标，再带大家看一眼目录，"
+            "交代本节课的知识脉络与节奏。建议用时约 1 分钟。")
+    else:
+        s.notes_slide.notes_text_frame.text = (
+            f"开场白：各位好，今天分享的主题是「{title}」"
+            f"{('，' + subtitle) if subtitle else ''}。"
+            "先用一句话点明这次分享的核心价值，再交代整体结构，"
+            "语速放慢，与听众做一次眼神交流。建议用时约 30 秒。")
     return s
 
 
@@ -699,15 +708,22 @@ def _place_side_image(slide, img_path, left, top):
 # ================================================================ 版式 5：two_column 两栏对比页
 
 def _render_two_column(slide, page, page_no, style):
-    """米白底：左右两栏，栏头赭红小条 + 18pt 栏题，栏间浅金竖线分隔。"""
+    """米白底：左右两栏，栏头赭红小条 + 18pt 栏题，栏间浅金竖线分隔。
+    page["image"] 有效时启用「双栏 + 底部横图」：栏正文区压高、分隔线同步缩短，
+    底部居中放等比圆角横图 + 浅金衬底；无图或图片缺失时与原版式一致。"""
     _set_bg(slide, COLOR_BG)
     _add_page_header(slide, _safe_str(page.get("page_title"), "（无标题）"))
+
+    img = _valid_image_path(page.get("image"))
+    # 有图时正文区与分隔线压高，给底部横图让位（无图时与原版式逐像素一致）
+    pts_h = 2.45 if img else 4.1
+    line_h = 3.35 if img else 4.9
 
     col_w = (CONTENT_W - 0.8) / 2
     col_x = [CONTENT_LEFT, CONTENT_LEFT + col_w + 0.8]
 
     # 栏间竖分隔线
-    _add_rect(slide, CONTENT_LEFT + col_w + 0.4, BODY_Y + 0.1, 0.012, 4.9, COLOR_GOLD)
+    _add_rect(slide, CONTENT_LEFT + col_w + 0.4, BODY_Y + 0.1, 0.012, line_h, COLOR_GOLD)
 
     for ci, key in enumerate(("left", "right")):
         col = page.get(key)
@@ -725,10 +741,36 @@ def _render_two_column(slide, page, page_no, style):
         rh.text = heading
         _set_run_font(rh, SIZE_BODY, COLOR_DARK, bold=True)
 
-        tf_p = _add_textbox(slide, col_x[ci], BODY_Y + 0.9, col_w, 4.1)
+        tf_p = _add_textbox(slide, col_x[ci], BODY_Y + 0.9, col_w, pts_h)
         size, gap = _fit_body_font(points)
         # 栏宽只有一半，字号上限压到 16，避免半栏宽下放 18pt 溢出
         _write_bullet_paras(tf_p, points, base_size=min(size, SIZE_BODY_MID), gap_in=gap)
+
+    if img:
+        _place_bottom_image(slide, img, BODY_Y + 3.0, 2.15)
+
+
+def _place_bottom_image(slide, img_path, top, max_h):
+    """底部横图（two_column 配图位）：先按限高等比铺图、水平居中；
+    图下垫一圈浅金衬底色块，与右图区同款 8% 圆角；任何失败静默降级。"""
+    from pptx.util import Inches, Emu
+    try:
+        pic = slide.shapes.add_picture(
+            img_path, Inches(CONTENT_LEFT), Inches(top), height=Inches(max_h))  # 只给高度，等比
+        if pic.width > Inches(CONTENT_W):         # 超宽则按内容区宽回缩
+            ratio = Inches(CONTENT_W) / pic.width
+            pic.width = Inches(CONTENT_W)
+            pic.height = Emu(int(pic.height * ratio))
+        pic.left = Emu(int(Inches(CONTENT_LEFT) + (Inches(CONTENT_W) - pic.width) / 2))
+        _round_picture(pic, 8)                    # 与右图区一致的圆角裁切（失败静默回退直角）
+        pad = Inches(IMG_PAD)
+        backing = _add_round_rect(slide,
+                                  (pic.left - pad) / 914400, (pic.top - pad) / 914400,
+                                  (pic.width + 2 * pad) / 914400, (pic.height + 2 * pad) / 914400,
+                                  COLOR_GOLD, adj=0.08)
+        pic._element.addprevious(backing._element)   # z-order：衬底挪到图片之下
+    except Exception:
+        pass   # 配图失败静默降级，绝不中断渲染
 
 
 # ================================================================ 版式 6：big_number 大数字页
@@ -942,9 +984,11 @@ def _render_chart(slide, page, page_no, style):
 
 # ================================================================ 版式 9：closing 结尾行动页
 
-def _render_closing(slide, page, page_no, style):
+def _render_closing(slide, page, page_no, style, content_type=""):
     """米白底：色块标题 + 行动要点 + 居中仪式感收尾（短细线 + 谢谢聆听 + 落款）。
-    精修：弃用底部大色带（工程感重），改用画册尾页式的居中三段式。"""
+    精修：弃用底部大色带（工程感重），改用画册尾页式的居中三段式。
+    落款随 content_type 调口吻：教学课件型「温故知新」，讲话动员型「期待行动」，
+    分析报告型「有据可依」，缺省「期待行动」。"""
     from pptx.enum.text import PP_ALIGN
     _set_bg(slide, COLOR_BG)
     _add_page_header(slide, _safe_str(page.get("page_title"), "总结与行动"))
@@ -953,7 +997,9 @@ def _render_closing(slide, page, page_no, style):
     tf = _add_textbox(slide, CONTENT_LEFT + 0.2, BODY_Y, CONTENT_W - 0.2, 3.3)
     _write_bullet_paras(tf, bullets)
 
-    # 居中仪式感三段：短细线 -> 谢谢聆听 -> 落款（风格 · 期待行动）
+    # 居中仪式感三段：短细线 -> 谢谢聆听 -> 落款（风格 · 口吻词，随内容类型变化）
+    _CLOSING_TONE = {"教学课件型": "温故知新", "分析报告型": "有据可依"}
+    tone = _CLOSING_TONE.get(content_type, "期待行动")
     _add_rect(slide, SLIDE_W / 2 - 0.7, 5.35, 1.4, 0.014, COLOR_GOLD)
     tf_t = _add_textbox(slide, MARGIN, 5.55, CONTENT_W, 0.7)
     pt = tf_t.paragraphs[0]
@@ -965,7 +1011,7 @@ def _render_closing(slide, page, page_no, style):
     pb = tf_b.paragraphs[0]
     pb.alignment = PP_ALIGN.CENTER
     rb = pb.add_run()
-    rb.text = f"{style} · 期待行动"
+    rb.text = f"{style} · {tone}"
     _set_run_font(rb, SIZE_NOTE, COLOR_CAPTION)
 
 
@@ -1019,8 +1065,10 @@ def render_deck(prs, deck: dict, style: str = "工作汇报") -> None:
     }
     page 按 layout 分八种：toc / section / bullets / two_column /
                           big_number / quote / chart / closing。
-    page 可选键 "image"：配图绝对路径，仅 bullets 版式响应（左文右图），
-    文件不存在时自动降级为无图版式，绝不抛异常。
+    page 可选键 "image"：配图绝对路径，bullets（左文右图）与 two_column
+    （底部横图）版式响应，文件不存在时自动降级为无图版式，绝不抛异常。
+    deck 可选键 "content_type"：讲话动员型/教学课件型/分析报告型，
+    影响封面备注口吻与结尾落款措辞，缺省保持通用口吻。
     每页都要把 speaker_note 写进该页 notes_slide（物理写入，非注释）。
     封面由 render_deck 自动用 deck["title"]/["subtitle"] 生成，pages 里不含封面。
 
@@ -1039,8 +1087,10 @@ def render_deck(prs, deck: dict, style: str = "工作汇报") -> None:
     blank = prs.slide_layouts[6]
 
     # ---- 封面（无图编辑部式 / 有图全出血双构图；cover_image 无效自动降级无图）
+    content_type = _safe_str(deck.get("content_type"))   # 可选：口吻提示（路 B 契约）
     _render_cover(prs, title, subtitle, style, cover_image=cover_image,
-                  page_total=len(pages) + 1)   # 底部信息行「共 N 页」用
+                  page_total=len(pages) + 1,   # 底部信息行「共 N 页」用
+                  content_type=content_type)
 
     total = len(pages) + 1   # 物理总页数（含封面），页脚用
 
@@ -1058,6 +1108,8 @@ def render_deck(prs, deck: dict, style: str = "工作汇报") -> None:
         try:
             if layout == "bullets":
                 render_fn(slide, page, i, style, _alt=(consec_bullets % 2 == 0))
+            elif layout == "closing":
+                render_fn(slide, page, i, style, content_type=content_type)
             else:
                 render_fn(slide, page, i, style)
         except Exception:
