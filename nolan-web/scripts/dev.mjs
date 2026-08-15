@@ -101,10 +101,15 @@ function cleanup() {
   }
 }
 
-// 前端退出 → 清理后端并以相同码退出
+// 前端退出 → 正常退出才清理后端；异常退出（如端口被 Windows 排除段拒绝）
+// 保留后端并给出直连地址——后端死了用户连兜底的入口都没有
 frontend.on("exit", (code) => {
+  if (code) {
+    console.error(`[dev] Vite 异常退出（code=${code}）。后端仍在运行，可直接访问 http://localhost:7901`);
+    process.exit(code);
+  }
   cleanup();
-  process.exit(code ?? 0);
+  process.exit(0);
 });
 
 // 后端异常退出 → 提示并整体退出
