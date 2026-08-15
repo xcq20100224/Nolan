@@ -11,9 +11,9 @@ export default defineConfig({
     // 网页版统一预览端口；host: true 允许局域网访问
     port: 7100,
     host: true,
-    // 把 /api 代理到 Python 标准库后端（监听 7101）
+    // 把 /api 代理到 Python 标准库后端（监听 7901）
     proxy: {
-      '/api': 'http://localhost:7101',
+      '/api': 'http://localhost:7901',
     },
   },
   resolve: {

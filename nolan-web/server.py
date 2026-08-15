@@ -7,7 +7,7 @@ Nolan 语音助手 · 网页版后端（server.py）
 不做用户系统、不做数据库、不做静态文件服务（前端由 vite dev server 提供，
 vite 把 /api 代理到本服务）。
 
-端口：sys.argv[1]，默认 7101。
+端口：sys.argv[1]，默认 7901。
 
 单实例守卫（最高优先级）：
     根因——Kimi 预览反复拉起新后端而旧后端不死，Windows 默认允许同端口双绑定，
@@ -2358,12 +2358,12 @@ class NolanHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    port = 7101
+    port = 7901
     if len(sys.argv) > 1:
         try:
             port = int(sys.argv[1])
         except ValueError:
-            print(f"[server] 端口参数无效：{sys.argv[1]}，使用默认 7101")
+            print(f"[server] 端口参数无效：{sys.argv[1]}，使用默认 7901")
 
     _single_instance_guard()  # 最高优先级：先清理存活旧实例，再绑定端口
 

@@ -1,5 +1,5 @@
 // Nolan 网页版一键开发启动器
-// 先拉起 Python 标准库后端（server.py，端口 7101），再启动 Vite 前端，
+// 先拉起 Python 标准库后端（server.py，端口 7901），再启动 Vite 前端，
 // 退出时负责把后端子进程树一并清理掉。
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -44,8 +44,8 @@ if (!PYTHON_EXE) {
 }
 console.log(`[dev] 使用 Python 解释器：${PYTHON_EXE}`);
 
-// 启动 Python 后端：python server.py 7101，工作目录为项目根
-const backend = spawn(PYTHON_EXE, ["-u", "server.py", "7101"], {
+// 启动 Python 后端：python server.py 7901，工作目录为项目根
+const backend = spawn(PYTHON_EXE, ["-u", "server.py", "7901"], {
   cwd: projectRoot,
   stdio: "inherit",
   shell: false,

@@ -1,10 +1,10 @@
 // Nolan 后端 API 封装
-// 默认走相对路径 '/api/...'（vite 代理到 7101）；
+// 默认走相对路径 '/api/...'（vite 代理到 7901）；
 // 内嵌 webview 被证实存在『代理链路响应丢失』问题，故关键端点支持
-// 直连兜底：http://127.0.0.1:7101（CORS 已放开，GET 为简单请求无预检）
+// 直连兜底：http://127.0.0.1:7901（CORS 已放开，GET 为简单请求无预检）
 
 /** 直连后端的兜底地址（绕过 vite 代理这一中间人） */
-const DIRECT_BASE = 'http://127.0.0.1:7101'
+const DIRECT_BASE = 'http://127.0.0.1:7901'
 
 /** 通用 JSON 请求助手：失败时抛出带说明的错误 */
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -257,7 +257,7 @@ export async function transcribe(blob: Blob): Promise<string> {
 /**
  * 服务端开始录音：GET /api/mic/start → {"ok": true}
  * 麦克风由服务端（sounddevice）直采，浏览器只当遥控器，无需任何浏览器权限。
- * 双通道点火：先走 vite 代理，失败再走 7101 直连（绕过代理中间人）——
+ * 双通道点火：先走 vite 代理，失败再走 7901 直连（绕过代理中间人）——
  * 服务端录音幂等可重开，重复 start 无害；每通道 2 次尝试、3 秒上界。
  * 全程黑匣子落痕，响应丢失也能从后端日志还原链路。
  */

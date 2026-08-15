@@ -4,10 +4,14 @@ Nolan · PPT 引擎（ppt_maker.py）——意图解析 + 两阶段精写 + 自�
 一句话生成带演讲稿的真 .pptx 文件：
   - 阶段 0 之前 · 意图解析：先从 topic（含 brain 纠正路由合并进来的修正要求）
     解析意图四要素——audience（谁听）、perspective（谁在说/口吻）、purpose（目的）、
-    content_type（讲话动员型 | 分析报告型）；规则先行分类，讲话型补一次轻量 LLM 精修，
-    任何失败回退规则结果，绝不阻断制作；讲话动员型跳过联网市场研究（讲话稿不需要
-    行业数据，查回来的市场材料会把内容拖向宏大叙事），大纲与逐页精写 prompt
-    注入四要素硬约束（标题是对听众说的话、备注以讲话者口吻对听众讲话）；
+    content_type（讲话动员型 | 教学课件型 | 分析报告型）；规则先行分类，
+    讲话型与课件型同权补一次轻量 LLM 精修，任何失败回退规则结果，绝不阻断制作；
+    讲话动员型跳过联网市场研究（讲话稿不需要行业数据，查回来的市场材料会把内容
+    拖向宏大叙事）；教学课件型保留联网研究（课件要事实准确）并按
+    「导入→知识点讲解→例题/案例→小结+课后任务」课堂结构组织大纲、
+    备注为教师授课口吻；分析报告型维持研究+串题丢弃约束；
+    大纲与逐页精写 prompt 注入四要素硬约束（讲话型：标题是对听众说的话、
+    备注以讲话者口吻对听众讲话）；
   - 阶段 1 · 大纲：1 次 LLM 调用产出 总标题 + 副标题 + 每页
     {layout, page_title, core_point, keywords, ...版式草稿字段}；
     标题规则为结论式标题（action title）：page_title 必须是带数字/比较级的断言句，
@@ -218,9 +222,11 @@ def _call_json(prompt: str, caller, repair_once: bool = True):
 
 # ---------------------------------------------------------------- 阶段 0 之前：意图四要素解析
 # 第一性原理：先理解「谁听、谁在说、为什么说、写什么型」，再决定要不要联网研究、
-# 用什么内容类型。讲话动员型跳过市场研究、走讲话稿约束；分析报告型维持研究。
+# 用什么内容类型。讲话动员型跳过市场研究、走讲话稿约束；教学课件型保留联网研究
+# （课件要事实准确）、走课堂结构约束；分析报告型维持研究。
 
 SPEECH = "讲话动员型"
+COURSEWARE = "教学课件型"
 REPORT = "分析报告型"
 
 # 讲话动员型判定信号：topic（含 brain 纠正路由合并进来的修正要求）命中即讲话型
@@ -228,24 +234,80 @@ _SPEECH_SIGNALS = ("站在", "视角", "口吻", "告诉", "致辞", "动员",
                    "讲话", "发言", "演讲", "寄语", "叮嘱")
 _SPEECH_RE = re.compile(r"(?:对|向)[^，。,.]{1,12}?(?:讲|致辞|发言)")
 
+# 教学课件型判定信号：明确的「上课/传授知识」词汇。与讲话型的分界：
+# 讲话型是动员叮嘱（告诉同学们…），课件型是传授知识（给学生讲知识点/例题）；
+# topic 同时命中两边信号时，含课件/讲课类词优先判课件型（规则层先查课件型）。
+_COURSEWARE_SIGNALS = ("课件", "讲课", "教学", "上课", "知识点", "例题",
+                       "教案", "课堂讲解", "授课", "备课")
+# 「给…学生/同学讲（教、上）…」与「教…学生…」句式：给学生传授知识 -> 课件型。
+# 设计细节：「教」字开头排除「教育」（教育学生诚信是德育讲话，不是课件）；
+# 「给…学生」后要求接 讲/教/上课/授课，避免「给学生的开学寄语」误吞（寄语是讲话型）。
+_COURSEWARE_RE = re.compile(
+    r"教(?!育)[^，。,.、（）()]{0,12}?(?:学生|同学|孩子)"
+    r"|(?:给|面向)[^，。,.、（）()]{0,12}?(?:学生|同学|孩子)"
+    r"[^，。,.、（）()]{0,10}?(?:讲|教|上课|授课)")
+# 受众提取：「给初三学生上课」「教高一学生」「面向五年级学生」
+_COURSEWARE_AUDIENCE_RE = re.compile(
+    r"(?:给|教|面向)([^，。,.、（）()]{1,12}?(?:学生|同学们?|孩子们?|小朋友们?))")
+# 目的提取：「教会/学会/掌握/搞懂/讲清 X」
+_COURSEWARE_PURPOSE_RE = re.compile(
+    r"(?:教会|学会|掌握|搞懂|讲清|讲明白)([^，。,.、（）()]{1,15}?)")
+
 _INTENT_PROMPT = """从下面这个 PPT 需求里提取意图四要素。只输出一个 JSON 对象，不要输出任何其他文字、解释或 markdown 围栏。格式严格如下：
 {{
-  "content_type": "讲话动员型 或 分析报告型",
-  "audience": "谁听（如：同学们）",
-  "perspective": "谁在说/什么口吻（如：班主任对同学们讲话）",
-  "purpose": "目的（如：收心、告知开学安排、鼓劲）"
+  "content_type": "讲话动员型 或 教学课件型 或 分析报告型",
+  "audience": "谁听（如：同学们 / 初三学生）",
+  "perspective": "谁在说/什么口吻（如：班主任对同学们讲话 / 数学老师授课）",
+  "purpose": "目的（如：收心、告知开学安排 / 教会一元二次方程的解法）"
 }}
 
-判定规则：需求里出现「站在…视角/口吻」「告诉…」「对…讲」「致辞」「动员」「讲话」等，
-是要一个具体的人对一群人讲话 -> 讲话动员型；否则默认分析报告型。
+判定规则：
+- 需求里出现「课件」「讲课」「教学」「上课」「知识点」「例题」「教案」，
+  或「给…学生/同学讲（教、上）…」句式，是要把学科知识教会学生 -> 教学课件型；
+- 需求里出现「站在…视角/口吻」「告诉…」「对…讲」「致辞」「动员」「讲话」「寄语」等，
+  是要一个具体的人对一群人做动员叮嘱 -> 讲话动员型；
+- 两类信号同时命中时：传授学科知识优先判教学课件型，动员叮嘱才是讲话动员型；
+- 其余默认分析报告型。
 
 需求：「{topic}」"""
 
 
 def _rule_intent(topic: str) -> dict:
-    """规则兜底意图解析：关键词命中即讲话动员型并做正则提取，否则分析报告型。
-    纯本地、零调用、零异常；LLM 失败/缺席时的保底答案。"""
-    is_speech = any(k in topic for k in _SPEECH_SIGNALS) or bool(_SPEECH_RE.search(topic))
+    """规则兜底意图解析：关键词命中即分类并做正则提取。
+    纯本地、零调用、零异常；LLM 失败/缺席时的保底答案。
+    判定顺序：教学课件型（课件/讲课类词优先）-> 讲话动员型 -> 分析报告型。
+    与讲话型的分界：讲话型是动员叮嘱（告诉同学们要开学了），
+    课件型是传授知识（给初三学生讲一元二次方程）；
+    topic 含明确学科知识点 + 课件/讲课类词时判课件型。"""
+    is_courseware = (any(k in topic for k in _COURSEWARE_SIGNALS)
+                     or bool(_COURSEWARE_RE.search(topic)))
+    is_speech = (not is_courseware) and (
+        any(k in topic for k in _SPEECH_SIGNALS) or bool(_SPEECH_RE.search(topic)))
+    if is_courseware:
+        # 受众提取：「给初三学生上课」-> 初三学生；兜底「学生」
+        audience = ""
+        m = _COURSEWARE_AUDIENCE_RE.search(topic)
+        if m:
+            audience = m.group(1).strip()
+        # 年级补全：「初三数学课件」式 topic 没写「学生」时，抓到年级也够用
+        if not audience:
+            m = re.search(r"([一二三四五六七八九0-9]{1,3}年级|初[一二三123]|高[一二三123])", topic)
+            if m:
+                audience = m.group(1).strip() + "学生"
+        # 视角提取：复用「站在/以 X 的视角/口吻/身份」；兜底「任课老师」
+        perspective = ""
+        m = re.search(r"(?:站在|以)([^，。,.、（）()]{1,10}?)的(?:视角|口吻|角度|立场|身份)", topic)
+        if m:
+            perspective = m.group(1).strip()
+        # 目的提取：「教会/掌握/讲清 X」；兜底为通用的教会知识目标
+        purpose = ""
+        m = _COURSEWARE_PURPOSE_RE.search(topic)
+        if m:
+            purpose = m.group(0).strip()
+        return {"content_type": COURSEWARE,
+                "audience": audience or "学生",
+                "perspective": perspective or "任课老师",
+                "purpose": purpose or "教会本课题的核心知识与解题方法"}
     if not is_speech:
         return {"content_type": REPORT,
                 "audience": "行业从业者与决策者",
@@ -270,11 +332,11 @@ def _rule_intent(topic: str) -> dict:
 
 
 def _parse_intent(topic: str, caller) -> dict:
-    """意图四要素解析：规则先行分类；讲话动员型再补一次轻量 LLM 提取做精修
-    （视角/听众/目的的措辞与遗漏补齐）。LLM 任何失败静默回退规则结果，
-    永不抛异常、不阻断制作；分析报告型不烧这次调用。"""
+    """意图四要素解析：规则先行分类；讲话动员型与教学课件型再补一次轻量 LLM
+    提取做精修（视角/听众/目的的措辞与遗漏补齐，两型同权）。LLM 任何失败静默
+    回退规则结果，永不抛异常、不阻断制作；分析报告型不烧这次调用。"""
     intent = _rule_intent(topic)
-    if intent["content_type"] != SPEECH or caller is None:
+    if intent["content_type"] not in (SPEECH, COURSEWARE) or caller is None:
         return intent
     try:
         data = _call_json(_INTENT_PROMPT.format(topic=topic), caller, repair_once=False)
@@ -283,7 +345,7 @@ def _parse_intent(topic: str, caller) -> dict:
     if not isinstance(data, dict):
         return intent
     ct = str(data.get("content_type") or "").strip()
-    if ct in (SPEECH, REPORT):
+    if ct in (SPEECH, COURSEWARE, REPORT):
         intent["content_type"] = ct
     for key in ("audience", "perspective", "purpose"):
         v = str(data.get(key) or "").strip()[:30]
@@ -311,6 +373,27 @@ def _intent_block(intent: dict) -> str:
             "- 内容落在听众自己身上：他们要做的事、要记住的时间与安排、要调整的状态；\n"
             f"- 每页 speaker_note 必须是演讲稿：以{perspective}的口吻直接称呼听众"
             f"（如「{audience}，…」），口语化、上台能照着念。")
+    if intent.get("content_type") == COURSEWARE:
+        return (
+            "\n\n【教学课件意图 · 硬约束】\n"
+            f"- 这是一份教学课件型 PPT：{perspective}给{audience}上课，"
+            f"目的是：{purpose or '教会本课题的核心知识与方法'}；\n"
+            "- 全篇按真实课堂结构组织：导入（唤起旧知/抛出引例）→ 知识点讲解"
+            "（可分 2-4 节，逐节推进）→ 例题/案例分析（例题页必须给出完整题干 + "
+            "解析思路要点，不能只写「见例题」）→ 小结 + 课后任务（最后一页 closing "
+            "做小结与作业布置）；本条优先于上文「情境→冲突→分析→行动」叙事弧线规则；\n"
+            "- 版式偏好：知识点讲解用 bullets 或 two_column，解题步骤/推导流程用 process，"
+            "知识演进脉络用 timeline，关键数据用 big_number，例题页用 bullets"
+            "（题干 + 要点解析），收尾小结用 closing；\n"
+            "- 标题允许教学要点式（这一页教会什么、例题的关键在哪），不强制带数字断言；"
+            "本条优先于上文「带数字/比较级的断言」规则；\n"
+            "- 严禁市场分析腔：不得出现「市场规模」「产业格局」「趋势分析」「从业者」"
+            "这类报告式措辞，内容必须落在学科知识本身（定义、公式、方法、易错点）；\n"
+            "- 材料取舍：只保留与学科知识直接相关、对教学有意义的事实与材料，"
+            "明显串题、与教学无关的内容一律丢弃；\n"
+            f"- 每页 speaker_note 必须是教师授课稿：以{perspective}的口吻带{audience}"
+            "过这一页（如「我们先看…」「这道题的关键是…」「大家注意…」），"
+            "口语化、课堂上能照着讲。")
     return (
         "\n\n【受众意图 · 硬约束】\n"
         f"- 这是一份分析报告型 PPT：受众是{audience}，目的是：{purpose}；\n"
@@ -1530,17 +1613,23 @@ def make_ppt(topic: str, pages: int = 8, style: str = "工作汇报", llm_caller
 
     # ---- 意图解析步：先从 topic（含 brain 纠正路由合并进来的修正要求）解析
     #      意图四要素（audience/perspective/purpose/content_type），
-    #      决定要不要联网研究、走讲话稿还是分析报告的内容约束。
-    #      规则先行，讲话型补一次轻量 LLM 精修；任何失败回退规则结果，绝不阻断
+    #      决定要不要联网研究、走讲话稿/课件/分析报告哪种内容约束。
+    #      规则先行，讲话型与课件型补一次轻量 LLM 精修；任何失败回退规则结果，绝不阻断
     intent = _parse_intent(topic, caller)
     stats["intent"] = dict(intent)
     if intent["content_type"] == SPEECH:
         _emit(f"明白了：以{intent['perspective']}口吻对{intent['audience']}讲话")
+    elif intent["content_type"] == COURSEWARE:
+        # 课题名：去掉括号里的补充说明（如「（给初三学生上课用）」），留主干
+        lesson = re.sub(r"[（(][^）)]*[）)]", "", topic).strip()[:16] or topic[:16]
+        _emit(f"明白了：给{intent['audience']}上《{lesson}》")
 
     # ---- 阶段 0：联网研究（R1，25s 硬预算；失败/关闭返回空串，
     #      大纲与精写自动降级为纯模型记忆，行为与接入前一致）
     #      讲话动员型跳过市场研究：讲话稿不需要行业数据，查回来的市场材料
-    #      反而会把内容拖向宏大叙事（开学季串出动力电池的病例）
+    #      反而会把内容拖向宏大叙事（开学季串出动力电池的病例）；
+    #      教学课件型保留研究：课件要事实准确（公式、史实、数据不能凭记忆瞎写），
+    #      串题丢弃约束由 _intent_block 的课件型硬约束块承接
     research = ""
     if intent["content_type"] == SPEECH:
         _emit("讲话稿凭储备来写，不查市场资料")

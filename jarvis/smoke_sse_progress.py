@@ -6,7 +6,7 @@ import urllib.request
 
 t0 = time.time()
 req = urllib.request.Request(
-    "http://localhost:7101/api/chat/stream",
+    "http://localhost:7901/api/chat/stream",
     data=json.dumps({"text": "帮我做一个关于咖啡的 PPT，3 页"}).encode(),
     headers={"Content-Type": "application/json"})
 events = []

@@ -8,7 +8,7 @@
         → 修复后：确定性路由重做 PPT（progress 事件 >= 3，话题含「端午节」「历史老师」）
 
 验收：两轮都出现 >= 3 条 progress，且轮 2 收尾话术提到 PPT/文件柜。
-运行：先起 server.py（7101），再 python smoke_ppt_correction.py
+运行：先起 server.py（7901），再 python smoke_ppt_correction.py
 """
 import json
 import sys
@@ -16,7 +16,7 @@ import time
 
 import httpx
 
-URL = "http://localhost:7101/api/chat/stream"
+URL = "http://localhost:7901/api/chat/stream"
 
 
 def run_turn(text: str):
