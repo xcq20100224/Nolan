@@ -11,6 +11,7 @@ import FileCabinet from '@/sections/FileCabinet'
 import type { WaveMode } from '@/sections/WaveCanvas'
 import type { Message } from '@/types/message'
 import { MarkdownContent } from '@/lib/markdown'
+import { resolveFinalReply } from '@/lib/finalReply'
 import { checkHealth, sendChatStream, getDueMessages, getGreeting, getWakeState, setWake, getWakeEvents, getMemoryText, getRemindersText, playAudio, enqueueAudio, stopAllAudio, stopSpeak, soundTest, getBackground, getFilesList, clientLog, uploadFile } from '@/lib/api'
 
 /** 待发送附件（芯片展示 + 发送时拼 payload 的全量文本） */
@@ -276,16 +277,21 @@ export default function ChatApp() {
           onSentence: (s) => {
             if (s.audio_url) enqueueAudio(s.audio_url)
           },
-          // 全量收尾：以服务端权威全量文本为准
+          // 全量收尾：服务端权威版过了显示层卫生（speakable 会把换行折成单空格）。
+          // 仅排版差异时保留流式原文的 markdown 结构；内容真被剥离才用服务端版。
           onDone: (d) => {
             if (d.reply) {
-              acc = d.reply
-              patchReply(d.reply)
+              acc = resolveFinalReply(acc, d.reply)
+              patchReply(acc)
             }
             finalizeProgress()
           },
-          // 回退整段：规则意图/工具调用/流式失败——行为与旧 /api/chat 完全一致
+          // 回退整段：规则意图/工具调用/流式失败——行为与旧 /api/chat 完全一致。
+          // 关键：fallback 是「整段接管」语义。abort 前可能已有 sentence 事件入队
+          // （如「好的先生。{工具JSON}」场景第一句已合成推送），若不先清空句队列，
+          // 队列残句会与整段音频叠加——正是「有时重复念 2 遍」的根因。
           onFallback: (d) => {
+            stopAllAudio() // 整段接管播放通道：停当前 + 清空句级队列
             acc = d.reply
             patchReply(d.reply)
             finalizeProgress()
@@ -316,7 +322,7 @@ export default function ChatApp() {
     if (bootedRef.current) return
     bootedRef.current = true
 
-    clientLog('页面加载 build 0808-1')
+    clientLog('页面加载 build 0815-1')
     checkHealth().then((ok) => {
       clientLog(`健康检查: ${ok}`)
       setOnline(ok)
@@ -770,7 +776,7 @@ export default function ChatApp() {
 
       {/* 构建水印：排查「页面跑的是旧缓存」用——截图带它即可确认前端版本 */}
       <span className="pointer-events-none absolute bottom-1 right-3 text-[10px] leading-[14px] tracking-widest text-[var(--label-quaternary)]">
-        build 0808-1
+        build 0815-1
       </span>
     </div>
   )
