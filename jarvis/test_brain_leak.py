@@ -148,7 +148,9 @@ class TestMixedReplyExtraction(_BrainLeakTestBase):
             reply = brain.think(ACCIDENT_INPUT, [])
         # 前置口语文本 + 跨行 JSON：被提取执行，没有当文本播报
         self.assertEqual([("run_shell", mock.ANY)], fake_hands.calls)
-        self.assertEqual(final_words, reply)
+        # T1 主动交代会追加汇报行：主体回复不变，交代随行
+        self.assertTrue(reply.startswith(final_words), reply)
+        self.assertIn("交代", reply)
 
     def test_fenced_json_executes(self):
         fake_hands = _FakeHands()
@@ -159,7 +161,9 @@ class TestMixedReplyExtraction(_BrainLeakTestBase):
             reply = brain.think("请你开始制作物理课件的准备工作", [])
         self.assertEqual([("write_file", mock.ANY)], fake_hands.calls)
         self.assertEqual("物理大纲.txt", fake_hands.calls[0][1]["name"])
-        self.assertEqual(final_words, reply)
+        # T1 主动交代会追加汇报行：主体回复不变，交代随行
+        self.assertTrue(reply.startswith(final_words), reply)
+        self.assertIn("交代", reply)
 
     def test_multiline_escaped_json_executes(self):
         # 跨行 + 转义引号 + 字符串内含 \n 转义
@@ -175,7 +179,9 @@ class TestMixedReplyExtraction(_BrainLeakTestBase):
             reply = brain.think("帮我把物理课件的笔记整理一下", [])
         self.assertEqual([("write_file", mock.ANY)], fake_hands.calls)
         self.assertIn("第一行\n第二行", fake_hands.calls[0][1]["content"])
-        self.assertEqual("先生，笔记写好了。", reply)
+        # T1 主动交代会追加汇报行：主体回复不变，交代随行
+        self.assertTrue(reply.startswith("先生，笔记写好了。"), reply)
+        self.assertIn("交代", reply)
 
 
 class TestSpeakGuardAtExit(_BrainLeakTestBase):

@@ -905,16 +905,95 @@ _MAX_TOOL_ROUNDS = 4      # Agent 循环最大工具调用轮数（超出即止�
 _TOOL_RESULT_LIMIT = 800  # 回灌给大模型的单条工具结果最大字符数（超出截断，防上下文膨胀）
 
 
-def _request_llm(url: str, payload: dict, headers: dict) -> str | None:
+# == 模型自动降级（零操作升级通道）==
+# 主人原则：行业出了更强模型就换引擎，且不该为此改代码、更不该把大脑搞哑。
+# 配置里直接写最新模型（如 glm-5.3）；若账号权限尚未开通（智谱 403/1220），
+# 本进程自动降回 _MODEL_FALLBACK 继续服务，日志如实说明——权限一开通，
+# 重启即自然用回新模型，全程零代码改动。
+_MODEL_FALLBACK = "glm-5.2"
+_model_demoted = False  # 进程级记忆：一次 403 之后本会话直接走兜底，不再反复试探
+_thinking_unsupported_models: set = set()  # 进程级记忆：拒绝关闭思考的模型（glm-5.3 起始终思考）
+
+
+def _is_model_access_denied(exc: Exception) -> bool:
+    """智谱「模型未授权」判定：HTTP 403 且错误体含 1220 / 无权访问。
+    与瞬态故障严格区分——403 重试一万次也不会成功，必须换模型而非重试。"""
+    resp = getattr(exc, "response", None)
+    if resp is None or getattr(resp, "status_code", None) != 403:
+        return False
+    try:
+        body = resp.text or ""
+    except Exception:
+        return False
+    return "1220" in body or "无权访问" in body
+
+
+def _is_thinking_unsupported(exc: Exception) -> bool:
+    """智谱「该模型不支持关闭思考」判定：HTTP 400 且错误体含 1210 / 不支持关闭思考。
+    实测 glm-5.3 始终思考，带 thinking.disabled 直接 400——此时应摘掉
+    thinking 参数重发同一模型，而非换模型或放弃。"""
+    resp = getattr(exc, "response", None)
+    if resp is None or getattr(resp, "status_code", None) != 400:
+        return False
+    try:
+        body = resp.text or ""
+    except Exception:
+        return False
+    return "1210" in body or "不支持关闭思考" in body
+
+
+def _apply_model_demotion(payload: dict) -> None:
+    if _model_demoted and payload.get("model") != _MODEL_FALLBACK:
+        payload["model"] = _MODEL_FALLBACK
+    # 思考参数按模型记忆剥离：只影响拒绝它的那个模型，
+    # 降级到兜底模型时 thinking 设置原样保留（5.2 需要它来关闭思考）
+    if payload.get("model") in _thinking_unsupported_models:
+        payload.pop("thinking", None)
+
+
+_THINKING_UNSET = object()  # 哨兵：区分「调用方没带 thinking」与「递归中传承」
+
+
+def _request_llm(url: str, payload: dict, headers: dict,
+                 _orig_thinking=_THINKING_UNSET) -> str | None:
     """
     单次请求大模型并取出回复文本；任何失败返回 None。
     瞬态故障间隔 1 秒按原参数重试一次；失败透明化，真实原因写日志，绝不静默吞掉。
+    模型未授权（403/1220）不是瞬态故障：自动降级 _MODEL_FALLBACK 并记住整段进程。
+    模型拒绝关闭思考（400/1210）：摘掉 thinking 重发同一模型，按模型记住。
+    _orig_thinking：递归链上传承调用方最初的 thinking 设置——1210 剥参后
+    若又遇 403 降级，兜底模型需要把原设置还原（5.2 靠它关闭思考）。
     """
+    global _model_demoted
+    if _orig_thinking is _THINKING_UNSET:
+        _orig_thinking = payload.get("thinking")  # None = 调用方本就没带
+    _apply_model_demotion(payload)
     try:
         resp = httpx.post(url, json=payload, headers=headers, timeout=_API_TIMEOUT)
         resp.raise_for_status()
         reply = resp.json()["choices"][0]["message"]["content"].strip()
     except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
+        # 新模型始终思考（如 glm-5.3）：摘掉 thinking 参数立即重发同一模型，
+        # 并按模型记住——后续请求不再带（兜底模型的 thinking 设置不受影响）
+        if (_is_thinking_unsupported(e) and "thinking" in payload
+                and payload.get("model") not in _thinking_unsupported_models):
+            print(f"[brain] 模型 {payload.get('model')} 不支持关闭思考(400/1210)，"
+                  "本进程对该模型摘除 thinking 参数后重发")
+            _thinking_unsupported_models.add(payload.get("model"))
+            payload.pop("thinking", None)
+            return _request_llm(url, payload, headers, _orig_thinking)
+        # 新模型权限未开通：降级兜底模型立即重发（403 永非瞬态，原地重试无意义），
+        # 并记住降级——本进程后续请求直接走兜底；权限开通后重启即自动用回新模型
+        if _is_model_access_denied(e) and payload.get("model") != _MODEL_FALLBACK:
+            print(f"[brain] 模型 {payload.get('model')} 未授权(403/1220)，"
+                  f"本进程降级为 {_MODEL_FALLBACK}；权限开通后重启即自动升级")
+            _model_demoted = True
+            payload["model"] = _MODEL_FALLBACK
+            # 1210 剥参发生在前时，把调用方原本的 thinking 设置还给兜底模型
+            if (_orig_thinking is not None
+                    and _MODEL_FALLBACK not in _thinking_unsupported_models):
+                payload["thinking"] = _orig_thinking
+            return _request_llm(url, payload, headers, _orig_thinking)
         # 失败透明化：真实原因写进服务器日志，绝不静默吞掉（静默失败是可靠性大敌）
         print(f"[brain] 大模型调用失败: {type(e).__name__}: {e}")
         # 瞬态故障重试：间隔 1 秒按原参数再试一次（直连实测 4 秒，失败多为瞬态）

@@ -1,7 +1,7 @@
 {
   "api_key": "在这里填入你的智谱API_Key",
   "base_url": "https://open.bigmodel.cn/api/paas/v4",
-  "model": "glm-5.2",
+  "model": "glm-5.3",
   "extra_body": "{\"thinking\": {\"type\": \"disabled\"}}",
   "vision_model": "glm-4.5v",
   "vision_extra_body": "{\"thinking\": {\"type\": \"disabled\"}}"
