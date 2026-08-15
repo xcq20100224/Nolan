@@ -1807,6 +1807,7 @@ _last_initiative = 0.0
 
 def _trigger_loop() -> None:
     """条件触发检查守护线程：定期评估 triggers，触发消息入队 + 音箱播报。"""
+    global _last_initiative  # 开口记账（行内赋值），缺此声明会让上面的读取变 UnboundLocalError
     import triggers
     print("[triggers] 条件触发检查线程启动（每分钟一轮）。")
     while True:
