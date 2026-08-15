@@ -1,16 +1,24 @@
 @echo off
-rem ===== Nolan 一键启动（软件形态）=====
-rem 双击即用：启动后端（自带前端静态托管），自动打开浏览器。
-rem 重复双击无副作用——server.py 单实例守护会清理旧进程。
+rem ===== Nolan one-click launcher (standalone app mode) =====
+rem Double-click to use: starts backend (serves frontend statics too), opens browser.
+rem Safe to double-click repeatedly - server.py single-instance guard cleans old ones.
+setlocal
 cd /d "%~dp0nolan-web"
-start "" /min python -u server.py
-rem 等后端真正就绪再开浏览器（最多 30 秒），避免「浏览器开了服务没起」
+rem Prefer repo .venv (deps verified), fallback to PATH python
+set "PY=%~dp0.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=python"
+echo [Nolan] Python: %PY%
+start "" /min "%PY%" -u server.py
+rem Wait until backend is really up (max 30s) before opening browser
+rem (use absolute System32 paths: PATH may be polluted by Git Bash etc.)
 for /l %%i in (1,1,30) do (
-  curl -s -o nul -m 1 http://localhost:7901/api/version && goto ready
-  timeout /t 1 /nobreak >nul
+  %SystemRoot%\System32\curl.exe -s -o nul -m 1 http://localhost:7901/api/version && goto ready
+  %SystemRoot%\System32\timeout.exe /t 1 /nobreak >nul
 )
-echo Nolan 启动较慢，请稍等几秒后手动访问 http://localhost:7901
+echo [Nolan] Not ready within 30s. Please screenshot this window and send to developer.
+pause
 goto done
 :ready
 start "" http://localhost:7901
 :done
+endlocal
