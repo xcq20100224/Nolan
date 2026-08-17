@@ -39,7 +39,8 @@ API 契约（一字不差）：
                          早期失败一律回退到与 /api/chat 完全相同的整段路径（brain.think +
                          synth_for），以 fallback 事件下发——对话绝不因流式化而挂掉。
     GET  /api/due        → {"messages": [{"text": str, "audio_url": str|null}]}（到点提醒，无则 []）
-                         到点消息服务端音箱连续播报两遍（闹钟式，间隔 0.5 秒）
+                         恰好一次原则：浏览器在场由浏览器播；音箱仅在音频冷缓存时补 1 遍，
+                         离屏场景由触发循环在入队时兜底（提醒 2 遍 / 主动性提示 1 遍）
     GET  /api/sound_test → {"audio_url": str|null, "speaker": true}
                          声音必达自检：固定文本走 synth_for 链合成（浏览器通道），
                          同时后台线程 mouth.speak 从音箱播报同一句话（音箱通道）
@@ -136,7 +137,7 @@ except Exception:
 # 用途：曾出现『GUI 失败源于陈旧后端进程（旧代码仍在内存中运行）』的问题，
 # 仅靠单实例守卫清理旧进程还不够直观——需要让『当前跑的是不是新代码』一眼可验。
 # GET /api/version 返回本常量与当前进程 PID；改代码后务必同步更新本常量。
-_VERSION = "2026-08-15-p0ppt"
+_VERSION = "2026-08-17-duevoice"
 
 # mouth 惰性导入且失败降级为 None（GLM-TTS 主通道 + edge-tts 备用 + SAPI 离线兜底，
 # 网页版后端不能让播报失败拖垮 API）
@@ -1309,27 +1310,44 @@ def _speak_async(text: str) -> None:
     t.start()
 
 
-def _speak_alarm_async(text: str) -> None:
+def _speak_alarm_async(text: str, times: int = 2) -> None:
     """
-    闹钟式播报：到点提醒在服务端音箱连续播报两遍（中间间隔 0.5 秒）。
-    第一性原理：闹钟的价值在于『必被听见』，一遍可能错过，两遍才可靠。
-    后台守护线程执行，不阻塞 /api/due 响应；mouth 为 None 静默跳过。
+    音箱播报 text，次数由 times 指定（默认 2：闹钟式，间隔 0.5 秒）。
+    第一性原理：每条提示句对同一听众「恰好一次」——浏览器在场时浏览器播，
+    音箱只做离屏兜底（提醒 2 遍必被听见 / 主动性提示 1 遍轻提醒）
+    与冷缓存补位（1 遍）。后台守护线程执行；mouth 为 None 或 times<=0 静默跳过。
     """
-    if mouth is None or not text:
+    if mouth is None or not text or times <= 0:
         return
 
     def _worker():
         try:
             with _brain_lock:
-                print(f"[server] 闹钟播报（连续两遍）：{text}")
-                mouth.speak(text)
-                time.sleep(0.5)
-                mouth.speak(text)
+                print(f"[server] 音箱播报（{times} 遍）：{text}")
+                for i in range(times):
+                    if i:
+                        time.sleep(0.5)
+                    mouth.speak(text)
         except Exception as e:
-            print(f"[server] 闹钟播报失败（已静默）：{e}")
+            print(f"[server] 音箱播报失败（已静默）：{e}")
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
+
+
+# 提示句「恰好一次」决策（纯函数，可单测）：
+def _due_gap_cover_times(audio_url: str | None) -> int:
+    """/api/due 场景（能调到本端点 = 浏览器在场）：音频命中 → 0（浏览器播一遍）；
+    音频未命中（TTS 冷缓存）→ 1（音箱补一遍，绝不让提示句无声）。"""
+    return 0 if audio_url else 1
+
+
+def _absent_speaker_times(kind: str, browser_absent: bool) -> int:
+    """触发循环入队时的离屏播报：浏览器在场 → 0（等 /api/due 出队由浏览器播）；
+    缺席 → 提醒/触发 2 遍（闹钟必被听见），主动性提示 1 遍（轻提醒不吵人）。"""
+    if not browser_absent:
+        return 0
+    return 1 if kind == "proactive" else 2
 
 
 # == 主动晨报（J5）：每天第一次打开网页时，Nolan 主动开口问候 ==
@@ -1795,7 +1813,8 @@ def _fallback_with_progress(handler, user_text: str) -> None:
 # 为什么独立线程：条件评估要走 LLM 联网搜索（秒级），放进 /api/due 会挂住
 # 15 秒轮询、占满浏览器连接池（此前 TTS 同步合成挂死全链路的教训）。
 # 后台线程每分钟评估一轮，触发的消息进队列，/api/due 出队即走（毫秒级）；
-# 音箱通道同步播报两遍（闹钟语义：必被听见）。
+# 音箱兜底只在浏览器离屏（>45s 未轮询 /api/due）时启用：提醒 2 遍必被听见，
+# 主动性提示 1 遍轻提醒；在场时一律等出队由浏览器播（恰好一次，杜绝叠音）。
 _trigger_fired = _collections.deque(maxlen=20)
 _trigger_fired_lock = threading.Lock()
 
@@ -1803,6 +1822,9 @@ _trigger_fired_lock = threading.Lock()
 # 「用户刚交互过不打扰」闸门判定；_chat 与流式入口每轮对话更新
 _last_user_activity = 0.0
 _last_initiative = 0.0
+# 浏览器在场心跳：/api/due 每次轮询刷新；触发循环据此判断「离屏」，
+# 离屏才走音箱兜底播报（在场时浏览器播，双通道叠音是真实病例）
+_last_due_poll = 0.0
 
 
 def _trigger_loop() -> None:
@@ -1822,8 +1844,11 @@ def _trigger_loop() -> None:
                 with _trigger_fired_lock:
                     for m in msgs:
                         _trigger_fired.append(m)
-                # 语音与闹钟提醒同一路径：/api/due 出队时暖 TTS + 音箱播报两遍，
-                # 此处不单独播报（否则与 /api/due 的播报叠音）
+                # 恰好一次原则：浏览器在场时等 /api/due 出队由浏览器播；
+                # 仅当浏览器离屏（>45 秒没轮询）时音箱兜底两遍（闹钟必被听见）
+                _absent = (time.time() - _last_due_poll) > 45
+                for m in msgs:
+                    _speak_alarm_async(m, times=_absent_speaker_times("trigger", _absent))
         except Exception as e:
             print("[triggers] 检查异常（下轮继续）：%s" % e)
         # Gap4 主动性：触发器之外，Nolan 也会基于记忆主动开口。
@@ -1857,6 +1882,9 @@ def _trigger_loop() -> None:
                         with _trigger_fired_lock:
                             _trigger_fired.append(msg)
                         _last_initiative = time.time()
+                        # 主动性提示离屏兜底只播一遍（轻提醒，不是闹钟）
+                        _speak_alarm_async(msg, times=_absent_speaker_times(
+                            "proactive", (time.time() - _last_due_poll) > 45))
                         print("[proactive] 主动开口：%s" % msg[:40])
             except Exception as e:
                 print("[proactive] 主动性评估异常（下轮继续）：%s" % e)
@@ -2255,6 +2283,8 @@ class NolanHandler(BaseHTTPRequestHandler):
                 # （陈旧进程返回旧版本号，PID 可对照任务管理器核对）
                 self._send_json(200, {"version": _VERSION, "pid": os.getpid()})
             elif path == "/api/due":
+                global _last_due_poll
+                _last_due_poll = time.time()  # 浏览器在场心跳：能调到本端点即在场
                 messages = reminders.check_due() or []
                 # P4 条件触发：后台线程评估好的触发消息随本通道出队（毫秒级，不阻塞）
                 with _trigger_fired_lock:
@@ -2266,11 +2296,13 @@ class NolanHandler(BaseHTTPRequestHandler):
                     # 音频异步化（关键修复）：响应只带缓存命中（毫秒级，通常首轮为 None），
                     # 未命中交给后台线程合成暖缓存——此前在这里同步 synth_for，
                     # TTS 一慢/一挂，15 秒轮询就挂住，占满浏览器连接池，
-                    # 连累麦克风等所有请求排队卡死。闹钟声音由音箱通道保证必达。
-                    out.append({"text": msg, "audio_url": _tts_cached_url(msg)})
+                    # 连累麦克风等所有请求排队卡死。
+                    audio_url = _tts_cached_url(msg)
+                    out.append({"text": msg, "audio_url": audio_url})
                     _warm_tts_async(msg)
-                    # 闹钟必响：服务端音箱连续播报两遍
-                    _speak_alarm_async(msg)
+                    # 恰好一次原则：浏览器在场由浏览器播报；音箱只在音频缺失时补一遍，
+                    # 不再无条件音箱两遍（真实病例：浏览器+音箱双通道叠音，提示句念两三遍）
+                    _speak_alarm_async(msg, times=_due_gap_cover_times(audio_url))
                 self._send_json(200, {"messages": out})
             elif path == "/api/greeting":
                 # 主动晨报：每天首次打开网页时的问候语 + 语音
